@@ -326,7 +326,7 @@ final class AppSettings: ObservableObject {
         return try? JSONDecoder().decode(T.self, from: data)
     }
 
-    func save() {
+    private func persistLocal() {
         if let data = try? JSONEncoder().encode(symbols) { defaults.set(data, forKey: Key.symbols) }
         defaults.set(currentCode, forKey: Key.current)
         if let data = try? JSONEncoder().encode(levelsByCode) { defaults.set(data, forKey: Key.levels) }
@@ -353,6 +353,96 @@ final class AppSettings: ObservableObject {
         defaults.set(marketGatewayEnabled, forKey: Key.marketGatewayEnabled)
         defaults.set(marketServerURL, forKey: Key.marketServerURL)
         NotifyGovernor.shared.configure(notifyConfig)
+    }
+
+    func save() {
+        persistLocal()
+        let snapshot = gatewaySnapshot()
+        Task { try? await GatewayMarketClient.putSettings(snapshot) }
+    }
+
+    private func gatewaySnapshot() -> GatewaySettingsSnapshot {
+        GatewaySettingsSnapshot(
+            currentCode: currentCode,
+            levelsByCode: levelsByCode,
+            strategies: strategies,
+            comboStrategies: comboStrategies,
+            diaries: diaries,
+            alertsEnabled: alertsEnabled,
+            openCloseBrief: openCloseBrief,
+            theme: theme,
+            menuBarFormat: menuBarFormat,
+            fontSize: fontSize,
+            indicator: indicator.rawValue,
+            notifyConfig: notifyConfig,
+            aiConfig: aiConfig,
+            boardShowHS300: boardShowHS300,
+            boardShowBJ50: boardShowBJ50
+        )
+    }
+
+    /// 启动时服务端优先；服务端为空则把现有本地缓存作为迁移种子上传。
+    /// 网关不可用时直接返回，本地 UserDefaults 保持可用。
+    func syncGatewayData() async {
+        guard marketGatewayEnabled else { return }
+        guard let remote = try? await GatewayMarketClient.remoteState() else { return }
+        if remote.isEmpty {
+            await seedGatewayFromLocal()
+            return
+        }
+
+        if !remote.watchlist.isEmpty {
+            symbols = remote.watchlist.map {
+                WatchSymbol(code: $0.code, name: $0.name, pinned: $0.pinned, group: $0.group)
+            }
+        } else {
+            for symbol in symbols { try? await GatewayMarketClient.putWatchSymbol(symbol) }
+        }
+        if !remote.positions.isEmpty {
+            positions = Dictionary(uniqueKeysWithValues: remote.positions.map {
+                ($0.code, PositionNote(cost: $0.cost, shares: $0.shares,
+                                       stopLoss: $0.stopLoss, positionPct: $0.positionPct))
+            })
+        } else {
+            for (code, position) in positions {
+                try? await GatewayMarketClient.putPosition(code: code, position: position)
+            }
+        }
+        if remote.settings.isEmpty {
+            try? await GatewayMarketClient.putSettings(gatewaySnapshot())
+        } else {
+            apply(remote.settings)
+        }
+        if !symbols.contains(where: { $0.code == currentCode }), let first = symbols.first {
+            currentCode = first.code
+        }
+        persistLocal()
+    }
+
+    private func seedGatewayFromLocal() async {
+        try? await GatewayMarketClient.putSettings(gatewaySnapshot())
+        for symbol in symbols { try? await GatewayMarketClient.putWatchSymbol(symbol) }
+        for (code, position) in positions {
+            try? await GatewayMarketClient.putPosition(code: code, position: position)
+        }
+    }
+
+    private func apply(_ remote: GatewaySettingsSnapshot) {
+        if let value = remote.currentCode { currentCode = value }
+        if let value = remote.levelsByCode { levelsByCode = value }
+        if let value = remote.strategies { strategies = value }
+        if let value = remote.comboStrategies { comboStrategies = value }
+        if let value = remote.diaries { diaries = value }
+        if let value = remote.alertsEnabled { alertsEnabled = value }
+        if let value = remote.openCloseBrief { openCloseBrief = value }
+        if let value = remote.theme { theme = value }
+        if let value = remote.menuBarFormat { menuBarFormat = value }
+        if let value = remote.fontSize { fontSize = value }
+        if let value = remote.indicator, let parsed = IndicatorKind(rawValue: value) { indicator = parsed }
+        if let value = remote.notifyConfig { notifyConfig = value }
+        if let value = remote.aiConfig { aiConfig = value }
+        if let value = remote.boardShowHS300 { boardShowHS300 = value }
+        if let value = remote.boardShowBJ50 { boardShowBJ50 = value }
     }
 
     func setBoardShowHS300(_ on: Bool) {
@@ -386,6 +476,8 @@ final class AppSettings: ObservableObject {
             strategies[currentCode] = st
         }
         save()
+        let code = currentCode
+        Task { try? await GatewayMarketClient.putPosition(code: code, position: note) }
     }
 
     func updateStrategy(above: Double, below: Double, drawdownPct: Double, coolDownMin: Int = 30, linkStopToBelow: Bool = true) {
@@ -473,8 +565,10 @@ final class AppSettings: ObservableObject {
             return .exists(exist.name.isEmpty ? c : exist.name)
         }
         symbols.append(WatchSymbol(code: c, name: n.isEmpty ? c : n, group: g.isEmpty ? "默认" : g))
+        let added = symbols.last!
         selectSymbol(c)
         save()
+        Task { try? await GatewayMarketClient.putWatchSymbol(added) }
         return .added(c)
     }
 
@@ -512,6 +606,7 @@ final class AppSettings: ObservableObject {
             currentCode = symbols[0].code
         }
         save()
+        Task { try? await GatewayMarketClient.deleteWatchSymbol(code: c) }
     }
 
     func removeCurrentIfPossible() {
@@ -542,6 +637,7 @@ final class AppSettings: ObservableObject {
         }
         positions[c] = pos
         save()
+        Task { try? await GatewayMarketClient.putPosition(code: c, position: pos) }
     }
 
     func moveWithinGroup(_ group: String, from: IndexSet, to: Int) {
@@ -571,13 +667,17 @@ final class AppSettings: ObservableObject {
     func togglePin(_ code: String) {
         guard let i = symbols.firstIndex(where: { $0.code == code }) else { return }
         symbols[i].pinned.toggle()
+        let symbol = symbols[i]
         save()
+        Task { try? await GatewayMarketClient.putWatchSymbol(symbol) }
     }
 
     func setGroup(_ code: String, group: String) {
         guard let i = symbols.firstIndex(where: { $0.code == code }) else { return }
         symbols[i].group = group.isEmpty ? "默认" : group
+        let symbol = symbols[i]
         save()
+        Task { try? await GatewayMarketClient.putWatchSymbol(symbol) }
     }
 
     func upsertCombo(_ rule: ComboStrategy) {

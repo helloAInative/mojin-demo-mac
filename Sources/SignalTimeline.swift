@@ -125,6 +125,7 @@ enum SignalTimeline {
         if let data = try? JSONEncoder().encode(list) {
             try? data.write(to: fileURL(), options: .atomic)
         }
+        Task { try? await GatewayMarketClient.putSignal(ev) }
         return ev
     }
 
@@ -139,10 +140,25 @@ enum SignalTimeline {
         if let data = try? JSONEncoder().encode(list) {
             try? data.write(to: fileURL(), options: .atomic)
         }
+        let updated = list[idx]
+        Task { try? await GatewayMarketClient.putSignal(updated) }
+    }
+
+    /// 服务端与本地缓存按 id 合并；同 id 以服务端为准，断网时不触碰本地数据。
+    static func mergeRemote(_ remote: [SignalEvent]) -> [SignalEvent] {
+        var merged = Dictionary(uniqueKeysWithValues: load().map { ($0.id, $0) })
+        for event in remote { merged[event.id] = event }
+        let list = Array(merged.values.sorted { $0.at > $1.at }.prefix(maxKeep))
+        cache = list
+        if let data = try? JSONEncoder().encode(list) {
+            try? data.write(to: fileURL(), options: .atomic)
+        }
+        return list
     }
 
     static func clear() {
         cache = []
         try? FileManager.default.removeItem(at: fileURL())
+        Task { try? await GatewayMarketClient.deleteSignals() }
     }
 }

@@ -1,5 +1,65 @@
 import Foundation
 
+struct GatewaySettingsSnapshot: Codable {
+    var currentCode: String?
+    var levelsByCode: [String: SymbolLevels]?
+    var strategies: [String: StrategyNote]?
+    var comboStrategies: [ComboStrategy]?
+    var diaries: [String: String]?
+    var alertsEnabled: Bool?
+    var openCloseBrief: Bool?
+    var theme: AppTheme?
+    var menuBarFormat: MenuBarFormat?
+    var fontSize: FontSizePref?
+    var indicator: String?
+    var notifyConfig: NotifyGovernor.Config?
+    var aiConfig: AIConfig?
+    var boardShowHS300: Bool?
+    var boardShowBJ50: Bool?
+
+    var isEmpty: Bool {
+        currentCode == nil && levelsByCode == nil && strategies == nil &&
+        comboStrategies == nil && diaries == nil && alertsEnabled == nil &&
+        openCloseBrief == nil && theme == nil && menuBarFormat == nil &&
+        fontSize == nil && indicator == nil && notifyConfig == nil &&
+        aiConfig == nil && boardShowHS300 == nil && boardShowBJ50 == nil
+    }
+}
+
+struct GatewayPosition: Codable {
+    var code: String
+    var cost: Double
+    var shares: Double
+    var stopLoss: Double
+    var takeProfit: Double
+    var positionPct: Double
+    var note: String?
+    var updatedAt: Int64?
+}
+
+struct GatewayWatchItem: Codable {
+    var code: String
+    var name: String
+    var market: String
+    var pinned: Bool
+    var group: String
+    var addedAt: Int64?
+    var updatedAt: Int64?
+}
+
+struct GatewayRemoteState {
+    var positions: [GatewayPosition]
+    var watchlist: [GatewayWatchItem]
+    var settings: GatewaySettingsSnapshot
+
+    var isEmpty: Bool { positions.isEmpty && watchlist.isEmpty && settings.isEmpty }
+}
+
+struct GatewayQuoteUpdate {
+    var code: String
+    var quote: Quote
+}
+
 /// Rust 行情网关的 Swift DTO 适配层。这里不访问第三方行情源。
 enum GatewayMarketClient {
     private static let session: URLSession = {
@@ -67,10 +127,14 @@ enum GatewayMarketClient {
 
     static func quote(symbol: WatchSymbol) async throws -> Quote {
         let remote: RemoteQuote = try await get("quote/\(symbol.code)")
+        return try quote(from: remote, fallbackName: symbol.name)
+    }
+
+    private static func quote(from remote: RemoteQuote, fallbackName: String = "") throws -> Quote {
         guard remote.price > 0, remote.prev > 0 else { throw GatewayError.badResponse }
         let change = remote.price - remote.prev
         return Quote(
-            name: remote.name.isEmpty ? symbol.name : remote.name,
+            name: remote.name.isEmpty ? fallbackName : remote.name,
             price: remote.price,
             prev: remote.prev,
             open: remote.open,
@@ -81,6 +145,73 @@ enum GatewayMarketClient {
             timeText: chinaTime(remote.ts, format: "HH:mm:ss"),
             source: "网关·\(sourceName(remote.source))"
         )
+    }
+
+    /// WebSocket 行情流。断线重连由 MarketStore 负责，HTTP 轮询始终作为兜底。
+    static func quoteUpdates() async throws -> AsyncThrowingStream<GatewayQuoteUpdate, Error> {
+        struct Event: Decodable {
+            var type: String
+            var quote: RemoteQuoteWithCode
+        }
+        struct RemoteQuoteWithCode: Decodable {
+            var code: String
+            var name: String
+            var price: Double
+            var prev: Double
+            var open: Double
+            var high: Double
+            var low: Double
+            var source: String
+            var ts: String
+        }
+
+        let enabled = await AppSettings.shared.marketGatewayEnabled
+        let base = await AppSettings.shared.marketServerURL
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard enabled, var components = URLComponents(string: base) else {
+            throw GatewayError.disabled
+        }
+        switch components.scheme?.lowercased() {
+        case "http": components.scheme = "ws"
+        case "https": components.scheme = "wss"
+        default: throw GatewayError.invalidURL
+        }
+        components.path = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            + "/api/v1/ws/quote"
+        components.query = nil
+        guard let url = components.url else { throw GatewayError.invalidURL }
+
+        return AsyncThrowingStream { continuation in
+            let socket = session.webSocketTask(with: url)
+            socket.resume()
+            let receiveTask = Task {
+                do {
+                    while !Task.isCancelled {
+                        let message = try await socket.receive()
+                        let data: Data
+                        switch message {
+                        case .data(let value): data = value
+                        case .string(let value): data = Data(value.utf8)
+                        @unknown default: continue
+                        }
+                        let event = try JSONDecoder().decode(Event.self, from: data)
+                        guard event.type == "quote" else { continue }
+                        let remote = event.quote
+                        let legacy = RemoteQuote(name: remote.name, price: remote.price, prev: remote.prev,
+                                                 open: remote.open, high: remote.high, low: remote.low,
+                                                 source: remote.source, ts: remote.ts)
+                        let value = try quote(from: legacy)
+                        continuation.yield(GatewayQuoteUpdate(code: remote.code, quote: value))
+                    }
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                receiveTask.cancel()
+                socket.cancel(with: .goingAway, reason: nil)
+            }
+        }
     }
 
     static func minutes(symbol: WatchSymbol) async throws -> [MinuteBar] {
@@ -106,6 +237,76 @@ enum GatewayMarketClient {
         return bars
     }
 
+    /// 阶段 3：服务端信号时间线。调用失败时上层继续使用本地 JSON 缓存。
+    static func signals(limit: Int = 200) async throws -> [SignalEvent] {
+        try await getData("signals?limit=\(max(1, min(limit, 1000)))")
+    }
+
+    /// 本地先写、服务端后写；网络错误不会影响盯盘主流程。
+    static func putSignal(_ event: SignalEvent) async throws {
+        try await sendData("signals", method: "POST", body: event)
+    }
+
+    static func deleteSignals() async throws {
+        let request = try await dataRequest(path: "signals", method: "DELETE")
+        let (_, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse,
+              response.statusCode == 204 else { throw GatewayError.badResponse }
+    }
+
+    static func remoteState() async throws -> GatewayRemoteState {
+        struct SettingsDocument: Decodable { var values: GatewaySettingsSnapshot }
+        async let positions: [GatewayPosition] = getData("positions")
+        async let watchlist: [GatewayWatchItem] = getData("watchlist")
+        async let settings: SettingsDocument = getData("settings")
+        return try await GatewayRemoteState(
+            positions: positions,
+            watchlist: watchlist,
+            settings: settings.values
+        )
+    }
+
+    static func putSettings(_ settings: GatewaySettingsSnapshot) async throws {
+        try await sendData("settings", method: "PUT", body: settings)
+    }
+
+    static func putPosition(code: String, position: PositionNote) async throws {
+        struct Body: Encodable {
+            var cost: Double
+            var shares: Double
+            var stopLoss: Double
+            var takeProfit: Double = 0
+            var positionPct: Double
+        }
+        try await sendData(
+            "positions/\(code)", method: "PUT",
+            body: Body(cost: position.cost, shares: position.shares,
+                       stopLoss: position.stopLoss, positionPct: position.positionPct)
+        )
+    }
+
+    static func putWatchSymbol(_ symbol: WatchSymbol) async throws {
+        struct Body: Encodable {
+            var code: String
+            var name: String
+            var market: String
+            var pinned: Bool
+            var group: String
+        }
+        try await sendData(
+            "watchlist", method: "POST",
+            body: Body(code: symbol.code, name: symbol.name, market: symbol.marketPrefix,
+                       pinned: symbol.pinned, group: symbol.group)
+        )
+    }
+
+    static func deleteWatchSymbol(code: String) async throws {
+        let request = try await dataRequest(path: "watchlist/\(code)", method: "DELETE")
+        let (_, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse,
+              response.statusCode == 204 else { throw GatewayError.badResponse }
+    }
+
     private static func get<T: Decodable>(_ path: String) async throws -> T {
         let enabled = await AppSettings.shared.marketGatewayEnabled
         let base = await AppSettings.shared.marketServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -127,6 +328,41 @@ enum GatewayMarketClient {
             await circuit.failed(base)
             throw error
         }
+    }
+
+    private static func getData<T: Decodable>(_ path: String) async throws -> T {
+        let request = try await dataRequest(path: path, method: "GET")
+        let (data, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse,
+              (200..<300).contains(response.statusCode) else { throw GatewayError.badResponse }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(T.self, from: data)
+    }
+
+    private static func sendData<T: Encodable>(_ path: String, method: String, body: T) async throws {
+        var request = try await dataRequest(path: path, method: method)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        request.httpBody = try encoder.encode(body)
+        let (_, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse,
+              (200..<300).contains(response.statusCode) else { throw GatewayError.badResponse }
+    }
+
+    private static func dataRequest(path: String, method: String) async throws -> URLRequest {
+        let enabled = await AppSettings.shared.marketGatewayEnabled
+        let base = await AppSettings.shared.marketServerURL
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard enabled else { throw GatewayError.disabled }
+        guard let endpoint = URL(string: base + "/api/v1/" + path),
+              ["http", "https"].contains(endpoint.scheme?.lowercased() ?? ""),
+              endpoint.host != nil else { throw GatewayError.invalidURL }
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = method
+        return request
     }
 
     private static func sourceName(_ source: String) -> String {
