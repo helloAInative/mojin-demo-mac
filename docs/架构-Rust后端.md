@@ -62,7 +62,8 @@ mojinprince-server/
 ├── migrations/                  # sqlx 迁移
 │   ├── 0001_init.sql
 │   ├── 0002_signals.sql
-│   └── 0003_positions.sql
+│   ├── 0003_positions.sql
+│   └── …                        # 见 §6 表结构（含 0006_ingest.sql）
 ├── src/
 │   ├── main.rs                  # 启动 + 路由注册
 │   ├── config.rs                # 配置加载（config + dotenvy）
@@ -88,6 +89,8 @@ mojinprince-server/
 │   │   │   ├── openai.rs
 │   │   │   ├── ollama.rs
 │   │   │   └── governor.rs      # 冷却 / 配额 / 成本
+│   │   ├── ingest.rs            # §F.3–F.4 东财新闻 / 研报 / 板块（拉取 + 落库）
+│   │   ├── scheduler.rs         # 行情轮询 / 复盘自动生成 / 每日数据接入刷新
 │   │   └── notify.rs            # 推送给前端（WebSocket）
 │   ├── repo/                    # 数据库访问
 │   │   ├── mod.rs
@@ -99,6 +102,7 @@ mojinprince-server/
 │       ├── mod.rs
 │       ├── quote.rs
 │       ├── signal.rs
+│       ├── ingest.rs            # §F.3–F.4 NewsItem / ResearchReport / SectorBoard
 │       └── ai.rs
 └── tests/
 ```
@@ -142,9 +146,9 @@ PUT  /api/v1/settings
 GET  /api/v1/reviews                      // 列出已生成报告（?kind=&limit=）
 POST /api/v1/reviews/run                  // 生成日报 / 周报（?kind=daily|weekly）
 
-// 数据接入（§F，待实现）
-GET  /api/v1/news/{code}                  // 新闻流
-GET  /api/v1/reports/{code}               // 研报
+// 数据接入（§F.3–F.4 已实现：东财按需拉取 + UPSERT 落库，每日收盘后增量刷新自选股）
+GET  /api/v1/news/{code}                  // 新闻流（?limit=&hours=）
+GET  /api/v1/reports/{code}               // 研报（?limit=&days=）
 GET  /api/v1/sector/{code}                // 板块行情
 
 // 鉴权（公网模式才打开）
@@ -285,6 +289,51 @@ CREATE TABLE scheduled_report (
     UNIQUE(kind, period_key)
 );
 CREATE INDEX idx_scheduled_report_created ON scheduled_report(created_at DESC);
+
+-- 0006_ingest.sql
+CREATE TABLE IF NOT EXISTS news_item (
+    code         TEXT NOT NULL,         -- sh600460
+    url          TEXT NOT NULL,         -- 原文链接（去重键）
+    title        TEXT NOT NULL,
+    summary      TEXT NOT NULL DEFAULT '',
+    media        TEXT NOT NULL DEFAULT '',
+    published_at INTEGER NOT NULL,      -- 毫秒时间戳（UTC）
+    fetched_at   INTEGER NOT NULL,
+    PRIMARY KEY(code, url)
+);
+CREATE INDEX idx_news_item_code_published ON news_item(code, published_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_report (
+    code            TEXT NOT NULL,
+    info_code       TEXT NOT NULL,      -- 东财研报编号（详情页 URL 的一部分）
+    title           TEXT NOT NULL,
+    org             TEXT NOT NULL DEFAULT '',
+    publish_date    TEXT NOT NULL DEFAULT '',  -- YYYY-MM-DD
+    rating          TEXT NOT NULL DEFAULT '',
+    last_rating     TEXT NOT NULL DEFAULT '',
+    rating_change   INTEGER,            -- 1 上调 / 2 下调 / 3 维持
+    researcher      TEXT NOT NULL DEFAULT '',
+    industry        TEXT NOT NULL DEFAULT '',
+    aim_price_high  REAL,
+    aim_price_low   REAL,
+    url             TEXT NOT NULL DEFAULT '',
+    fetched_at      INTEGER NOT NULL,
+    PRIMARY KEY(code, info_code)
+);
+CREATE INDEX idx_research_report_code_date ON research_report(code, publish_date DESC);
+
+CREATE TABLE IF NOT EXISTS sector_board (
+    code        TEXT NOT NULL,
+    board_code  TEXT NOT NULL,          -- BK0977
+    board_name  TEXT NOT NULL,
+    is_precise  INTEGER NOT NULL DEFAULT 1,  -- 1 = 主营相关（东财 IS_PRECISE）
+    reason      TEXT NOT NULL DEFAULT '',
+    price       REAL,                   -- 板块指数（停牌 / 无数据为 NULL）
+    change_pct  REAL,
+    fetched_at  INTEGER NOT NULL,
+    PRIMARY KEY(code, board_code)
+);
+CREATE INDEX idx_sector_board_code ON sector_board(code);
 ```
 
 ### 6.5 复盘表 + 幂等生成
@@ -333,7 +382,7 @@ CREATE INDEX idx_scheduled_report_created ON scheduled_report(created_at DESC);
 - 后端 scheduler 跑收盘复盘 / 周报导出。
 - 接新闻 / 研报 / 板块数据（§F.3–F.4）。
 - 至此 §F 数据接入全部走 Rust，前端只剩 UI。
-- **代码状态（2026-09-20）**：`/api/v1/ws/quote`、广播 Hub、自选股交易时段轮询调度和 Swift 断线重连 / HTTP 回退已完成；收盘复盘 / 周报生成按需 API（`POST /api/v1/reviews/run` + `GET /api/v1/reviews`，按 `(kind, period_key)` UPSERT 幂等，落 `scheduled_report` 表，7 项集成测试）与**自动触发**（`spawn_report_scheduler` 60s 心跳：工作日 15:05 后补日报，周五 15:05 后与周末补周报，仅补缺失的基线版，2 项集成测试）均已落地，Swift 端 `ReportClient` 已接入复盘历史与手动生成；新闻 / 研报 / 板块数据（§F.3–F.4）仍待实现。
+- **代码状态（2026-09-20）**：`/api/v1/ws/quote`、广播 Hub、自选股交易时段轮询调度和 Swift 断线重连 / HTTP 回退已完成；收盘复盘 / 周报生成按需 API（`POST /api/v1/reviews/run` + `GET /api/v1/reviews`，按 `(kind, period_key)` UPSERT 幂等，落 `scheduled_report` 表，7 项集成测试）与**自动触发**（`spawn_report_scheduler` 60s 心跳：工作日 15:05 后补日报，周五 15:05 后与周末补周报，仅补缺失的基线版，2 项集成测试）均已落地，Swift 端 `ReportClient` 已接入复盘历史与手动生成；**新闻 / 研报 / 板块数据（§F.3–F.4）已完成**：三个只读端点按需拉东财并 UPSERT 落 `news_item` / `research_report` / `sector_board` 三张缓存表，`POST /api/v1/ai/analyze` 新增 `include_news` 可把近 24h 新闻拼进 prompt，`spawn_ingest_scheduler` 工作日 16:00 后为自选股（≤60 只）增量刷新一次（8 项集成测试 + 3 项 live 测试 `#[ignore]`）。
 
 ### 阶段 5（可选）：跨设备
 
@@ -517,7 +566,12 @@ WantedBy=multi-user.target
 - [x] `service/scheduler.rs`：`spawn_report_scheduler` 60s 心跳收盘 / 周末**自动触发**报告生成（`report_kinds_due` 纯函数决策 + `ensure_report` 仅补缺失基线版，已存在则跳过）
 - [x] `tests/report_scheduler.rs`：2 项（基线版只生成一次且不覆盖手动刷新、周报 ISO 周 period_key）
 - [x] Swift 端消费 `/api/v1/reviews`：`Sources/ReviewDesk.swift` 新增 `ReportClient`（list / run），`MarketStore.submitReview` 手动生成日报 / 周报、`MarketStore.loadReviewHistory` 拉取历史，复盘子页展示近 14 天报告
-- [ ] 新闻 / 研报 / 板块数据接入（§F.3–F.4）
+- [x] `migrations/20250918000006_ingest.sql`：`news_item` / `research_report` / `sector_board` 三张缓存表（按 `(code,url)` / `(code,info_code)` / `(code,board_code)` 主键 UPSERT）
+- [x] `service/ingest.rs`：东财新闻（全文搜索）/ 研报（研报库）/ 板块（成分 + 批量行情）三个 provider，北京时间统一转 UTC
+- [x] `api/ingest.rs`：`GET /api/v1/news/{code}`（?limit=&hours=）、`GET /api/v1/reports/{code}`（?limit=&days=）、`GET /api/v1/sector/{code}` + OpenAPI
+- [x] `tests/ingest_integration.rs`：8 项（新闻解析 / 时间窗 / 重复拉取幂等、研报字段与详情页 URL、板块成分与行情合并、非法代码 400 不打上游、上游 5xx → 502、analyze 注入近 24h 新闻、默认不注入）+ 3 项 live 测试（`#[ignore]`，直连东财）
+- [x] `api/ai.rs`：`POST /api/v1/ai/analyze` 新增 `include_news`（默认 false），命中近 24h 新闻（≤5 条）拼进 prompt 并顺带落库；拉取失败只 warn 不阻断分析
+- [x] `service/scheduler.rs`：`spawn_ingest_scheduler` 工作日 16:00 后为自选股（≤60 只，300ms 间隔）增量刷新新闻 / 研报 / 板块，同日只跑一次
 - [ ] 目标设备 / 局域网端到端联调报告
 
 ---

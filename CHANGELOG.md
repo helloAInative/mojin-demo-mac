@@ -18,6 +18,9 @@
 - 收盘复盘 / 周报生成 API（`/api/v1/reviews`、`/api/v1/reviews/run`），按 `(kind, period_key)` 幂等落库
 - Swift 复盘页接入后端报告：`ReportClient` 调用 `/api/v1/reviews*`，支持手动生成日报 / 周报与历史列表
 - 收盘 / 周末自动触发报告：`spawn_report_scheduler` 60s 心跳按北京时间补生成缺失的日报 / 周报基线版，已存在记录不覆盖，手动刷新仍走 `/api/v1/reviews/run`
+- 新闻 / 研报 / 概念板块数据接入（§F.3–F.4）：`GET /api/v1/news/{code}`、`/api/v1/reports/{code}`、`/api/v1/sector/{code}` 按需拉取东财并 UPSERT 落 `news_item` / `research_report` / `sector_board` 缓存表
+- `POST /api/v1/ai/analyze` 新增 `include_news`：开启后把近 24h 新闻（≤5 条）拼进 prompt，拉取失败只告警不阻断分析
+- `spawn_ingest_scheduler`：工作日 16:00 后为自选股（≤60 只，300ms 间隔）增量刷新新闻 / 研报 / 板块，同日只跑一次
 
 ### Fixed
 

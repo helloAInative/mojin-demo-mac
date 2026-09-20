@@ -24,6 +24,7 @@ use crate::service::ai::{
     prompt::SYSTEM_PROMPT,
     ChatMessage, ChatRequest, ProviderError,
 };
+use crate::service::ingest;
 use crate::state::AppState;
 use actix_web::{web, HttpResponse};
 use chrono::Utc;
@@ -220,6 +221,8 @@ pub struct AnalyzeRequest {
     pub code: Option<String>,
     /// 当前价；缺省 0
     pub price: Option<f64>,
+    /// 是否把「近 24h 新闻」拼进 prompt（§F.3；需要 `code`）
+    pub include_news: Option<bool>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -278,6 +281,7 @@ pub async fn analyze(
         .system
         .clone()
         .unwrap_or_else(|| SYSTEM_PROMPT.to_string());
+    let user_content = with_recent_news(&state, &req).await;
     let messages = vec![
         ChatMessage {
             role: "system".into(),
@@ -285,7 +289,7 @@ pub async fn analyze(
         },
         ChatMessage {
             role: "user".into(),
-            content: req.user.clone(),
+            content: user_content.clone(),
         },
     ];
     let temperature = req.temperature.unwrap_or(0.4);
@@ -319,7 +323,7 @@ pub async fn analyze(
                 resp.usage.completion_tokens as i64,
                 resp.usage.cost_usd,
                 elapsed,
-                (sys.len() + req.user.len()) as i64,
+                (sys.len() + user_content.len()) as i64,
                 resp.text.chars().count() as i64,
                 true,
                 false,
@@ -381,7 +385,7 @@ pub async fn analyze(
                 0,
                 0.0,
                 elapsed,
-                (sys.len() + req.user.len()) as i64,
+                (sys.len() + user_content.len()) as i64,
                 0,
                 false,
                 false,
@@ -458,7 +462,6 @@ pub async fn reflect(
     let key = req.api_key.clone().unwrap_or_default();
     let provider = ai::resolve(&provider_id, &base_url, &key)
         .map_err(|e| map_provider_error(e, &provider_id, &model))?;
-    let bucket = format!("{provider_id}/{model}");
 
     let temperature = req.temperature.unwrap_or(0.4);
     let max_tokens = req.max_tokens.unwrap_or(600);
@@ -668,6 +671,48 @@ pub async fn feedback(
 }
 
 // ---- 内部 helpers ----
+
+/// §F.3：把「近 24h 新闻」拼到用户 prompt 后面（opt-in，需要 `code`）。
+///
+/// 拉取失败只 warn，不阻断分析；命中条数最多 5 条。
+async fn with_recent_news(state: &AppState, req: &AnalyzeRequest) -> String {
+    let original = req.user.clone();
+    if !req.include_news.unwrap_or(false) {
+        return original;
+    }
+    let Some(code) = req.code.as_deref().filter(|c| !c.is_empty()) else {
+        return original;
+    };
+    let items = match state.news.fetch(&state.http, code, 10).await {
+        Ok(items) => items,
+        Err(error) => {
+            tracing::warn!(%error, code, "fetch news for analyze failed; skip injection");
+            return original;
+        }
+    };
+    let since = Utc::now() - chrono::Duration::hours(24);
+    let recent: Vec<_> = items
+        .into_iter()
+        .filter(|item| item.published_at >= since)
+        .take(5)
+        .collect();
+    if recent.is_empty() {
+        return original;
+    }
+    if let Err(error) = ingest::persist_news(&state.db, &recent).await {
+        tracing::warn!(%error, code, "failed to persist news used by analyze");
+    }
+    let mut text = format!("{original}\n\n近 24h 新闻：");
+    for item in &recent {
+        text.push_str(&format!(
+            "\n- [{}] {} ({})",
+            item.media,
+            item.title,
+            item.published_at.format("%m-%d %H:%M")
+        ));
+    }
+    text
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn insert_usage(

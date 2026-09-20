@@ -21,8 +21,8 @@
   - 本机联调通过：smoke 全部 ✅，200 并发 P95 < 200ms（待目标设备验证）
 - ✅ 阶段 2：AI 网关（OpenAI 兼容 / Ollama、用量、命中率、熔断）
 - ✅ 阶段 3：信号 / 持仓 / 自选 / 设置 API 与 Swift 双向同步
-- 🚧 阶段 4：WebSocket 行情推送 + 自选股交易时段调度 + 收盘复盘 / 周报生成（按需 API + 收盘 / 周末自动触发，按 `(kind, period_key)` 幂等，9 项集成测试）已完成，Swift 端已接入复盘历史 / 手动生成；新闻 / 研报 / 板块数据接入待实现
-- ✅ 测试全绿（2026-09-20 复跑 `cargo test --offline`）：单元 13 项 + 集成 28 项（行情 5 / AI 5+6 / 数据 3 / 复盘 7 / 报告调度 2），另有 2 项真实外网用例默认 `#[ignore]`
+- 🚧 阶段 4：WebSocket 行情推送 + 自选股交易时段调度 + 收盘复盘 / 周报生成（按需 API + 收盘 / 周末自动触发，按 `(kind, period_key)` 幂等，9 项集成测试）已完成，Swift 端已接入复盘历史 / 手动生成；**新闻 / 研报 / 板块数据接入（§F.3–F.4）已完成**（按需 API + 每日收盘后增量刷新，Swift 端展示未接）
+- ✅ 测试全绿（2026-09-20 复跑 `cargo test --offline`）：单元 18 项 + 集成 36 项（行情 5 / AI 5+6 / 数据 3 / 复盘 7 / 报告调度 2 / 数据接入 8），另有 5 项真实外网用例默认 `#[ignore]`；3 项数据接入 live 用例已联网验证通过
 
 ---
 
@@ -191,6 +191,18 @@ Swift 复盘页通过 `ReportClient` 调用这两个接口：手动生成日报 
 
 自动触发：`spawn_report_scheduler` 独立 60s 心跳（与 3s 行情轮询分离）。北京时间工作日 15:05 后补当日日报，周五 15:05 后与周六 / 周日补周报（覆盖周五晚间服务器未开机的情况）。仅当 `(kind, period_key)` 不存在时生成一份无客户端 context 的基线版，已存在则跳过；之后仍可手动 `POST /reviews/run` 带日记 / 委托刷新同一条记录。
 
+### 新闻 / 研报 / 概念板块（§F.3–F.4）
+
+三个端点都是"按需拉取东财 + UPSERT 落库"：上游成功即写 SQLite（`news_item` / `research_report` / `sector_board`），客户端可反复读、断网可离线读库。
+
+- `GET /api/v1/news/{code}?limit=20&hours=72`：东财全文搜索个股新闻，按发布时间倒序；`hours` 为响应的时间窗（落库的是全量，窗口只作用于返回）。条目缺少链接会被丢弃。
+- `GET /api/v1/reports/{code}?limit=20&days=365`：东财研报库，含机构 / 评级 / 上次评级 / 评级变动 / 分析师 / 目标价上下限，`url` 指向东财研报详情页。
+- `GET /api/v1/sector/{code}`：先拉成分列表（`RPT_F10_CORETHEME_BOARDTYPE`，最多 50 个板块），再用 `ulist.np` 批量补板块指数与涨跌幅；停牌 / 无数据时 `price` / `change_pct` 为 `null`。
+
+`POST /api/v1/ai/analyze` 新增可选 `include_news: true`（需要 `code`）：开启后把近 24h 新闻（≤5 条）拼到 prompt 末尾（`近 24h 新闻：` + 每行 `[媒体] 标题 (MM-DD HH:MM)`），并顺带把用到的新闻落库；拉取失败只记 `warn`，不影响分析本身。默认关闭。
+
+自动刷新：`spawn_ingest_scheduler` 独立 5 分钟心跳，北京时间工作日 16:00 之后为自选股（≤60 只，逐只间隔 300ms）增量刷新新闻 / 研报 / 板块，同一天只跑一次；单只标的某个源失败只告警，不中断其余标的。
+
 ### 错误响应
 
 ```json
@@ -231,7 +243,8 @@ mojinprince-server/
 │   ├── 20250918000002_ai_usage.sql       # ai_usage / ai_feedback
 │   ├── 20250918000003_signal_position.sql# signal_event / position / watchlist
 │   ├── 20250918000004_settings.sql       # settings
-│   └── 20250918000005_scheduled_report.sql # scheduled_report（复盘 / 周报）
+│   ├── 20250918000005_scheduled_report.sql # scheduled_report（复盘 / 周报）
+│   └── 20250918000006_ingest.sql         # news_item / research_report / sector_board
 ├── scripts/
 │   ├── dev-up.sh                 # 后台启动 + 等待就绪
 │   ├── smoke.sh                  # 冒烟
@@ -239,11 +252,11 @@ mojinprince-server/
 │   └── verify.sh                 # 一键端到端：起 + 冒烟 + 压测
 ├── src/
 │   ├── lib.rs                    # 业务模块汇总（让 tests 可用）
-│   ├── bin/mojinprince-server.rs # 启动入口 + 路由注册 + 两个 scheduler 接线
+│   ├── bin/mojinprince-server.rs # 启动入口 + 路由注册 + 三个 scheduler 接线
 │   ├── config.rs
 │   ├── state.rs
 │   ├── error.rs
-│   ├── model/                    # quote / ai / data / review DTO
+│   ├── model/                    # quote / ai / data / review / ingest DTO
 │   ├── api/
 │   │   ├── mod.rs
 │   │   ├── health.rs
@@ -252,11 +265,13 @@ mojinprince-server/
 │   │   ├── data.rs               # 阶段 3：signals / positions / watchlist / settings
 │   │   ├── review.rs             # 阶段 4：reviews / reviews/run
 │   │   ├── ws.rs                 # 阶段 4：/ws/quote 推送
+│   │   ├── ingest.rs             # §F.3–F.4：news / reports / sector
 │   │   └── openapi.rs            # ApiDoc 汇总
 │   ├── repo/                     # signal / settings 数据访问
 │   └── service/
 │       ├── mod.rs
-│       ├── scheduler.rs          # 阶段 4：交易时段轮询 + 收盘 / 周末自动补报告
+│       ├── scheduler.rs          # 阶段 4：交易时段轮询 + 收盘 / 周末自动补报告 + 每日数据接入刷新
+│       ├── ingest.rs             # §F.3–F.4：东财新闻 / 研报 / 板块 provider + 落库
 │       ├── ai/                   # mod / openai / ollama / governor / prompt
 │       └── quote/
 │           ├── mod.rs            # enum 派发 + normalize_code
@@ -271,7 +286,8 @@ mojinprince-server/
 │   ├── ai_phase2_features.rs     # 阶段 2 analyze / reflect / accuracy / feedback / governor
 │   ├── data_phase3.rs            # 阶段 3 数据接口
 │   ├── review_phase4.rs          # 阶段 4 复盘 / 周报幂等
-│   └── report_scheduler.rs       # 阶段 4：自动触发报告（基线版 / ISO 周 key）
+│   ├── report_scheduler.rs       # 阶段 4：自动触发报告（基线版 / ISO 周 key）
+│   └── ingest_integration.rs     # §F.3–F.4：8 项 mock + 3 项 live（新闻 / 研报 / 板块 / analyze 注入）
 └── target/                       # 构建产物（gitignore）
 ```
 

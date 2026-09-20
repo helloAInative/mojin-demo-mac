@@ -1,6 +1,7 @@
 //! 全局共享状态：DB 连接池、HTTP 客户端、行情 failover 引擎
 use crate::config::Config;
 use crate::model::Quote;
+use crate::service::ingest::{EastMoneyNews, EastMoneyReports, EastMoneySector};
 use crate::service::quote::failover::QuoteFailover;
 use sqlx::SqlitePool;
 use std::str::FromStr;
@@ -45,6 +46,12 @@ pub struct AppState {
     pub ai_http: reqwest::Client,
     pub failover: Arc<QuoteFailover>,
     pub quote_hub: QuoteHub,
+    /// §F.3 新闻（东财全文搜索）
+    pub news: EastMoneyNews,
+    /// §F.4 研报（东财研报库）
+    pub reports: EastMoneyReports,
+    /// 概念板块（成分 + 行情）
+    pub sector: EastMoneySector,
 }
 
 impl AppState {
@@ -97,6 +104,9 @@ impl AppState {
             ai_http,
             failover,
             quote_hub: QuoteHub::new(512),
+            news: EastMoneyNews::default(),
+            reports: EastMoneyReports::default(),
+            sector: EastMoneySector::default(),
         })
     }
 }

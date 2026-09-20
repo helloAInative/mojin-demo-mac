@@ -7,6 +7,7 @@
 
 use crate::error::AppError;
 use crate::model::{Quote, ReviewContext, ScheduledReport};
+use crate::service::ingest;
 use crate::state::AppState;
 use chrono::{Datelike, FixedOffset, NaiveDate, Timelike, Utc, Weekday};
 use std::time::Duration;
@@ -537,6 +538,82 @@ fn cn_date_end_ms(date: NaiveDate) -> i64 {
     dt.timestamp_millis()
 }
 
+// ============================================================================
+// §F.3–F.4 每日增量拉取：自选股新闻 / 研报 / 概念板块
+// ============================================================================
+
+/// 收盘后为自选股增量刷新新闻 / 研报 / 板块（每 5 分钟心跳，工作日 16:00 后只跑一次）。
+pub fn spawn_ingest_scheduler(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last_run: Option<NaiveDate> = None;
+        loop {
+            let offset = FixedOffset::east_opt(CN_OFFSET_SECS).expect("valid UTC+8 offset");
+            let now = Utc::now().with_timezone(&offset);
+            if ingest_due(now, last_run) {
+                match refresh_watchlist_ingest(&state).await {
+                    Ok(count) => {
+                        last_run = Some(now.date_naive());
+                        tracing::info!(count, "ingest refresh done");
+                    }
+                    Err(error) => tracing::warn!(%error, "ingest refresh failed"),
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(300)).await;
+        }
+    })
+}
+
+/// 工作日 16:00 之后（收盘 + 数据源更新完成）触发；同一天只跑一次。
+fn ingest_due(now: chrono::DateTime<FixedOffset>, last_run: Option<NaiveDate>) -> bool {
+    let after = now.hour() * 60 + now.minute() >= 16 * 60;
+    let weekday_ok = matches!(
+        now.weekday(),
+        Weekday::Mon | Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri
+    );
+    after && weekday_ok && last_run != Some(now.date_naive())
+}
+
+/// 为自选股刷新新闻（近 72h 已由接口时间窗覆盖，这里取最新 20 条）、
+/// 研报（近 90 天）与板块行情，逐标的落库；单标的失败不影响其余。
+pub async fn refresh_watchlist_ingest(state: &AppState) -> anyhow::Result<usize> {
+    let codes: Vec<String> = sqlx::query_scalar(
+        "SELECT code FROM watchlist ORDER BY pinned DESC, added_at ASC LIMIT 60",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let mut refreshed = 0usize;
+    for code in &codes {
+        let mut ok = true;
+        match state.news.fetch(&state.http, code, 20).await {
+            Ok(items) => ingest::persist_news(&state.db, &items).await?,
+            Err(error) => {
+                ok = false;
+                tracing::warn!(%code, %error, "scheduled news refresh failed");
+            }
+        }
+        match state.reports.fetch(&state.http, code, 20, 90).await {
+            Ok(items) => ingest::persist_reports(&state.db, &items).await?,
+            Err(error) => {
+                ok = false;
+                tracing::warn!(%code, %error, "scheduled report refresh failed");
+            }
+        }
+        match state.sector.fetch(&state.http, code).await {
+            Ok(boards) => ingest::persist_sector_boards(&state.db, &boards).await?,
+            Err(error) => {
+                ok = false;
+                tracing::warn!(%code, %error, "scheduled sector refresh failed");
+            }
+        }
+        if ok {
+            refreshed += 1;
+        }
+        // 东财接口对高频调用不友好，逐标的之间留一点间隔
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    Ok(refreshed)
+}
+
 /// 用 `kind + period_key` 生成稳定 id（同一 (kind, period_key) 永远同一 id）。
 fn uuid_like(period_key: &str, kind: &str) -> String {
     // 简单哈希；不加密学安全，但 SQLite 里 PRIMARY KEY 唯一即可。
@@ -597,5 +674,22 @@ mod review_tests {
         assert_eq!(a, b);
         let c = uuid_like("2026-09-21", "daily");
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn ingest_due_fires_once_after_close_on_weekdays() {
+        let tz = FixedOffset::east_opt(CN_OFFSET_SECS).unwrap();
+        let friday_1630 = tz.with_ymd_and_hms(2026, 9, 25, 16, 30, 0).unwrap();
+        assert!(ingest_due(friday_1630, None));
+        assert!(!ingest_due(friday_1630, Some(friday_1630.date_naive())));
+    }
+
+    #[test]
+    fn ingest_due_skips_before_close_and_weekends() {
+        let tz = FixedOffset::east_opt(CN_OFFSET_SECS).unwrap();
+        let friday_morning = tz.with_ymd_and_hms(2026, 9, 25, 10, 0, 0).unwrap();
+        let saturday_1630 = tz.with_ymd_and_hms(2026, 9, 26, 16, 30, 0).unwrap();
+        assert!(!ingest_due(friday_morning, None));
+        assert!(!ingest_due(saturday_1630, None));
     }
 }

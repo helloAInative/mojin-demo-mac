@@ -4,6 +4,7 @@ use utoipa::OpenApi;
 use super::ai;
 use super::data;
 use super::health;
+use super::ingest;
 use super::quote;
 use super::review;
 
@@ -41,6 +42,9 @@ use super::review;
         data::put_settings,
         review::list,
         review::run,
+        ingest::get_news,
+        ingest::get_reports,
+        ingest::get_sector,
     ),
     components(
         schemas(
@@ -63,6 +67,9 @@ use super::review;
             crate::model::ReviewContext,
             crate::model::TicketSummary,
             crate::model::ClientSignal,
+            crate::model::NewsItem,
+            crate::model::ResearchReport,
+            crate::model::SectorBoard,
             crate::state::QuotePushEvent,
             crate::error::AppErrorBody,
         )
@@ -73,6 +80,7 @@ use super::review;
         (name = "ai", description = "OpenAI 兼容接口 / Ollama / 用量账本"),
         (name = "data", description = "信号 / 持仓 / 自选 / 设置"),
         (name = "review", description = "收盘复盘 / 周报（按日期幂等）"),
+        (name = "ingest", description = "新闻 / 研报 / 概念板块（东财按需拉取 + 落库）"),
         (name = "realtime", description = "WebSocket 实时行情：/api/v1/ws/quote")
     )
 )]

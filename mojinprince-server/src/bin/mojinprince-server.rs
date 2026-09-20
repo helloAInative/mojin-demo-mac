@@ -23,6 +23,8 @@ async fn main() -> anyhow::Result<()> {
         mojinprince_server::service::scheduler::spawn_quote_scheduler(state.clone());
     let _report_scheduler =
         mojinprince_server::service::scheduler::spawn_report_scheduler(state.clone());
+    let _ingest_scheduler =
+        mojinprince_server::service::scheduler::spawn_ingest_scheduler(state.clone());
 
     let bind = cfg.bind_addr.clone();
     let prefix = cfg.api_prefix.clone();
@@ -43,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
                     .configure(api::ai::configure)
                     .configure(api::data::configure)
                     .configure(api::review::configure)
+                    .configure(api::ingest::configure)
                     .configure(api::ws::configure),
             )
     })
