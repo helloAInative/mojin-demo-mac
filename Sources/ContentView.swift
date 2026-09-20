@@ -32,7 +32,30 @@ struct ContentView: View {
     @State private var tradeStoryText = ""
     @State private var showPositionDetails = false
     @State private var copiedPositionSummary = ""
+    /// 阶段 4：复盘页后端报告相关 UI 状态。
+    @State private var serverReport: ScheduledReport?
+    @State private var reviewHint: String = ""
+    @State private var reviewHistory: [ScheduledReport] = []
+    @State private var reviewHistoryKind: ReviewKindFilter = .all
     var embeddedInMenu: Bool = false
+
+    enum ReviewKindFilter: Hashable {
+        case all, daily, weekly
+
+        var asReviewKind: ReviewKind? {
+            switch self {
+            case .all: return nil
+            case .daily: return .daily
+            case .weekly: return .weekly
+            }
+        }
+    }
+
+    private func refreshReviewHistory() async {
+        let kind = reviewHistoryKind.asReviewKind
+        let list = await store.loadReviewHistory(kind: kind, limit: 14)
+        reviewHistory = list
+    }
 
     enum PanelTab: String, CaseIterable {
         case watch = "盯盘"
@@ -1523,7 +1546,36 @@ struct ContentView: View {
                             .font(.system(size: 10, weight: .bold))
                         Spacer()
                         Button("生成今日") {
+                            store.submitReview(kind: .daily) { result in
+                                switch result {
+                                case .success(let report):
+                                    serverReport = report
+                                    tradeStoryText = report.body
+                                    reviewHint = "已落库 · \(report.title) · \(report.periodKey)"
+                                    Task { await refreshReviewHistory() }
+                                case .failure(let err):
+                                    reviewHint = "生成失败：\(err.localizedDescription)"
+                                }
+                            }
+                        }
+                        .controlSize(.mini)
+                        Button("生成本周") {
+                            store.submitReview(kind: .weekly) { result in
+                                switch result {
+                                case .success(let report):
+                                    serverReport = report
+                                    tradeStoryText = report.body
+                                    reviewHint = "已落库 · \(report.title) · \(report.periodKey)"
+                                    Task { await refreshReviewHistory() }
+                                case .failure(let err):
+                                    reviewHint = "生成失败：\(err.localizedDescription)"
+                                }
+                            }
+                        }
+                        .controlSize(.mini)
+                        Button("本地预览") {
                             tradeStoryText = store.tradeStoryText(day: day)
+                            reviewHint = "本地拼接（未上后端）"
                         }
                         .controlSize(.mini)
                         Button("复制") {
@@ -1533,7 +1585,12 @@ struct ContentView: View {
                         .controlSize(.mini)
                         .disabled(tradeStoryText.isEmpty)
                     }
-                    Text(tradeStoryText.isEmpty ? "拼接：日记 + 信号 + 委托照抄" : tradeStoryText)
+                    if !reviewHint.isEmpty {
+                        Text(reviewHint)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Text(tradeStoryText.isEmpty ? "点「生成今日 / 生成本周」走后端，或「本地预览」拼一份" : tradeStoryText)
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(tradeStoryText.isEmpty ? .tertiary : .primary)
                         .textSelection(.enabled)
@@ -1542,6 +1599,59 @@ struct ContentView: View {
                 }
                 .padding(4)
             }
+
+            // 复盘历史（从后端拉，按 kind 过滤）
+            GroupBox {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("复盘历史 · 后端持久化")
+                            .font(.system(size: 10, weight: .bold))
+                        Spacer()
+                        Picker("", selection: $reviewHistoryKind) {
+                            Text("全部").tag(ReviewKindFilter.all)
+                            Text("日报").tag(ReviewKindFilter.daily)
+                            Text("周报").tag(ReviewKindFilter.weekly)
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 160)
+                        Button("刷新") {
+                            Task { await refreshReviewHistory() }
+                        }
+                        .controlSize(.mini)
+                    }
+                    if reviewHistory.isEmpty {
+                        Text("暂无报告。先点「生成今日 / 生成本周」")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                    } else {
+                        ForEach(reviewHistory) { r in
+                            HStack(alignment: .top, spacing: 8) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(r.title)
+                                        .font(.system(size: 10, weight: .semibold))
+                                    Text("\(r.kind) · \(r.periodKey) · \(r.createdAt.formatted(date: .abbreviated, time: .shortened))")
+                                        .font(.system(size: 9))
+                                        .foregroundStyle(.secondary)
+                                    Text(r.body.prefix(140).description)
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(3)
+                                }
+                                Spacer()
+                                Button("展开") {
+                                    tradeStoryText = r.body
+                                    serverReport = r
+                                    reviewHint = "已加载 · \(r.title)"
+                                }
+                                .controlSize(.mini)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+                .padding(4)
+            }
+            .onAppear { Task { await refreshReviewHistory() } }
 
             TextField("检索复盘（标的/日期/关键词）", text: $diaryQuery)
                 .textFieldStyle(.roundedBorder)

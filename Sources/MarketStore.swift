@@ -92,6 +92,7 @@ final class MarketStore: ObservableObject {
     let settings: AppSettings
 
     private var quoteTask: Task<Void, Never>?
+    private var quoteStreamTask: Task<Void, Never>?
     private var minuteTask: Task<Void, Never>?
     private var dailyTask: Task<Void, Never>?
     private var listTask: Task<Void, Never>?
@@ -99,6 +100,7 @@ final class MarketStore: ObservableObject {
     private var retryTask: Task<Void, Never>?
     private var aiTask: Task<Void, Never>?
     private var started = false
+    private var quoteStreamConnected = false
     private var pendingRetry = 0
 
     private var lastPriceForLevel: Double?
@@ -225,10 +227,20 @@ final class MarketStore: ObservableObject {
         syncTicketFromMarket(forcePrice: true)
         restartLoops()
         Task { await prefetchWatchlistDaily() }
+        Task { [weak self] in
+            let previousCode = self?.settings.currentCode
+            await self?.settings.syncGatewayData()
+            if let self, previousCode != self.settings.currentCode {
+                self.switchSymbol(self.settings.currentCode)
+            }
+            guard let remote = try? await GatewayMarketClient.signals() else { return }
+            self?.signalEvents = SignalTimeline.mergeRemote(remote)
+        }
     }
 
     func restartLoops() {
         quoteTask?.cancel()
+        quoteStreamTask?.cancel()
         minuteTask?.cancel()
         dailyTask?.cancel()
         listTask?.cancel()
@@ -247,7 +259,25 @@ final class MarketStore: ObservableObject {
             while !Task.isCancelled {
                 await self?.refreshQuote()
                 self?.sessionLabel = TradingSession.current().label
-                try? await Task.sleep(nanoseconds: TradingSession.current().quoteInterval)
+                let interval = self?.quoteStreamConnected == true
+                    ? max(TradingSession.current().quoteInterval, 15_000_000_000)
+                    : TradingSession.current().quoteInterval
+                try? await Task.sleep(nanoseconds: interval)
+            }
+        }
+        quoteStreamTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    let updates = try await GatewayMarketClient.quoteUpdates()
+                    for try await update in updates {
+                        guard !Task.isCancelled else { break }
+                        self?.quoteStreamConnected = true
+                        self?.applyPushedQuote(update)
+                    }
+                } catch {
+                    self?.quoteStreamConnected = false
+                }
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
         }
         minuteTask = Task { [weak self] in
@@ -288,6 +318,7 @@ final class MarketStore: ObservableObject {
     func stop() {
         started = false
         quoteTask?.cancel()
+        quoteStreamTask?.cancel()
         minuteTask?.cancel()
         dailyTask?.cancel()
         listTask?.cancel()
@@ -550,6 +581,57 @@ final class MarketStore: ObservableObject {
         )
     }
 
+    /// 阶段 4：调后端生成复盘 / 周报。
+    /// - `kind=daily` 按当日 date 幂等；`kind=weekly` 按 ISO 周幂等。
+    /// - 客户端把当日的日记 + 委托 + 信号打包到 `payload.context`，
+    ///   后端再补上"AI 调用 / level 命中 / 后端信号时间线"。
+    /// - 返回的报告已经写入数据库，前端只需展示。
+    func submitReview(
+        kind: ReviewKind,
+        day: String? = nil,
+        completion: ((Result<ScheduledReport, Error>) -> Void)? = nil
+    ) {
+        let d = day ?? Self.todayString()
+        let diary = settings.diaryText(day: d)
+        let ctx = ReviewContextPayload.from(
+            diary: diary,
+            tickets: ticketHistory,
+            signals: signalEvents
+        )
+        guard let url = URL(string: settings.marketServerURL) else {
+            completion?(.failure(ReportClientError.network(message: "marketServerURL 非法：\(settings.marketServerURL)")))
+            return
+        }
+        let client = ReportClient(baseURL: url)
+        status = "正在生成\(kind == .weekly ? "周报" : "日报")…"
+        Task { [weak self] in
+            do {
+                let report = try await client.run(kind: kind, context: ctx)
+                await MainActor.run {
+                    self?.status = "复盘已生成 · \(report.title)"
+                    completion?(.success(report))
+                }
+            } catch {
+                await MainActor.run {
+                    self?.status = "复盘生成失败：\(error.localizedDescription)"
+                    completion?(.failure(error))
+                }
+            }
+        }
+    }
+
+    /// 拉取后端已落库的复盘历史。
+    func loadReviewHistory(kind: ReviewKind? = nil, limit: Int = 7) async -> [ScheduledReport] {
+        guard let url = URL(string: settings.marketServerURL) else { return [] }
+        let client = ReportClient(baseURL: url)
+        do {
+            return try await client.list(kind: kind, limit: limit)
+        } catch {
+            status = "拉取复盘历史失败：\(error.localizedDescription)"
+            return []
+        }
+    }
+
     func selectBoardIndex(_ code: String) {
         if selectedIndexCode == code {
             selectedIndexCode = nil
@@ -681,6 +763,35 @@ final class MarketStore: ObservableObject {
         failStreak = 0
         pendingRetry = 0
         status = "\(sessionLabel) · \(voted.badge)"
+        patchTodayClose(q.price)
+        persist()
+        maybeSessionBriefs(q)
+        maybeAutoAIAnalyze()
+        checkLevelAlerts()
+        checkLevelHits()
+        checkPositionAlert()
+        refreshNotifyQuota()
+    }
+
+    private func applyPushedQuote(_ update: GatewayQuoteUpdate) {
+        let q = update.quote
+        guard q.price > 0 else { return }
+        watchQuotes[update.code] = q
+        guard update.code == settings.currentCode else { return }
+        if !q.name.isEmpty, let index = settings.symbols.firstIndex(where: { $0.code == update.code }),
+           settings.symbols[index].name != q.name {
+            settings.symbols[index].name = q.name
+            settings.save()
+        }
+        evaluateAlerts(old: lastPriceForLevel, new: q)
+        lastPriceForLevel = q.price
+        quote = q
+        evaluateComboStrategies()
+        liveOK = true
+        usingCache = false
+        failStreak = 0
+        pendingRetry = 0
+        status = "\(sessionLabel) · WebSocket · \(q.source)"
         patchTodayClose(q.price)
         persist()
         maybeSessionBriefs(q)
