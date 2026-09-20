@@ -15,7 +15,7 @@ jobs:
       run:
         working-directory: mojinprince-server
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -26,11 +26,25 @@ jobs:
       - run: cargo test --locked
 
   macos:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build app bundle
-        run: BUILD_ONLY=1 ./build.sh
+        shell: bash
+        run: |
+          set +e
+          BUILD_ONLY=1 ./build.sh 2>&1 | tee build.log
+          status=${PIPESTATUS[0]}
+          if (( status != 0 )); then
+            python3 - <<'PY'
+          from pathlib import Path
+
+          lines = Path("build.log").read_text(errors="replace").splitlines()[-60:]
+          message = "\n".join(lines).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error title=macOS app build failed::{message}")
+          PY
+          fi
+          exit "$status"
       - name: Verify bundle
         run: |
           plutil -lint "build/摸金小王子.app/Contents/Info.plist"
