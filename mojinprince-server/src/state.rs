@@ -10,6 +10,7 @@ pub struct AppState {
     pub cfg: Arc<Config>,
     pub db: SqlitePool,
     pub http: reqwest::Client,
+    pub ai_http: reqwest::Client,
     pub failover: Arc<QuoteFailover>,
 }
 
@@ -46,6 +47,10 @@ impl AppState {
             .timeout(std::time::Duration::from_millis(cfg.quote_timeout_ms))
             .user_agent("mojinprince-server/0.1 (+https://github.com/mojinprince)")
             .build()?;
+        let ai_http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(cfg.ai_timeout_ms))
+            .user_agent("mojinprince-server/0.2 (+https://github.com/helloAInative/mojin-demo-mac)")
+            .build()?;
 
         let failover = Arc::new(QuoteFailover::new(
             cfg.quote_sources.clone(),
@@ -56,6 +61,7 @@ impl AppState {
             cfg: Arc::new(cfg),
             db: pool,
             http,
+            ai_http,
             failover,
         })
     }

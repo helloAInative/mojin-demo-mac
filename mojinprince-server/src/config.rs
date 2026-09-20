@@ -8,6 +8,8 @@ pub struct Config {
     pub database_url: String,
     /// 单次行情请求超时（毫秒）
     pub quote_timeout_ms: u64,
+    /// 单次 AI 请求超时（毫秒）
+    pub ai_timeout_ms: u64,
     /// 单源连续失败 N 次后切换备用源
     pub quote_fail_threshold: u32,
     /// 主源选择顺序：逗号分隔，如 "sina,tencent,eastmoney"
@@ -28,6 +30,10 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(3000);
+        let ai_timeout_ms = env::var("AI_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(65_000);
         let quote_fail_threshold = env::var("QUOTE_FAIL_THRESHOLD")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -43,6 +49,7 @@ impl Config {
             bind_addr,
             database_url,
             quote_timeout_ms,
+            ai_timeout_ms,
             quote_fail_threshold,
             quote_sources,
             api_prefix,

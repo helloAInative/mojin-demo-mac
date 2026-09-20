@@ -33,6 +33,15 @@ pub enum AppError {
     #[error("upstream parse error: {0}")]
     UpstreamParse(StrWrap),
 
+    #[error("AI upstream error: {0}")]
+    AiUpstream(StrWrap),
+
+    #[error("too many requests: {0}")]
+    TooManyRequests(StrWrap),
+
+    #[error("service unavailable: {0}")]
+    Unavailable(StrWrap),
+
     #[error("db error: {0}")]
     Db(#[from] sqlx::Error),
 
@@ -77,6 +86,9 @@ impl ResponseError for AppError {
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::UpstreamExhausted { .. } => StatusCode::BAD_GATEWAY,
             AppError::UpstreamParse(_) => StatusCode::BAD_GATEWAY,
+            AppError::AiUpstream(_) => StatusCode::BAD_GATEWAY,
+            AppError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            AppError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             AppError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -88,6 +100,9 @@ impl ResponseError for AppError {
             AppError::BadRequest(_) => "bad_request",
             AppError::UpstreamExhausted { .. } => "upstream_exhausted",
             AppError::UpstreamParse(_) => "upstream_parse",
+            AppError::AiUpstream(_) => "ai_upstream",
+            AppError::TooManyRequests(_) => "too_many_requests",
+            AppError::Unavailable(_) => "service_unavailable",
             AppError::Db(_) => "db_error",
             AppError::Internal(_) => "internal",
         };

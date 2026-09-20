@@ -33,7 +33,11 @@ async fn main() -> anyhow::Result<()> {
             .service(
                 SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-docs/openapi.json", openapi.clone()),
             )
-            .service(web::scope(&prefix).configure(api::quote::configure))
+            .service(
+                web::scope(&prefix)
+                    .configure(api::quote::configure)
+                    .configure(api::ai::configure),
+            )
     })
     .bind(bind)?
     .run()

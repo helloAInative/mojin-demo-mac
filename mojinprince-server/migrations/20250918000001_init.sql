@@ -39,3 +39,20 @@ CREATE TABLE IF NOT EXISTS day_bar (
     amount      REAL,
     PRIMARY KEY (code, date)
 );
+
+-- 阶段 2 起需要：信号事件表（架构文档 §6）
+CREATE TABLE IF NOT EXISTS signal_event (
+    id          TEXT PRIMARY KEY,        -- UUID
+    at          INTEGER NOT NULL,
+    kind        TEXT NOT NULL,           -- alert / ai / level / posAlert
+    code        TEXT NOT NULL,
+    title       TEXT,
+    body        TEXT,
+    price       REAL,
+    source      TEXT,
+    evidence    TEXT,
+    why         TEXT,
+    meta        TEXT                     -- JSON
+);
+CREATE INDEX IF NOT EXISTS idx_signal_at  ON signal_event(at DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_code ON signal_event(code, at DESC);
