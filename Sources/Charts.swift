@@ -1,0 +1,1006 @@
+import SwiftUI
+
+struct MinuteChart: View {
+    var bars: [MinuteBar]
+    var prev: Double
+    var base: Double
+    var support: Double
+    var resistance: Double
+    var aiSignal: AILatestSignal? = nil
+    /// 关键价位预警阈值（%），来自 settings.notifyConfig
+    var levelLightPct: Double = 0.30
+    var levelDeepPct: Double = 0.15
+    /// 持仓成本（0 表示未持仓，不画成本线）
+    var cost: Double = 0
+    /// 现价相对成本线预警阈值（%），默认 1.0
+    var costLightPct: Double = 1.0
+
+    @State private var hoverIndex: Int? = nil
+    @State private var hoverPoint: CGPoint = .zero
+
+    private static let session: [String] = {
+        var out: [String] = []
+        func push(_ h0: Int, _ m0: Int, _ h1: Int, _ m1: Int) {
+            var t = h0 * 60 + m0
+            let end = h1 * 60 + m1
+            while t <= end {
+                let hh = t / 60, mm = t % 60
+                out.append(String(format: "%02d%02d", hh, mm))
+                t += 1
+            }
+        }
+        push(9, 30, 11, 30)
+        push(13, 0, 15, 0)
+        return out
+    }()
+
+    var body: some View {
+        // TimelineView 驱动 Canvas 周期性重绘，用于关键价位闪烁
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { tl in
+            GeometryReader { geo in
+                ZStack(alignment: .topLeading) {
+                    Canvas { context, size in
+                        // 把 tl.date 转成 0..1 的相位（2s 周期），作为闪烁驱动
+                        let t = tl.date.timeIntervalSinceReferenceDate
+                        let phase = (sin(t * .pi) + 1) / 2  // 0..1
+                        draw(context: context, size: size,
+                          flashPhase: phase,
+                          flashPhaseDeep: (sin(t * 2 * .pi) + 1) / 2)
+                    }
+                    .drawingGroup()
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { value in
+                                updateHover(at: value.location, in: geo.size)
+                            }
+                            .onEnded { _ in
+                                hoverIndex = nil
+                            }
+                    )
+
+                    if let i = hoverIndex, i < bars.count {
+                        let b = bars[i]
+                        let tip = String(format: "%@  价%.2f  均%.2f  量%.0f",
+                                         fmtHM(b.minute), b.price, b.avg, b.vol)
+                        // 检查该 minute 是否落在某条 AI 事件的 ±1 分钟窗口内
+                        let hit = hoverEventNote(forMinute: b.minute)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(tip)
+                                .font(.system(size: 10, weight: .medium))
+                                .monospacedDigit()
+                            if let hit {
+                                Text("⚡ AI·" + hit)
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundColor(.orange)
+                            }
+                        }
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 4)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6))
+                        .position(
+                            x: min(max(hoverPoint.x, 70), geo.size.width - 70),
+                            y: max(14, hoverPoint.y - 18)
+                        )
+                        .allowsHitTesting(false)
+                    }
+                }
+            }
+        }
+    }
+
+    /// 根据 bar 的 minute 字符串（如 "0935"）找 ±1 分钟内的最近事件 note。
+    private func hoverEventNote(forMinute minute: String) -> String? {
+        guard let sig = aiSignal, !sig.events.isEmpty,
+              let n = Int(minute), minute.count == 4 else { return nil }
+        let hh = n / 100, mm = n % 100
+        let cur = hh * 60 + mm
+        // 排序后取第一个 minuteOffset 在 ±1 min 内的事件
+        for ev in sig.events {
+            if abs(ev.minuteOffset - cur) <= 1 {
+                if !ev.note.isEmpty { return ev.note }
+                return ev.kind == .volSpike ? "放量" : (ev.isUpArrow ? "上行信号" : "下行信号")
+            }
+        }
+        return nil
+    }
+
+    private func fmtHM(_ m: String) -> String {
+        guard m.count >= 4 else { return m }
+        return "\(m.prefix(2)):\(m.suffix(2))"
+    }
+
+    private func updateHover(at point: CGPoint, in size: CGSize) {
+        guard !bars.isEmpty else { return }
+        let padL: CGFloat = 2
+        let padR: CGFloat = 2
+        let slots = CGFloat(max(Self.session.count - 1, 1))
+        let ratio = (point.x - padL) / max(size.width - padL - padR, 1)
+        let idx = Int(round(ratio * slots))
+        hoverIndex = max(0, min(bars.count - 1, idx))
+        hoverPoint = point
+    }
+
+    private func draw(context: GraphicsContext, size: CGSize, flashPhase: Double = 0, flashPhaseDeep: Double = 0) {
+        guard !bars.isEmpty else {
+            let text = Text("等待分时…").font(.system(size: 11)).foregroundColor(.secondary)
+            context.draw(text, at: CGPoint(x: 8, y: size.height / 2))
+            return
+        }
+
+        let prices = bars.map(\.price)
+        var minP = min(prices.min() ?? prev, prev, support > 0 ? support : prev)
+        var maxP = max(prices.max() ?? prev, prev, resistance > 0 ? resistance : prev, base > 0 ? base : prev)
+        let pad = max((maxP - minP) * 0.1, 0.05)
+        minP -= pad
+        maxP += pad
+
+        let padL: CGFloat = 2
+        let padR: CGFloat = 2
+        let padT: CGFloat = 6
+        let padB: CGFloat = 4
+        let slots = CGFloat(max(Self.session.count - 1, 1))
+
+        func x(_ i: Int) -> CGFloat {
+            padL + CGFloat(i) / slots * (size.width - padL - padR)
+        }
+        func y(_ v: Double) -> CGFloat {
+            padT + (1 - (v - minP) / (maxP - minP)) * (size.height - padT - padB)
+        }
+
+        var prevLine = Path()
+        prevLine.move(to: CGPoint(x: padL, y: y(prev)))
+        prevLine.addLine(to: CGPoint(x: size.width - padR, y: y(prev)))
+        context.stroke(prevLine, with: .color(.white.opacity(0.25)), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+
+        // 关键价位线（base / support / resistance）：支持接近现价时闪烁
+        // 提示带 + 加粗线体——以 drawAlertLevels 集中绘制
+        let lastPrice = bars.last?.price ?? prev
+        drawAlertLevels(context: context,
+                        lastPrice: lastPrice,
+                        flashPhase: flashPhase,
+                        flashPhaseDeep: flashPhaseDeep,
+                        base: base, support: support, resistance: resistance,
+                        xLeft: padL, xRight: size.width - padR,
+                        y: y,
+                        lightPct: levelLightPct,
+                        deepPct: levelDeepPct)
+
+        let up = (lastPrice) >= prev
+        let color: Color = up ? Color(red: 1, green: 0.27, blue: 0.23) : Color(red: 0.2, green: 0.84, blue: 0.29)
+
+        var area = Path()
+        for (i, b) in bars.enumerated() {
+            let pt = CGPoint(x: x(i), y: y(b.price))
+            if i == 0 { area.move(to: pt) } else { area.addLine(to: pt) }
+        }
+        area.addLine(to: CGPoint(x: x(bars.count - 1), y: size.height - padB))
+        area.addLine(to: CGPoint(x: x(0), y: size.height - padB))
+        area.closeSubpath()
+        context.fill(area, with: .linearGradient(
+            Gradient(colors: [color.opacity(0.28), color.opacity(0)]),
+            startPoint: CGPoint(x: 0, y: padT),
+            endPoint: CGPoint(x: 0, y: size.height)
+        ))
+
+        var line = Path()
+        for (i, b) in bars.enumerated() {
+            let pt = CGPoint(x: x(i), y: y(b.price))
+            if i == 0 { line.move(to: pt) } else { line.addLine(to: pt) }
+        }
+        context.stroke(line, with: .color(color), lineWidth: 1.6)
+
+        if let i = hoverIndex, i < bars.count {
+            let hx = x(i)
+            let hy = y(bars[i].price)
+            var cross = Path()
+            cross.move(to: CGPoint(x: hx, y: padT))
+            cross.addLine(to: CGPoint(x: hx, y: size.height - padB))
+            cross.move(to: CGPoint(x: padL, y: hy))
+            cross.addLine(to: CGPoint(x: size.width - padR, y: hy))
+            context.stroke(cross, with: .color(.cyan.opacity(0.55)), style: StrokeStyle(lineWidth: 1, dash: [3, 2]))
+            context.fill(Path(ellipseIn: CGRect(x: hx - 3, y: hy - 3, width: 6, height: 6)), with: .color(.cyan))
+        }
+
+        // AI 关键价位标记（▲阻力/基，▼支撑/止）；每个标记在最右侧贴标签
+        if let sig = aiSignal {
+            drawAIMarkers(context: context,
+                          markers: sig.markers,
+                          xRight: size.width - padR,
+                          y: y,
+                          area: CGRect(x: padL, y: padT,
+                                        width: size.width - padL - padR,
+                                        height: size.height - padT - padB))
+            // 事件流（突破 / 跌破 / 量能异动 / 假突破 / 反转）
+            drawAIEvents(context: context,
+                         events: sig.events,
+                         chartW: size.width - padL - padR,
+                         padL: padL, padR: padR,
+                         y: y, yMin: padT, yMax: size.height - padB,
+                         prev: prev)
+        }
+
+        // Y 轴价格刻度（右贴文本，关键价位都用不同颜色）
+        drawYAxisTicks(context: context,
+                       y: y,
+                       xRight: size.width - padR,
+                       yMin: padT,
+                       yMax: size.height - padB,
+                       bars: bars,
+                       prev: prev,
+                       base: base,
+                       support: support,
+                       resistance: resistance)
+
+        // 持仓成本线 + 「到本」角标（接近现价 ±costLightPct% 时闪烁）
+        if cost > 0 {
+            drawCostLine(context: context,
+                         y: y,
+                         chartL: padL, chartR: size.width - padR,
+                         chartT: padT, chartB: size.height - padB,
+                         lastPrice: bars.last?.price ?? prev,
+                         flashPhase: flashPhase)
+        }
+
+        // X 轴时间刻度
+        drawXAxisTicks(context: context,
+                       padL: padL, padR: padR,
+                       yBottom: size.height - padB,
+                       totalW: size.width - padL - padR)
+    }
+
+    /// 在分时图上画 AI 事件流（折角箭头 + 标签）。
+    private func drawAIEvents(
+        context: GraphicsContext,
+        events: [AIEvent],
+        chartW: CGFloat,
+        padL: CGFloat, padR: CGFloat,
+        y: (Double) -> CGFloat,
+        yMin: CGFloat, yMax: CGFloat,
+        prev: Double
+    ) {
+        guard !events.isEmpty else { return }
+        let slots = CGFloat(max(Self.session.count - 1, 1))
+        for ev in events.prefix(6) {
+            // minuteOffset ∈ [0, session.count-1]；越界夹紧
+            let offset = CGFloat(min(max(ev.minuteOffset, 0), Int(slots)))
+            let ratio = offset / slots
+            let px = padL + ratio * chartW
+            let priceForY = ev.price > 0 ? ev.price : prev
+            let py = min(max(y(priceForY), yMin + 10), yMax - 10)
+
+            // 颜色：上=暖橙，下=冷青
+            let color: Color = ev.isUpArrow
+                ? Color(red: 1, green: 0.55, blue: 0.18)
+                : Color(red: 0.36, green: 0.78, blue: 1)
+
+            // 箭头：▲ / ▼
+            var tri = Path()
+            if ev.isUpArrow {
+                tri.move(to: CGPoint(x: px, y: py - 5))
+                tri.addLine(to: CGPoint(x: px - 4, y: py + 3))
+                tri.addLine(to: CGPoint(x: px + 4, y: py + 3))
+            } else {
+                tri.move(to: CGPoint(x: px, y: py + 5))
+                tri.addLine(to: CGPoint(x: px - 4, y: py - 3))
+                tri.addLine(to: CGPoint(x: px + 4, y: py - 3))
+            }
+            tri.closeSubpath()
+            context.fill(tri, with: .color(color))
+            context.stroke(tri, with: .color(.black.opacity(0.4)), lineWidth: 0.5)
+
+            // 标签贴在顶部/底部，并加短虚线接到价位
+            let tagText = ev.label
+            let tag = Text(tagText).font(.system(size: 9, weight: .bold)).foregroundColor(color)
+            let resolved = context.resolve(tag)
+            let tagSize = resolved.measure(in: CGSize(width: 24, height: 12))
+            let tagY = ev.isUpArrow ? yMin + 2 : yMax - tagSize.height - 2
+            let tagRect = CGRect(x: px - tagSize.width / 2,
+                                 y: tagY,
+                                 width: tagSize.width,
+                                 height: tagSize.height)
+            let bg = Path(roundedRect: tagRect.insetBy(dx: -2, dy: 0), cornerRadius: 2)
+            context.fill(bg, with: .color(.black.opacity(0.55)))
+            context.draw(tag, at: CGPoint(x: tagRect.midX, y: tagRect.midY))
+
+            // 短虚线
+            var stem = Path()
+            stem.move(to: CGPoint(x: px, y: tagRect.maxY + (ev.isUpArrow ? 1 : -1)))
+            stem.addLine(to: CGPoint(x: px, y: py + (ev.isUpArrow ? -5 : 5)))
+            context.stroke(stem, with: .color(color.opacity(0.5)),
+                           style: StrokeStyle(lineWidth: 0.6, dash: [2, 2]))
+        }
+    }
+
+    /// Y 轴右侧价格刻度：高/低/昨收/基准/支撑/阻力，按对应颜色。
+    /// 与 AI marker 错开：在 marker 的对面（xRight - 70）作为对照列。
+    private func drawYAxisTicks(
+        context: GraphicsContext,
+        y: (Double) -> CGFloat,
+        xRight: CGFloat,
+        yMin: CGFloat, yMax: CGFloat,
+        bars: [MinuteBar],
+        prev: Double,
+        base: Double, support: Double, resistance: Double
+    ) {
+        let high = bars.map(\.price).max() ?? prev
+        let low  = bars.map(\.price).min() ?? prev
+
+        struct Tick { let value: Double; let label: String; let color: Color }
+        var ticks: [Tick] = []
+        if prev > 0       { ticks.append(.init(value: prev, label: "昨", color: .white.opacity(0.85))) }
+        if high > prev    { ticks.append(.init(value: high, label: "高", color: Color(red: 1, green: 0.45, blue: 0.3))) }
+        if low > 0 && low != prev { ticks.append(.init(value: low, label: "低", color: Color(red: 0.45, green: 0.92, blue: 0.5))) }
+        if base > 0       { ticks.append(.init(value: base,       label: "基", color: .cyan)) }
+        if resistance > 0 { ticks.append(.init(value: resistance, label: "阻", color: .orange)) }
+        if support > 0    { ticks.append(.init(value: support,    label: "支", color: .green)) }
+
+        // 去重 + 排序：价位接近（<0.02）合并；按 value 升序
+        let merged = ticks.reduce(into: [Tick]()) { acc, t in
+            if let i = acc.firstIndex(where: { abs($0.value - t.value) < 0.02 }) {
+                acc[i] = Tick(value: t.value,
+                              label: acc[i].label + "·" + t.label,
+                              color: acc[i].color)
+            } else {
+                acc.append(t)
+            }
+        }.sorted { $0.value < $1.value }
+
+        // 在右侧另起一列（与 AI 标签错开）
+        let colX = xRight - 64
+        for t in merged {
+            let yPos = min(max(y(t.value), yMin + 6), yMax - 8)
+            let text = String(format: "%@%.2f", t.label, t.value)
+            let attr = Text(text)
+                .font(.system(size: 9, weight: .semibold))
+                .monospacedDigit()
+                .foregroundColor(t.color)
+            let resolved = context.resolve(attr)
+            let size = resolved.measure(in: CGSize(width: 64, height: 12))
+            let rect = CGRect(x: colX, y: yPos - size.height / 2,
+                              width: size.width, height: size.height)
+            let bg = Path(roundedRect: rect.insetBy(dx: -2, dy: -1), cornerRadius: 2)
+            context.fill(bg, with: .color(.black.opacity(0.55)))
+            context.draw(attr, at: CGPoint(x: rect.midX, y: rect.midY))
+            // 价位横虚线接到左轴（仅在 base/support/resistance 时画，避免画面嘈杂）
+            if t.label.contains("基") || t.label.contains("阻") || t.label.contains("支") {
+                var line = Path()
+                line.move(to: CGPoint(x: 0, y: yPos))
+                line.addLine(to: CGPoint(x: colX - 2, y: yPos))
+                context.stroke(line,
+                               with: .color(t.color.opacity(0.25)),
+                               style: StrokeStyle(lineWidth: 0.5, dash: [2, 3]))
+            }
+        }
+    }
+
+    /// X 轴底部时间刻度：9:30 / 11:30 / 13:00 / 15:00。
+    private func drawXAxisTicks(
+        context: GraphicsContext,
+        padL: CGFloat, padR: CGFloat,
+        yBottom: CGFloat,
+        totalW: CGFloat
+    ) {
+        let markers: [(label: String, slot: Int)] = [
+            ("9:30", 0),
+            ("11:30", 120),
+            ("13:00", 210),   // session = 9:30..11:30 (120 min) + 13:00..15:00 (120 min) = 240
+            ("15:00", 240)
+        ]
+        let slots = CGFloat(max(Self.session.count - 1, 1))
+        for m in markers {
+            let ratio = CGFloat(m.slot) / slots
+            let x = padL + ratio * totalW
+            // 短竖线
+            var tick = Path()
+            tick.move(to: CGPoint(x: x, y: yBottom))
+            tick.addLine(to: CGPoint(x: x, y: yBottom + 3))
+            context.stroke(tick, with: .color(.white.opacity(0.4)), lineWidth: 0.6)
+            // 文字
+            let attr = Text(m.label)
+                .font(.system(size: 9))
+                .monospacedDigit()
+                .foregroundColor(.white.opacity(0.65))
+            let resolved = context.resolve(attr)
+            let size = resolved.measure(in: CGSize(width: 36, height: 10))
+            let labelX = min(max(x - size.width / 2, padL), padL + totalW - size.width)
+            context.draw(attr, at: CGPoint(x: labelX + size.width / 2,
+                                           y: yBottom + 12))
+        }
+    }
+
+    /// 关键价位线：base / support / resistance。
+    /// 现价接近 ±0.3% 时进入一级闪态——线体加粗 + 透明度正弦变化 + 横向辉光带。
+    /// 进入 ±0.15% 二级时再叠加：辉光带变宽 + 双频脉动 + 红色描边。
+    /// - flashPhase: 0..1, 0.5Hz（一级闪烁）
+    /// - flashPhaseDeep: 0..1, 1.0Hz（二级更快闪烁）
+    private func drawAlertLevels(
+        context: GraphicsContext,
+        lastPrice: Double,
+        flashPhase: Double,
+        flashPhaseDeep: Double,
+        base: Double,
+        support: Double,
+        resistance: Double,
+        xLeft: CGFloat,
+        xRight: CGFloat,
+        y: (Double) -> CGFloat,
+        lightPct: Double,
+        deepPct: Double
+    ) {
+        struct Level { let value: Double; let color: Color; let label: String }
+        var levels: [Level] = []
+        if base > 0 {
+            levels.append(.init(value: base, color: .cyan, label: "基准"))
+        }
+        if resistance > 0 {
+            levels.append(.init(value: resistance, color: .orange, label: "阻力"))
+        }
+        if support > 0 {
+            levels.append(.init(value: support, color: .green, label: "支撑"))
+        }
+        for lv in levels {
+            let dist = lastPrice > 0 ? abs(lastPrice - lv.value) / max(lv.value, 0.0001) * 100 : 999
+            let tier: MarketStore.LevelAlertTier = lastPrice > 0
+                ? .classify(distPct: dist,
+                            lightPct: lightPct,
+                            deepPct: deepPct)
+                : .none
+            let isAlert = tier != .none
+            let isDeep = tier == .deep
+
+            // 静态态
+            let baseAlpha: Double = isAlert ? 0.45 + 0.45 * flashPhase : 0.45
+            let lineWidth: CGFloat = isAlert ? (1.4 + CGFloat(flashPhase) * 0.8) : 1.0
+
+            var p = Path()
+            p.move(to: CGPoint(x: xLeft, y: y(lv.value)))
+            p.addLine(to: CGPoint(x: xRight, y: y(lv.value)))
+
+            if isAlert {
+                // 辉光带：二级比一级更宽、更亮
+                let bandH: CGFloat = isDeep ? 16 : 10
+                let bandRect = CGRect(
+                    x: xLeft,
+                    y: y(lv.value) - bandH / 2,
+                    width: xRight - xLeft,
+                    height: bandH
+                )
+                let bandPath = Path(roundedRect: bandRect, cornerRadius: 3)
+                let bandAlpha: Double = isDeep
+                    ? (0.18 + 0.22 * flashPhaseDeep)   // 二级脉动频率 1Hz
+                    : (0.10 + 0.15 * flashPhase)
+                context.fill(bandPath, with: .color(lv.color.opacity(bandAlpha)))
+
+                // 主虚线
+                context.stroke(
+                    p,
+                    with: .color(lv.color.opacity(baseAlpha)),
+                    style: StrokeStyle(lineWidth: lineWidth, dash: [4, 3])
+                )
+                // 加粗实线（高亮叠层）
+                var solid = Path()
+                solid.move(to: CGPoint(x: xLeft, y: y(lv.value)))
+                solid.addLine(to: CGPoint(x: xRight, y: y(lv.value)))
+                let solidAlpha: Double = isDeep
+                    ? (0.65 + 0.35 * flashPhaseDeep)
+                    : (0.55 + 0.4 * flashPhase)
+                let solidWidth: CGFloat = isDeep
+                    ? (1.4 + 0.6 * CGFloat(flashPhaseDeep))
+                    : 1.0
+                context.stroke(
+                    solid,
+                    with: .color(lv.color.opacity(solidAlpha)),
+                    style: StrokeStyle(lineWidth: solidWidth)
+                )
+
+                // 二级预警：再叠一层红色描边外圈，提示「最危险」
+                if isDeep {
+                    var ring = Path()
+                    ring.move(to: CGPoint(x: xLeft, y: y(lv.value)))
+                    ring.addLine(to: CGPoint(x: xRight, y: y(lv.value)))
+                    context.stroke(
+                        ring,
+                        with: .color(.red.opacity(0.35 + 0.45 * flashPhaseDeep)),
+                        style: StrokeStyle(lineWidth: 0.8)
+                    )
+                }
+
+                // 预警角标：在右侧贴「⚠/🔴 距 X.XX 价 0.10%」
+                let badgeIcon = isDeep ? "🔴" : "⚠"
+                let priceText = String(format: "%@ 距 %.2f %.2f%%",
+                                       badgeIcon, lv.value, dist)
+                let attr = Text(priceText)
+                    .font(.system(size: 9, weight: .heavy))
+                    .monospacedDigit()
+                    .foregroundColor(isDeep ? .red : lv.color)
+                let resolved = context.resolve(attr)
+                let sSize = resolved.measure(in: CGSize(width: 110, height: 12))
+                let badgeY = y(lv.value) - sSize.height - 2
+                let badgeRect = CGRect(
+                    x: xRight - sSize.width - 4,
+                    y: badgeY,
+                    width: sSize.width,
+                    height: sSize.height
+                )
+                let bg = Path(roundedRect: badgeRect.insetBy(dx: -3, dy: -1), cornerRadius: 3)
+                context.fill(bg, with: .color(.black.opacity(0.75)))
+                let borderColor: Color = isDeep
+                    ? .red.opacity(0.7 + 0.3 * flashPhaseDeep)
+                    : lv.color.opacity(0.9)
+                context.stroke(bg,
+                               with: .color(borderColor),
+                               style: StrokeStyle(lineWidth: isDeep ? 1.2 : 0.8))
+                context.draw(attr, at: CGPoint(x: badgeRect.midX, y: badgeRect.midY))
+            } else {
+                context.stroke(
+                    p,
+                    with: .color(lv.color.opacity(baseAlpha)),
+                    style: StrokeStyle(lineWidth: lineWidth, dash: [4, 3])
+                )
+            }
+        }
+    }
+
+    /// 持仓成本线 + 「到本」角标。
+    /// 常规为半透灰虚线；现价接近 ±costLightPct% 时变橙红闪烁 + 角标高亮。
+    private func drawCostLine(
+        context: GraphicsContext,
+        y: (Double) -> CGFloat,
+        chartL: CGFloat, chartR: CGFloat,
+        chartT: CGFloat, chartB: CGFloat,
+        lastPrice: Double,
+        flashPhase: Double
+    ) {
+        guard lastPrice > 0 else { return }
+        let yC = y(cost)
+        guard yC >= chartT - 1 && yC <= chartB + 1 else { return }
+        let distPct = abs(lastPrice - cost) / cost * 100
+        let near = distPct <= costLightPct
+        // 主线（虚线）：常态灰；接近时橙红，闪烁 alpha 用 flashPhase 调制
+        let lineColor: Color = near
+            ? Color.orange.opacity(0.55 + 0.35 * flashPhase)
+            : Color.gray.opacity(0.35)
+        var path = Path()
+        path.move(to: CGPoint(x: chartL, y: yC))
+        path.addLine(to: CGPoint(x: chartR, y: yC))
+        context.stroke(
+            path,
+            with: .color(lineColor),
+            style: StrokeStyle(lineWidth: near ? 1.4 : 1.0,
+                               lineCap: .butt,
+                               dash: [3, 3])
+        )
+        // 「到本」角标：在右侧轴区，紧贴成本线右端
+        let labelText = String(format: "本 %.2f", cost)
+        let badge = Text(labelText)
+            .font(.system(size: 9, weight: .bold))
+            .foregroundColor(near ? .white : Color.gray)
+        let resolved = context.resolve(badge)
+        let tw = resolved.measure(in: CGSize(width: 120, height: 14)).width
+        let bx = chartR - tw - 4
+        let by = yC - 6
+        if near {
+            // 接近时：橙红填充矩形 + 闪烁 alpha
+            let rect = CGRect(x: bx - 4, y: by - 1, width: tw + 8, height: 12 + 2)
+            let bgColor = Color.orange.opacity(0.55 + 0.35 * flashPhase)
+            context.fill(Path(rect), with: .color(bgColor))
+        }
+        context.draw(resolved, at: CGPoint(x: bx + tw / 2, y: yC))
+    }
+
+    /// 在走势图最右侧绘制 AI 价位标记（▲/▼ + 标签 + 价格）。
+    /// 标签贴近价位纵坐标；过近则下移；超出可视区则夹紧。
+    private func drawAIMarkers(
+        context: GraphicsContext,
+        markers: [AIMarker],
+        xRight: CGFloat,
+        y: (Double) -> CGFloat,
+        area: CGRect
+    ) {
+        guard !markers.isEmpty else { return }
+        let tagFont = Font.system(size: 9, weight: .semibold)
+        let rowH: CGFloat = 12
+        let topY = area.minY + 1
+        var usedRows: [CGRect] = []
+        for (idx, m) in markers.enumerated() {
+            let isAbove = m.side == .above
+            let color: Color = isAbove
+                ? Color(red: 1, green: 0.55, blue: 0.18)   // 阻力/基 暖色
+                : Color(red: 0.36, green: 0.78, blue: 1)   // 支撑/止 冷色
+            let priceText = String(format: "%.2f", m.price)
+            let labelText = "\(isAbove ? "▲" : "▼") \(m.label) \(priceText)"
+            let attrText = Text(labelText).font(tagFont).foregroundColor(color)
+            let resolved = context.resolve(attrText)
+            let size = resolved.measure(in: CGSize(width: 120, height: rowH))
+
+            // 标签纵向：贴价位纵坐标 ± 6
+            let rawY = y(m.price) + (isAbove ? -6 : 6)
+            var yPos = rawY
+            yPos = min(max(yPos, topY), area.maxY - size.height)
+
+            // 简易防重叠：若与已用行重叠，下移
+            var attempt = 0
+            while usedRows.contains(where: { abs($0.midY - yPos) < rowH * 0.9 }) && attempt < 4 {
+                yPos += rowH
+                if yPos > area.maxY - size.height { yPos = rawY }
+                attempt += 1
+            }
+            let labelRect = CGRect(x: xRight - size.width - 4,
+                                   y: yPos,
+                                   width: size.width,
+                                   height: size.height)
+            usedRows.append(labelRect)
+
+            // 画一个半透明圆角背景，提升可读性
+            let bgRect = labelRect.insetBy(dx: -3, dy: -1)
+            let bg = Path(roundedRect: bgRect, cornerRadius: 3)
+            context.fill(bg, with: .color(.black.opacity(0.55)))
+            context.draw(attrText, at: CGPoint(x: labelRect.midX, y: labelRect.midY))
+
+            // 在价位对应的纵坐标画一个小三角作为指北针
+            let triX = xRight - 6
+            let triY = y(m.price)
+            var tri = Path()
+            if isAbove {
+                tri.move(to: CGPoint(x: triX, y: triY - 4))
+                tri.addLine(to: CGPoint(x: triX - 4, y: triY))
+                tri.addLine(to: CGPoint(x: triX + 4, y: triY))
+            } else {
+                tri.move(to: CGPoint(x: triX, y: triY + 4))
+                tri.addLine(to: CGPoint(x: triX - 4, y: triY))
+                tri.addLine(to: CGPoint(x: triX + 4, y: triY))
+            }
+            tri.closeSubpath()
+            context.fill(tri, with: .color(color))
+
+            // 画一条短虚线连接标签与价位
+            var line = Path()
+            line.move(to: CGPoint(x: labelRect.minX - 2, y: labelRect.midY))
+            line.addLine(to: CGPoint(x: triX + 4, y: triY))
+            context.stroke(line, with: .color(color.opacity(0.5)),
+                           style: StrokeStyle(lineWidth: 0.6, dash: [2, 2]))
+            _ = idx // 预留 hook，便于后续按 idx 决定是否画线
+        }
+    }
+}
+
+struct MACDChart: View {
+    var days: [DayBar]
+    var points: [MACD.Point]
+    var limit: Int = 60
+    var aiSignal: AILatestSignal? = nil
+
+    var body: some View {
+        Canvas { context, size in
+            let paired: [(DayBar, MACD.Point)] = zip(days, points).compactMap { d, p in
+                guard p.hist != nil else { return nil }
+                return (d, p)
+            }
+            let view = Array(paired.suffix(limit))
+            guard !view.isEmpty else {
+                let text = Text("等待 MACD…").font(.system(size: 11)).foregroundColor(.secondary)
+                context.draw(text, at: CGPoint(x: 8, y: size.height / 2))
+                return
+            }
+
+            let padL: CGFloat = 2
+            let padR: CGFloat = 2
+            let padT: CGFloat = 12
+            let padB: CGFloat = 14
+            var vals: [Double] = []
+            for (_, p) in view {
+                if let d = p.dif { vals.append(d) }
+                if let e = p.dea { vals.append(e) }
+                if let h = p.hist { vals.append(h) }
+            }
+            var minV = vals.min() ?? -1
+            var maxV = vals.max() ?? 1
+            let span = max(maxV - minV, 0.01)
+            minV -= span * 0.08
+            maxV += span * 0.08
+
+            func x(_ idx: Int) -> CGFloat {
+                padL + CGFloat(idx) / CGFloat(max(view.count - 1, 1)) * (size.width - padL - padR)
+            }
+            func y(_ v: Double) -> CGFloat {
+                padT + (1 - (v - minV) / (maxV - minV)) * (size.height - padT - padB)
+            }
+
+            if minV < 0 && maxV > 0 {
+                var zero = Path()
+                zero.move(to: CGPoint(x: padL, y: y(0)))
+                zero.addLine(to: CGPoint(x: size.width - padR, y: y(0)))
+                context.stroke(zero, with: .color(.white.opacity(0.2)), lineWidth: 1)
+            }
+
+            let bw = max(1.5, (size.width - padL - padR) / CGFloat(view.count) * 0.55)
+            for (idx, item) in view.enumerated() {
+                guard let hist = item.1.hist else { continue }
+                let y0 = y(0)
+                let y1 = y(hist)
+                let rect = CGRect(x: x(idx) - bw / 2, y: min(y0, y1), width: bw, height: max(abs(y1 - y0), 1))
+                let c: Color = hist >= 0
+                    ? Color(red: 1, green: 0.27, blue: 0.23).opacity(0.75)
+                    : Color(red: 0.2, green: 0.84, blue: 0.29).opacity(0.75)
+                context.fill(Path(rect), with: .color(c))
+            }
+
+            var difPath = Path()
+            var deaPath = Path()
+            for (idx, item) in view.enumerated() {
+                if let d = item.1.dif {
+                    let pt = CGPoint(x: x(idx), y: y(d))
+                    if difPath.isEmpty { difPath.move(to: pt) } else { difPath.addLine(to: pt) }
+                }
+                if let e = item.1.dea {
+                    let pt = CGPoint(x: x(idx), y: y(e))
+                    if deaPath.isEmpty { deaPath.move(to: pt) } else { deaPath.addLine(to: pt) }
+                }
+            }
+            context.stroke(difPath, with: .color(Color(red: 1, green: 0.84, blue: 0.04)), lineWidth: 1.4)
+            context.stroke(deaPath, with: .color(Color(red: 0.39, green: 0.82, blue: 1)), lineWidth: 1.4)
+
+            let legendDIF = Text("DIF").font(.system(size: 9, weight: .semibold)).foregroundColor(Color(red: 1, green: 0.84, blue: 0.04))
+            let legendDEA = Text("DEA").font(.system(size: 9, weight: .semibold)).foregroundColor(Color(red: 0.39, green: 0.82, blue: 1))
+            context.draw(legendDIF, at: CGPoint(x: 8, y: 8))
+            context.draw(legendDEA, at: CGPoint(x: 36, y: 8))
+
+            if let first = view.first?.0.date, first.count >= 10 {
+                let a = Text(String(first.dropFirst(5))).font(.system(size: 9)).foregroundColor(.secondary)
+                context.draw(a, at: CGPoint(x: 6, y: size.height - 4))
+            }
+            if let last = view.last?.0.date, last.count >= 10 {
+                let b = Text(String(last.dropFirst(5))).font(.system(size: 9)).foregroundColor(.secondary)
+                context.draw(b, at: CGPoint(x: size.width - 34, y: size.height - 4))
+            }
+
+            // AI 价位标签（MACD 纵轴是 DIF/DEA，无法直接按价格定位；
+            // 这里只画右侧竖排标签，避免误导价位在 MACD 区间内的位置）。
+            if let sig = aiSignal {
+                drawMACDMarkers(context: context, markers: sig.markers,
+                                area: CGRect(x: padL, y: padT,
+                                              width: size.width - padL - padR,
+                                              height: size.height - padT - padB))
+            }
+        }
+        .drawingGroup()
+    }
+
+    /// MACD 专用：竖排 AI 价位标签，无价位纵坐标轴，因此只画标签。
+    private func drawMACDMarkers(
+        context: GraphicsContext,
+        markers: [AIMarker],
+        area: CGRect
+    ) {
+        guard !markers.isEmpty else { return }
+        let tagFont = Font.system(size: 9, weight: .semibold)
+        let rowH: CGFloat = 11
+        var y = area.minY + 2
+        let xRight = area.maxX
+        for m in markers {
+            let isAbove = m.side == .above
+            let color: Color = isAbove
+                ? Color(red: 1, green: 0.55, blue: 0.18)
+                : Color(red: 0.36, green: 0.78, blue: 1)
+            let labelText = "\(isAbove ? "▲" : "▼") \(m.label) \(String(format: "%.2f", m.price))"
+            let attrText = Text(labelText).font(tagFont).foregroundColor(color)
+            let resolved = context.resolve(attrText)
+            let size = resolved.measure(in: CGSize(width: 120, height: rowH))
+            let rect = CGRect(x: xRight - size.width - 4,
+                              y: y,
+                              width: size.width,
+                              height: size.height)
+            let bg = Path(roundedRect: rect.insetBy(dx: -3, dy: -1), cornerRadius: 3)
+            context.fill(bg, with: .color(.black.opacity(0.55)))
+            context.draw(attrText, at: CGPoint(x: rect.midX, y: rect.midY))
+            y += rowH + 1
+            if y > area.maxY - rowH { break }
+        }
+    }
+}
+
+struct LineTripleChart: View {
+    var dates: [String]
+    var a: [Double?]
+    var b: [Double?]
+    var c: [Double?]
+    var nameA: String
+    var nameB: String
+    var nameC: String
+    var colorA: Color
+    var colorB: Color
+    var colorC: Color
+    var limit: Int = 60
+    var aiSignal: AILatestSignal? = nil
+
+    var body: some View {
+        Canvas { context, size in
+            let n = min(dates.count, a.count)
+            guard n > 0 else { return }
+            let start = max(0, n - limit)
+            let count = n - start
+            var vals: [Double] = []
+            for i in start..<n {
+                if let v = a[i] { vals.append(v) }
+                if i < b.count, let v = b[i] { vals.append(v) }
+                if i < c.count, let v = c[i] { vals.append(v) }
+            }
+            guard !vals.isEmpty else {
+                let text = Text("等待数据…").font(.system(size: 11)).foregroundColor(.secondary)
+                context.draw(text, at: CGPoint(x: 8, y: size.height / 2))
+                return
+            }
+            let padL: CGFloat = 2, padR: CGFloat = 2, padT: CGFloat = 12, padB: CGFloat = 14
+            var minV = vals.min() ?? 0
+            var maxV = vals.max() ?? 1
+            let span = max(maxV - minV, 0.01)
+            minV -= span * 0.08
+            maxV += span * 0.08
+            func x(_ idx: Int) -> CGFloat {
+                padL + CGFloat(idx) / CGFloat(max(count - 1, 1)) * (size.width - padL - padR)
+            }
+            func y(_ v: Double) -> CGFloat {
+                padT + (1 - (v - minV) / (maxV - minV)) * (size.height - padT - padB)
+            }
+            // KDJ/RSI 阈值线：80/20（仅在 KDJ 时画，避免污染 RSI）
+            if nameA == "K" {
+                let hi = y(80), lo = y(20)
+                var hiP = Path(); hiP.move(to: CGPoint(x: padL, y: hi)); hiP.addLine(to: CGPoint(x: size.width - padR, y: hi))
+                var loP = Path(); loP.move(to: CGPoint(x: padL, y: lo)); loP.addLine(to: CGPoint(x: size.width - padR, y: lo))
+                context.stroke(hiP, with: .color(.red.opacity(0.35)), style: StrokeStyle(lineWidth: 0.8, dash: [3, 3]))
+                context.stroke(loP, with: .color(.green.opacity(0.35)), style: StrokeStyle(lineWidth: 0.8, dash: [3, 3]))
+            }
+            // RSI 30/70 阈值线
+            if nameA == "RSI" {
+                let hi = y(70), lo = y(30)
+                var hiP = Path(); hiP.move(to: CGPoint(x: padL, y: hi)); hiP.addLine(to: CGPoint(x: size.width - padR, y: hi))
+                var loP = Path(); loP.move(to: CGPoint(x: padL, y: lo)); loP.addLine(to: CGPoint(x: size.width - padR, y: lo))
+                context.stroke(hiP, with: .color(.orange.opacity(0.4)), style: StrokeStyle(lineWidth: 0.8, dash: [3, 3]))
+                context.stroke(loP, with: .color(.cyan.opacity(0.4)), style: StrokeStyle(lineWidth: 0.8, dash: [3, 3]))
+            }
+            func stroke(_ series: [Double?], _ color: Color) {
+                guard series.count > start else { return }
+                var p = Path()
+                var started = false
+                for i in 0..<count {
+                    let idx = start + i
+                    guard idx < series.count, let v = series[idx] else { continue }
+                    let pt = CGPoint(x: x(i), y: y(v))
+                    if started { p.addLine(to: pt) } else { p.move(to: pt); started = true }
+                }
+                context.stroke(p, with: .color(color), lineWidth: 1.4)
+            }
+            stroke(a, colorA)
+            stroke(b, colorB)
+            stroke(c, colorC)
+            context.draw(Text(nameA).font(.system(size: 9, weight: .semibold)).foregroundColor(colorA), at: CGPoint(x: 10, y: 8))
+            context.draw(Text(nameB).font(.system(size: 9, weight: .semibold)).foregroundColor(colorB), at: CGPoint(x: 36, y: 8))
+            context.draw(Text(nameC).font(.system(size: 9, weight: .semibold)).foregroundColor(colorC), at: CGPoint(x: 62, y: 8))
+
+            // AI 价位竖排标签（KDJ/RSI 纵轴不是价格，仅做提示）
+            if let sig = aiSignal, !sig.markers.isEmpty {
+                drawSideLevelTags(context: context,
+                                  markers: sig.markers,
+                                  area: CGRect(x: padL, y: padT,
+                                                width: size.width - padL - padR,
+                                                height: size.height - padT - padB))
+            }
+        }
+        .drawingGroup()
+    }
+
+    /// 顶部竖排 AI 价位标签（KDJ/RSI 顶部的小行）。
+    private func drawSideLevelTags(
+        context: GraphicsContext,
+        markers: [AIMarker],
+        area: CGRect
+    ) {
+        let tagFont = Font.system(size: 9, weight: .semibold)
+        let rowH: CGFloat = 11
+        var y = area.minY + 1
+        let xRight = area.maxX
+        for m in markers.prefix(4) {
+            let isAbove = m.side == .above
+            let color: Color = isAbove
+                ? Color(red: 1, green: 0.55, blue: 0.18)
+                : Color(red: 0.36, green: 0.78, blue: 1)
+            let labelText = "\(isAbove ? "▲" : "▼") \(m.label) \(String(format: "%.2f", m.price))"
+            let attrText = Text(labelText).font(tagFont).foregroundColor(color)
+            let resolved = context.resolve(attrText)
+            let size = resolved.measure(in: CGSize(width: 120, height: rowH))
+            // 顶部一行：与图例同行，靠左放避免和 nameA/B/C 重叠
+            let rect = CGRect(x: xRight - size.width - 4, y: y,
+                              width: size.width, height: size.height)
+            let bg = Path(roundedRect: rect.insetBy(dx: -3, dy: -1), cornerRadius: 3)
+            context.fill(bg, with: .color(.black.opacity(0.55)))
+            context.draw(attrText, at: CGPoint(x: rect.midX, y: rect.midY))
+            y += rowH + 1
+            if y > area.minY + 80 { break }
+        }
+    }
+}
+
+struct VolumeChart: View {
+    var days: [DayBar]
+    var limit: Int = 60
+    var aiSignal: AILatestSignal? = nil
+
+    /// 均量阈值（默认 5 日均量）。AI 给定 volumeWarnRatio 后会用它。
+    private func avgVolume(_ view: [DayBar]) -> Double {
+        guard !view.isEmpty else { return 0 }
+        let sum = view.reduce(0.0) { $0 + $1.volume }
+        return sum / Double(view.count)
+    }
+
+    var body: some View {
+        Canvas { context, size in
+            let view = Array(days.suffix(limit))
+            guard !view.isEmpty else {
+                let text = Text("等待量能…").font(.system(size: 11)).foregroundColor(.secondary)
+                context.draw(text, at: CGPoint(x: 8, y: size.height / 2))
+                return
+            }
+            let maxV = max(view.map(\.volume).max() ?? 1, 1)
+            let padL: CGFloat = 2, padR: CGFloat = 2, padT: CGFloat = 12, padB: CGFloat = 8
+            let bw = max(1.5, (size.width - padL - padR) / CGFloat(view.count) * 0.6)
+
+            // 量能警戒线：AI 给 volumeWarnRatio 时按 (均量 * ratio) 画线；
+            // 否则用 5 日均量作为隐含警戒线（参考值，不强提示）。
+            let avg = avgVolume(view)
+            let warnRatio: Double = (aiSignal?.volumeWarnRatio ?? 0) > 0 ? aiSignal!.volumeWarnRatio : 0
+            if avg > 0, warnRatio > 0 {
+                let warnV = avg * warnRatio
+                let warnY = padT + (1 - CGFloat(warnV / maxV)) * (size.height - padT - padB)
+                var path = Path()
+                path.move(to: CGPoint(x: padL, y: warnY))
+                path.addLine(to: CGPoint(x: size.width - padR, y: warnY))
+                context.stroke(path,
+                               with: .color(.yellow.opacity(0.6)),
+                               style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                let label = Text(String(format: "AI 量比警戒 %.1f×", warnRatio))
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.yellow)
+                context.draw(label, at: CGPoint(x: size.width - 90, y: warnY - 6))
+            }
+
+            for (i, d) in view.enumerated() {
+                let x = padL + CGFloat(i) / CGFloat(max(view.count - 1, 1)) * (size.width - padL - padR)
+                let h = CGFloat(d.volume / maxV) * (size.height - padT - padB)
+                let rect = CGRect(x: x - bw / 2, y: size.height - padB - h, width: bw, height: max(h, 1))
+                let up = d.close >= d.open
+                let c: Color = up
+                    ? Color(red: 1, green: 0.27, blue: 0.23).opacity(0.7)
+                    : Color(red: 0.2, green: 0.84, blue: 0.29).opacity(0.7)
+                context.fill(Path(rect), with: .color(c))
+                // 单日放量标记（量 > 5日均 × 警戒倍数 且 AI 给出了方向）
+                if avg > 0, warnRatio > 0, d.volume > avg * warnRatio, let sig = aiSignal {
+                    let tagColor: Color = sig.verdict == .bull
+                        ? Color(red: 1, green: 0.78, blue: 0.15)
+                        : (sig.verdict == .bear
+                            ? Color(red: 0.36, green: 0.78, blue: 1)
+                            : .white)
+                    let labelText = Text("放量")
+                        .font(.system(size: 9, weight: .heavy))
+                        .foregroundColor(tagColor)
+                    let resolved = context.resolve(labelText)
+                    let tagSize = resolved.measure(in: CGSize(width: 36, height: 12))
+                    // 圆角背景：黑色半透明 + 描边
+                    let bgRect = CGRect(
+                        x: x - tagSize.width / 2 - 3,
+                        y: padT + 1,
+                        width: tagSize.width + 6,
+                        height: tagSize.height + 2
+                    )
+                    let bg = Path(roundedRect: bgRect, cornerRadius: 3)
+                    context.fill(bg, with: .color(.black.opacity(0.75)))
+                    context.stroke(bg,
+                                   with: .color(tagColor.opacity(0.85)),
+                                   style: StrokeStyle(lineWidth: 0.6))
+                    context.draw(labelText,
+                                 at: CGPoint(x: bgRect.midX, y: bgRect.midY))
+                }
+            }
+        }
+        .drawingGroup()
+    }
+}

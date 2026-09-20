@@ -1,0 +1,28 @@
+# macOS / editors
+.DS_Store
+*.swp
+*.xcuserstate
+xcuserdata/
+DerivedData/
+.idea/
+.vscode/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+
+# Build and runtime products
+/build/
+/mojinprince-server/target/
+/mojinprince-server/data/
+/mojinprince-server/logs/
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.pid
+*.tmp
+*.bak

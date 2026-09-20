@@ -1,0 +1,9 @@
+/target
+/data
+/logs
+**/*.rs.bk
+*.pdb
+*.db
+*.db-shm
+*.db-wal
+.DS_Store

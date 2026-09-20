@@ -1,0 +1,3 @@
+# 锁定 target 目录到工程内（避免被环境变量劫持到 /var/folders）
+[build]
+target-dir = "target"
