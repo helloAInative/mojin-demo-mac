@@ -290,6 +290,7 @@ CREATE INDEX idx_ai_usage_at ON ai_usage(at DESC);
 - 加 `/api/v1/ai/usage` 把 `AIUsageLedger` 落 SQLite。
 - 加 `/api/v1/ai/accuracy` 服务端算命中率。
 - 收益：本地 LLM（§A.3）和降级（§A.3 配套）天然在 Rust 做。
+- **代码状态（2026-09-20）**：路由 / DTO / Governor / 用量账本 / 集成测试 / smoke test 全部已绿；Swift 端 `GatewayFirstProvider` 网关优先 + Ollama 直连兜底实现完毕。剩余：Swift 端实际联调（菜单「测试连接」跑通网关）+ 目标设备局域网联调报告。
 
 ### 阶段 3：信号 / 持仓 / 设置（2 天）
 
@@ -443,6 +444,33 @@ WantedBy=multi-user.target
 - failover 触发 ≤ 3s —— 集成测试 `failover_switches_when_primary_fails` 断言已绿
 - 前端无网络时显示「离线模式」+ 本地缓存数据
 - 不引入新依赖到前端（`MarketService.swift` 改完后行数减少 60%+）
+
+### 阶段 2 启动前 / 进行中（2026-09-20）
+
+- [x] 写 `migrations/20250918000002_ai_usage.sql`（`ai_usage` + `ai_feedback` 两张表）
+- [x] `service/ai/{mod,openai,ollama,governor,prompt}.rs` —— `Provider` trait + OpenAI 兼容 + Ollama 原生 + 冷却 / 配额 / 熔断 governor + 默认 system prompt
+- [x] `model/ai.rs` —— `AiChatRequest` / `AiChatResponse` / `AiUsageRecord` / `AiUsageSummary`
+- [x] `api/ai.rs` —— `POST /api/v1/ai/chat` / `analyze` / `reflect` + `GET /api/v1/ai/usage` / `accuracy` + `POST /api/v1/ai/feedback`
+- [x] `state.rs` / `config.rs` 增加 `ai_http` 客户端 + `AI_TIMEOUT_MS` 环境变量（默认 65s）
+- [x] `error.rs` 增加 `AiUpstream`（502）/ `TooManyRequests`（429）/ `Unavailable`（503）
+- [x] `openapi.rs` 升级到 `0.2.0`，把 AI schema + 路由纳入 Swagger UI
+- [x] Swift `LLMProvider.swift`：`GatewayFirstProvider` 网关优先 + 直连兜底；`OllamaProvider` 本地直连
+- [x] Swift `ContentView.swift`：设置面板「Provider」二选一（OpenAI 兼容 / Ollama 本地），自动切换默认 base + model
+- [x] Swift `MarketStore.swift`：ollama provider 不再强制要求 API Token
+- [x] `tests/ai_integration.rs`：5 项 mock 用例覆盖 /chat 成功 / 上游 5xx / 非法 provider / 非法 base_url / Ollama 协议
+- [x] `tests/ai_phase2_features.rs`：6 项覆盖 /analyze 落库 signal_event、/reflect 多步反思、/accuracy 命中率、/feedback 写入 ai_feedback、Governor 熔断
+- [x] unit tests：`Governor::check` 冷却、`fail_streak` 熔断、`resolve` 路由
+- [x] smoke test：`/health`、`/api/v1/ai/usage`、`POST /api/v1/ai/chat` 非法参数均按预期返回
+- [ ] Swift 端联调：菜单「测试连接」→ GatewayFirstProvider 命中网关
+- [ ] 局域网联调报告（fastfetch / NAS 端到端 P95 延迟）补到本节
+
+### 阶段 2 验收标准
+
+- AI 网关 P95 延迟 < 70s（默认超时 65s + 远端调用开销）—— 单机 mock 已绿；真实环境待验
+- ai_usage 表每条调用都落账（成功 / 失败两条路径）
+- failover：OpenAI 失败自动回退到本地 Ollama 由 Swift `GatewayFirstProvider` 兜底（不在网关层做）
+- Governor 连续失败触发熔断（默认 5 次失败 → 60s 冷却）
+- 前端只通过 `POST /api/v1/ai/chat` 上行，不再直连 OpenAI 协议
 
 ---
 

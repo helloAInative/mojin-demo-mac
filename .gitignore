@@ -17,6 +17,8 @@ DerivedData/
 # Build and runtime products
 /build/
 /mojinprince-server/target/
+/mojinprince-server/target2/
+/mojinprince-server/target-local/
 /mojinprince-server/data/
 /mojinprince-server/logs/
 *.db

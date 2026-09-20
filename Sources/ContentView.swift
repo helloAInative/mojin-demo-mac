@@ -1898,6 +1898,7 @@ struct SettingsView: View {
     @State private var showLog = false
     @State private var aiBase = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
     @State private var aiModel = "qwen3.7-plus"
+    @State private var aiProvider = "openai"
     @State private var aiKey = ""
     @State private var aiInterval = "120"
     @State private var aiMaxTokens = "600"
@@ -1970,7 +1971,7 @@ struct SettingsView: View {
     }
 
     private var aiSettingsBox: some View {
-        GroupBox("AI 接入（OpenAI 兼容）") {
+        GroupBox("AI 接入") {
             VStack(alignment: .leading, spacing: 8) {
                 Toggle("启用 AI 分析", isOn: Binding(
                     get: { settings.aiConfig.enabled },
@@ -1988,31 +1989,52 @@ struct SettingsView: View {
                         settings.setAIConfig(c)
                     }
                 ))
-                TextField("Base URL", text: $aiBase).textFieldStyle(.roundedBorder)
-                TokenPlanModelPicker(selection: Binding(
-                    get: { aiModel },
-                    set: { new in
-                        aiModel = new
-                        settings.setAIModel(new)
+                Picker("Provider", selection: $aiProvider) {
+                    Text("OpenAI 兼容").tag("openai")
+                    Text("Ollama 本地").tag("ollama")
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: aiProvider) { _, provider in
+                    if provider == "ollama", !aiBase.contains(":11434") {
+                        aiBase = "http://127.0.0.1:11434"
+                        aiModel = "qwen2.5:1.5b"
+                    } else if provider == "openai", aiBase.contains(":11434") {
+                        aiBase = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+                        aiModel = "qwen3.7-plus"
                     }
-                ), chatOnly: false)
-                if !TokenPlanCatalog.isChat(aiModel) {
+                }
+                TextField(aiProvider == "ollama" ? "Ollama URL（默认 http://127.0.0.1:11434）" : "Base URL", text: $aiBase)
+                    .textFieldStyle(.roundedBorder)
+                if aiProvider == "ollama" {
+                    TextField("模型（例如 qwen2.5:1.5b）", text: $aiModel)
+                        .textFieldStyle(.roundedBorder)
+                } else {
+                    TokenPlanModelPicker(selection: Binding(
+                        get: { aiModel },
+                        set: { new in
+                            aiModel = new
+                            settings.setAIModel(new)
+                        }
+                    ), chatOnly: false)
+                }
+                if aiProvider != "ollama" && !TokenPlanCatalog.isChat(aiModel) {
                     Text("图片 / 语音 / 视频模型不能做盯盘分析，请选「推理 / 文本」类。")
                         .font(.caption2)
                         .foregroundStyle(.orange)
                 }
-                SecureField("API Token", text: $aiKey).textFieldStyle(.roundedBorder)
+                SecureField(aiProvider == "ollama" ? "API Token（通常留空）" : "API Token", text: $aiKey)
+                    .textFieldStyle(.roundedBorder)
                 HStack {
                     field("间隔秒", $aiInterval)
                     field("max_tokens", $aiMaxTokens)
                 }
-                Text("改完点「完成」保存 Base URL / Token。模型切换即时生效。")
+                Text("AI 请求优先经 Rust 网关并记录用量；网关不可用时自动直连回退。")
                     .font(.caption2).foregroundStyle(.secondary)
                 Button("测试连接") {
                     persistAI()
                     store.analyzeWithAI(force: true)
                 }
-                .disabled(aiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(aiProvider != "ollama" && aiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }.padding(6)
         }
     }
@@ -2298,6 +2320,7 @@ struct SettingsView: View {
         var a = settings.aiConfig
         a.baseURL = aiBase.trimmingCharacters(in: .whitespacesAndNewlines)
         a.model = aiModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        a.providerId = aiProvider
         a.intervalSec = max(30, Int(aiInterval) ?? 120)
         a.maxTokens = max(128, Int(aiMaxTokens) ?? 600)
         settings.setAIConfig(a)
@@ -2336,6 +2359,7 @@ struct SettingsView: View {
         costLightDraft = settings.notifyConfig.costLightPct
         aiBase = settings.aiConfig.baseURL
         aiModel = settings.aiConfig.model
+        aiProvider = settings.aiConfig.providerId
         aiKey = settings.aiAPIKey
         aiInterval = String(settings.aiConfig.intervalSec)
         aiMaxTokens = String(settings.aiConfig.maxTokens)

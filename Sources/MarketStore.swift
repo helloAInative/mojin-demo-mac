@@ -1022,7 +1022,8 @@ final class MarketStore: ObservableObject {
             aiStatus = "请先在设置中开启 AI"
             return
         }
-        guard !settings.aiAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard cfg.providerId == "ollama"
+                || !settings.aiAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             aiStatus = "请先配置 API Token"
             return
         }
