@@ -138,7 +138,11 @@ DELETE /api/v1/watchlist/{code}
 GET  /api/v1/settings
 PUT  /api/v1/settings
 
-// 数据接入（§F）
+// 复盘 / 周报（已实现：按需触发 + 收盘 / 周末自动补缺 + 幂等落库）
+GET  /api/v1/reviews                      // 列出已生成报告（?kind=&limit=）
+POST /api/v1/reviews/run                  // 生成日报 / 周报（?kind=daily|weekly）
+
+// 数据接入（§F，待实现）
 GET  /api/v1/news/{code}                  // 新闻流
 GET  /api/v1/reports/{code}               // 研报
 GET  /api/v1/sector/{code}                // 板块行情
@@ -268,7 +272,31 @@ CREATE TABLE ai_usage (
     error       TEXT
 );
 CREATE INDEX idx_ai_usage_at ON ai_usage(at DESC);
+
+-- 0005_scheduled_report.sql
+CREATE TABLE scheduled_report (
+    id          TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,          -- daily / weekly
+    period_key  TEXT NOT NULL,          -- YYYY-MM-DD / YYYY-Www
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    payload     TEXT NOT NULL DEFAULT '{}',
+    created_at  INTEGER NOT NULL,
+    UNIQUE(kind, period_key)
+);
+CREATE INDEX idx_scheduled_report_created ON scheduled_report(created_at DESC);
 ```
+
+### 6.5 复盘表 + 幂等生成
+
+`scheduled_report` 的 `UNIQUE(kind, period_key)` 是幂等保证的基石：
+
+- `period_key`：daily 用 `YYYY-MM-DD`（Asia/Shanghai），weekly 用 ISO 周 `YYYY-Www`
+- 重复执行同一 `(kind, period_key)` 走 `INSERT ... ON CONFLICT(kind, period_key) DO UPDATE SET title/body/payload`，**只刷新正文，`created_at` 保留首次写入时间**。Swift 端可以用 `id`（基于 kind+period_key 哈希，稳定不变）做缓存键
+- 报告正文包含两部分：
+  - **后端摘要**（服务端拼）：signal_event 时间线、AI 用量、level 命中
+  - **客户端上下文**（Swift 主动 POST）：日记 / 委托 / 信号 — 后端原样落到 `payload.context`
+- 自动调度：`spawn_report_scheduler` 60s 心跳；工作日 15:05 后补日报，周五 / 周末补周报，**只补缺失的基线版**（已存在的跳过）；Swift 端"生成今日 / 生成本周"按钮相当于在已存在的记录上覆盖正文（含客户端 context），不会改 `created_at`
 
 ---
 
@@ -297,6 +325,7 @@ CREATE INDEX idx_ai_usage_at ON ai_usage(at DESC);
 - 把 `SignalTimeline` / `AppSettings` / `PositionNote` 的 JSON 落库迁到 SQLite + HTTP API。
 - 前端加 5 分钟本地缓存（启动拉一次，断网用本地兜底）。
 - `SignalEvent.meta` 仍按 JSON 存，迁移成本最低。
+- **代码状态（2026-09-20）**：`signals / positions / watchlist / settings` HTTP API、OpenAPI 和 3 项集成测试已完成；Swift 采用“本地先写、服务端后写”，启动时服务端优先、空库自动用本地数据播种。断网继续使用 UserDefaults / 本地 JSON；API Token 始终仅存 Keychain，不参与同步。
 
 ### 阶段 4：推送 + 调度 + 数据接入（2–3 天）
 
@@ -304,6 +333,7 @@ CREATE INDEX idx_ai_usage_at ON ai_usage(at DESC);
 - 后端 scheduler 跑收盘复盘 / 周报导出。
 - 接新闻 / 研报 / 板块数据（§F.3–F.4）。
 - 至此 §F 数据接入全部走 Rust，前端只剩 UI。
+- **代码状态（2026-09-20）**：`/api/v1/ws/quote`、广播 Hub、自选股交易时段轮询调度和 Swift 断线重连 / HTTP 回退已完成；收盘复盘 / 周报生成按需 API（`POST /api/v1/reviews/run` + `GET /api/v1/reviews`，按 `(kind, period_key)` UPSERT 幂等，落 `scheduled_report` 表，7 项集成测试）与**自动触发**（`spawn_report_scheduler` 60s 心跳：工作日 15:05 后补日报，周五 15:05 后与周末补周报，仅补缺失的基线版，2 项集成测试）均已落地，Swift 端 `ReportClient` 已接入复盘历史与手动生成；新闻 / 研报 / 板块数据（§F.3–F.4）仍待实现。
 
 ### 阶段 5（可选）：跨设备
 
@@ -471,6 +501,24 @@ WantedBy=multi-user.target
 - failover：OpenAI 失败自动回退到本地 Ollama 由 Swift `GatewayFirstProvider` 兜底（不在网关层做）
 - Governor 连续失败触发熔断（默认 5 次失败 → 60s 冷却）
 - 前端只通过 `POST /api/v1/ai/chat` 上行，不再直连 OpenAI 协议
+
+### 阶段 3 / 4 进行中（2026-09-20）
+
+- [x] `migrations/20250918000003_signal_position.sql` / `20250918000004_settings.sql` / `20250918000005_scheduled_report.sql`
+- [x] `api/data.rs`：signals / positions / watchlist / settings HTTP API + OpenAPI
+- [x] `tests/data_phase3.rs`：3 项（信号往返与 feedback 合并 meta、持仓 / 自选 upsert、settings 按 key 合并不丢旧值）
+- [x] Swift 双向同步：本地先写、服务端后写；启动服务端优先、空库用本地播种；断网回退 UserDefaults / 本地 JSON
+- [x] `api/ws.rs` + 广播 Hub：`/api/v1/ws/quote` 推送自选股报价；服务端 15s ping / 45s 无 pong 断开
+- [x] `service/scheduler.rs`：`spawn_quote_scheduler` 交易时段轮询 + 落库 + 广播
+- [x] Swift `MarketStore.quoteStreamTask` 消费 `GatewayMarketClient.quoteUpdates()`：WebSocket 接入、连上后 HTTP 轮询降频到 ≥15s、断线 5s 重试且 HTTP 轮询始终兜底
+- [x] `service/scheduler.rs`：`generate_daily_report` / `generate_weekly_report` 按 `(kind, period_key)` 幂等生成
+- [x] `api/review.rs`：`GET /api/v1/reviews` + `POST /api/v1/reviews/run` + OpenAPI
+- [x] `tests/review_phase4.rs`：7 项（日 / 周独立、幂等、默认 context、非法 kind 400、body 含 AI 用量与信号、列表按 kind 过滤与 limit、created_at ISO8601）
+- [x] `service/scheduler.rs`：`spawn_report_scheduler` 60s 心跳收盘 / 周末**自动触发**报告生成（`report_kinds_due` 纯函数决策 + `ensure_report` 仅补缺失基线版，已存在则跳过）
+- [x] `tests/report_scheduler.rs`：2 项（基线版只生成一次且不覆盖手动刷新、周报 ISO 周 period_key）
+- [x] Swift 端消费 `/api/v1/reviews`：`Sources/ReviewDesk.swift` 新增 `ReportClient`（list / run），`MarketStore.submitReview` 手动生成日报 / 周报、`MarketStore.loadReviewHistory` 拉取历史，复盘子页展示近 14 天报告
+- [ ] 新闻 / 研报 / 板块数据接入（§F.3–F.4）
+- [ ] 目标设备 / 局域网端到端联调报告
 
 ---
 
