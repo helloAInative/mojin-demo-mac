@@ -16,12 +16,11 @@
 //!   POST /api/v1/ai/feedback   用户反馈（accept / ignore / partial）
 
 use crate::error::{AppError, AppResult};
-use crate::model::{
-    AiChatRequest, AiChatResponse, AiUsageRecord, AiUsageSummary,
-};
+use crate::model::{AiChatRequest, AiChatResponse, AiUsageRecord, AiUsageSummary};
 use crate::repo::signal::{SignalEventRow, SignalRepo};
 use crate::service::ai::{
-    self, governor::{DenyReason, Governor, GovernorConfig},
+    self,
+    governor::{DenyReason, Governor, GovernorConfig},
     prompt::SYSTEM_PROMPT,
     ChatMessage, ChatRequest, ProviderError,
 };
@@ -57,8 +56,12 @@ pub async fn chat(
     let model = request.model.trim().to_string();
     validate(&request, &model)?;
 
-    let provider = ai::resolve(&provider_id, request.base_url.trim(), request.api_key.trim())
-        .map_err(|error| map_provider_error(error, &provider_id, &model))?;
+    let provider = ai::resolve(
+        &provider_id,
+        request.base_url.trim(),
+        request.api_key.trim(),
+    )
+    .map_err(|error| map_provider_error(error, &provider_id, &model))?;
     let bucket = format!("{provider_id}/{model}");
     if let Err(reason) = GOVERNOR.check(&bucket) {
         return Err(map_deny(reason));
@@ -271,10 +274,19 @@ pub async fn analyze(
         return Err(map_deny(reason));
     }
 
-    let sys = req.system.clone().unwrap_or_else(|| SYSTEM_PROMPT.to_string());
+    let sys = req
+        .system
+        .clone()
+        .unwrap_or_else(|| SYSTEM_PROMPT.to_string());
     let messages = vec![
-        ChatMessage { role: "system".into(), content: sys.clone() },
-        ChatMessage { role: "user".into(),   content: req.user.clone() },
+        ChatMessage {
+            role: "system".into(),
+            content: sys.clone(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: req.user.clone(),
+        },
     ];
     let temperature = req.temperature.unwrap_or(0.4);
     let max_tokens = req.max_tokens.unwrap_or(600);
@@ -336,7 +348,8 @@ pub async fn analyze(
                         "model": model,
                         "tokens_in": resp.usage.prompt_tokens,
                         "tokens_out": resp.usage.completion_tokens,
-                    }).to_string(),
+                    })
+                    .to_string(),
                 };
                 let repo = SignalRepo::new(state.db.clone());
                 if let Err(e) = repo.upsert(&row).await {
@@ -572,12 +585,11 @@ pub async fn accuracy(
 ) -> AppResult<HttpResponse> {
     let hours = q.window_hours.unwrap_or(24).clamp(1, 24 * 30);
     let since_ms = Utc::now().timestamp_millis() - hours * 3600 * 1000;
-    let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM signal_event WHERE kind='level' AND at >= ?",
-    )
-    .bind(since_ms)
-    .fetch_one(&state.db)
-    .await?;
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM signal_event WHERE kind='level' AND at >= ?")
+            .bind(since_ms)
+            .fetch_one(&state.db)
+            .await?;
     let hit: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM signal_event \
          WHERE kind='level' AND at >= ? \
@@ -600,7 +612,11 @@ pub async fn accuracy(
     Ok(HttpResponse::Ok().json(AccuracyResponse {
         total,
         hit,
-        hit_rate: if total > 0 { hit as f64 / total as f64 } else { 0.0 },
+        hit_rate: if total > 0 {
+            hit as f64 / total as f64
+        } else {
+            0.0
+        },
         avg_lead_sec: avg_lead,
         window_hours: hours,
     }))
@@ -700,7 +716,9 @@ fn validate(request: &AiChatRequest, model: &str) -> AppResult<()> {
     let url = reqwest::Url::parse(request.base_url.trim())
         .map_err(|_| AppError::BadRequest("base_url is invalid".into()))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(AppError::BadRequest("base_url must be an http(s) URL".into()));
+        return Err(AppError::BadRequest(
+            "base_url must be an http(s) URL".into(),
+        ));
     }
     if request.system.trim().is_empty() || request.user.trim().is_empty() {
         return Err(AppError::BadRequest("system and user are required".into()));
@@ -733,9 +751,9 @@ fn map_provider_error(error: ProviderError, provider: &str, model: &str) -> AppE
         ProviderError::Http { status, body } if (400..500).contains(&status) => {
             AppError::BadRequest(format!("{provider}/{model} HTTP {status}: {body}").into())
         }
-        ProviderError::Timeout(_) => AppError::AiUpstream(
-            format!("{provider}/{model} timeout: {error}").into(),
-        ),
+        ProviderError::Timeout(_) => {
+            AppError::AiUpstream(format!("{provider}/{model} timeout: {error}").into())
+        }
         other => AppError::AiUpstream(format!("{provider}/{model}: {other}").into()),
     }
 }

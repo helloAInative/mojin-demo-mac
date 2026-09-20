@@ -25,12 +25,19 @@ fn config(database_url: String) -> Config {
 }
 
 async fn fresh_state() -> AppState {
+    // 把 thread id 也加入文件名：cargo test 多线程并行时，同进程内两个测试可能
+    // 在同一时钟粒度内取到相同 nonce，共用 sqlite 路径会撞 _sqlx_migrations UNIQUE 约束。
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let thread_id = format!("{:?}", std::thread::current().id());
+    let safe_thread = thread_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>();
     let path = std::env::temp_dir().join(format!(
-        "mojinprince-ai-test-{}-{nonce}.db",
+        "mojinprince-ai-test-{}-{safe_thread}-{nonce}.db",
         std::process::id()
     ));
     let state = AppState::new(config(format!("sqlite://{}", path.display())))

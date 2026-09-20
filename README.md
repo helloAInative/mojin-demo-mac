@@ -17,8 +17,9 @@
 - 持仓浮盈浮亏展示和一键复制摘要
 - OpenAI 兼容接口的 AI 分析，API Token 保存到 macOS Keychain
 - 组合策略、历史回测、信号时间线和复盘日记
+- 日报 / 周报：由 Rust 网关按日 / ISO 周幂等生成，复盘页一键生成与历史查看
 - 半自动委托草稿：生成可复制文本，不执行交易
-- Rust 网关：新浪 / 腾讯 / 东财 failover、熔断、SQLite WAL、OpenAPI
+- Rust 网关：三源 failover、熔断、WebSocket 推送、AI 网关与数据同步 API、SQLite WAL、OpenAPI
 
 ## 架构
 
@@ -125,9 +126,9 @@ build.sh                  macOS App 构建脚本
 ## 当前状态
 
 - 阶段 1：行情网关与 Swift 接入已完成，本机服务支持登录自启
-- 阶段 2：AI 网关
-- 阶段 3：信号、持仓与设置迁移到服务端
-- 阶段 4：WebSocket 推送与调度
+- 阶段 2：AI 网关与 Swift 接入已完成
+- 阶段 3：信号 / 持仓 / 自选 / 设置 API 与 Swift 双向同步已完成；断网保留 UserDefaults / 本地 JSON 缓存
+- 阶段 4：WebSocket 行情推送、自选股交易时段调度、收盘复盘 / 周报生成（按需 API + 收盘 / 周末自动触发，按 `(kind, period_key)` 幂等）与 Swift 端复盘历史 / 手动生成（`ReportClient`）已完成；新闻 / 研报 / 板块数据接入待实现
 
 路线图见 [未来演进方向](docs/未来演进方向.md) 和 [ROI 排序](docs/按ROI排序.md)。
 

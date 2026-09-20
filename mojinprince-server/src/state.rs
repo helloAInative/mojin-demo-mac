@@ -1,9 +1,41 @@
 //! 全局共享状态：DB 连接池、HTTP 客户端、行情 failover 引擎
 use crate::config::Config;
+use crate::model::Quote;
 use crate::service::quote::failover::QuoteFailover;
 use sqlx::SqlitePool;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::sync::broadcast;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct QuotePushEvent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub quote: Quote,
+}
+
+#[derive(Clone)]
+pub struct QuoteHub {
+    tx: broadcast::Sender<QuotePushEvent>,
+}
+
+impl QuoteHub {
+    pub fn new(capacity: usize) -> Self {
+        let (tx, _) = broadcast::channel(capacity);
+        Self { tx }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<QuotePushEvent> {
+        self.tx.subscribe()
+    }
+
+    pub fn publish(&self, quote: Quote) {
+        let _ = self.tx.send(QuotePushEvent {
+            kind: "quote".into(),
+            quote,
+        });
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -12,6 +44,7 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub ai_http: reqwest::Client,
     pub failover: Arc<QuoteFailover>,
+    pub quote_hub: QuoteHub,
 }
 
 impl AppState {
@@ -63,6 +96,38 @@ impl AppState {
             http,
             ai_http,
             failover,
+            quote_hub: QuoteHub::new(512),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    #[tokio::test]
+    async fn quote_hub_broadcasts_serializable_event() {
+        let hub = QuoteHub::new(4);
+        let mut receiver = hub.subscribe();
+        hub.publish(Quote {
+            code: "sh600460".into(),
+            name: "士兰微".into(),
+            price: 32.61,
+            prev: 31.99,
+            open: 32.5,
+            high: 32.75,
+            low: 31.77,
+            volume: 1,
+            amount: 2.0,
+            source: "test".into(),
+            ts: Utc::now(),
+        });
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.kind, "quote");
+        assert_eq!(event.quote.code, "sh600460");
+        assert!(serde_json::to_string(&event)
+            .unwrap()
+            .contains("\"type\":\"quote\""));
     }
 }

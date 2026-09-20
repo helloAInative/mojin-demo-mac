@@ -1,25 +1,28 @@
 # mojinprince-server
 
-> 摸金小王子 · 行情网关（阶段 1）
+> 摸金小王子 · 行情、AI 与数据网关（阶段 4 进行中）
 > Rust + Actix-web 4 + SQLite，独立服务部署。
 
 完整架构见 [`docs/架构-Rust后端.md`](../docs/架构-Rust后端.md)。
 
 ---
 
-## 状态（2026-09-18）
+## 状态（2026-09-20）
 
 - ✅ 阶段 1：行情网关代码（实时报价 + 分时 + 日 K）
   - 三个数据源：新浪（主力）/ 腾讯 / 东财，自动 failover
   - 熔断：单源连续失败 ≥3 次 → 跳过 60s
   - SQLite 落库（quote / minute_bar / day_bar 三表，WAL 模式）
   - 分时、前复权日 K 实时拉取腾讯接口并写入 SQLite；Swift 前端优先走网关，故障时临时直连回退
-  - 集成测试：5 项 mock failover / 2 项真实外网（`#[ignore]`），3 项单元测试
+  - 集成测试：5 项 mock failover / 2 项真实外网（`#[ignore]`），本阶段单元测试 3 项
   - Swagger UI：`/swagger-ui/`（已挂载，bundled assets，build 时无需联网）
   - 联调脚本：`dev-up.sh` / `smoke.sh` / `load-test.sh`
   - BadCode 在 HTTP 层返回 `400 bad_request`（不再混入 502）
   - 本机联调通过：smoke 全部 ✅，200 并发 P95 < 200ms（待目标设备验证）
-- ⏳ 阶段 2-4 待办：AI 网关 / 数据迁移 / WebSocket 推送
+- ✅ 阶段 2：AI 网关（OpenAI 兼容 / Ollama、用量、命中率、熔断）
+- ✅ 阶段 3：信号 / 持仓 / 自选 / 设置 API 与 Swift 双向同步
+- 🚧 阶段 4：WebSocket 行情推送 + 自选股交易时段调度 + 收盘复盘 / 周报生成（按需 API + 收盘 / 周末自动触发，按 `(kind, period_key)` 幂等，9 项集成测试）已完成，Swift 端已接入复盘历史 / 手动生成；新闻 / 研报 / 板块数据接入待实现
+- ✅ 测试全绿（2026-09-20 复跑 `cargo test --offline`）：单元 13 项 + 集成 28 项（行情 5 / AI 5+6 / 数据 3 / 复盘 7 / 报告调度 2），另有 2 项真实外网用例默认 `#[ignore]`
 
 ---
 
@@ -160,6 +163,34 @@ http://127.0.0.1:8732/swagger-ui/
 http://127.0.0.1:8732/api-docs/openapi.json
 ```
 
+### 阶段 3 数据接口
+
+- `GET|POST|DELETE /api/v1/signals`、`POST /api/v1/signals/{id}/feedback`
+- `GET /api/v1/positions`、`PUT /api/v1/positions/{code}`
+- `GET|POST /api/v1/watchlist`、`DELETE /api/v1/watchlist/{code}`
+- `GET|PUT /api/v1/settings`（按 key 合并，不会覆盖请求中未提供的设置）
+
+### WebSocket 实时行情
+
+连接 `ws://127.0.0.1:8732/api/v1/ws/quote` 后，会收到自选股报价：
+
+```json
+{"type":"quote","quote":{"code":"sh600460","price":32.61,"source":"sina","ts":"2026-09-20T08:00:00Z"}}
+```
+
+后台只在北京时间工作日 `09:15–11:30`、`13:00–15:05` 拉取自选股；服务端每 15s 发一次 ping，45s 内无 pong 则断开。Swift 收到首条推送后自动降低 HTTP 轮询频率（≥15s 一次），断线后每 5 秒重连并恢复 HTTP 兜底。
+
+### 收盘复盘 / 周报
+
+- `POST /api/v1/reviews/run?kind=daily|weekly`：生成一份报告。可选 JSON body `{tickets, diary, signals, focusCodes}` 补全 Swift 端内存数据。按 `(kind, period_key)` UPSERT 幂等——重复调用刷新同一条记录（`created_at` 仅首次写入）。`period_key`：daily 为 `YYYY-MM-DD`，weekly 为 `YYYY-Www`（ISO 周，周一为周首日）。
+- `GET /api/v1/reviews?kind=daily|weekly&limit=N`：按 `created_at` 倒序列出已落库报告。
+
+报告 body 汇总后端落库的信号事件、level 命中率、AI 调用成功 / 总数与 token / 成本，并拼接客户端传入的日记、委托与信号时间线，落 `scheduled_report` 表。
+
+Swift 复盘页通过 `ReportClient` 调用这两个接口：手动生成日报 / 周报 + 拉取历史列表。
+
+自动触发：`spawn_report_scheduler` 独立 60s 心跳（与 3s 行情轮询分离）。北京时间工作日 15:05 后补当日日报，周五 15:05 后与周六 / 周日补周报（覆盖周五晚间服务器未开机的情况）。仅当 `(kind, period_key)` 不存在时生成一份无客户端 context 的基线版，已存在则跳过；之后仍可手动 `POST /reviews/run` 带日记 / 委托刷新同一条记录。
+
 ### 错误响应
 
 ```json
@@ -196,7 +227,11 @@ mojinprince-server/
 ├── Cargo.toml
 ├── .cargo/config.toml            # 锁定 target-dir
 ├── migrations/
-│   └── 20250918000001_init.sql   # quote / minute_bar / day_bar
+│   ├── 20250918000001_init.sql           # quote / minute_bar / day_bar
+│   ├── 20250918000002_ai_usage.sql       # ai_usage / ai_feedback
+│   ├── 20250918000003_signal_position.sql# signal_event / position / watchlist
+│   ├── 20250918000004_settings.sql       # settings
+│   └── 20250918000005_scheduled_report.sql # scheduled_report（复盘 / 周报）
 ├── scripts/
 │   ├── dev-up.sh                 # 后台启动 + 等待就绪
 │   ├── smoke.sh                  # 冒烟
@@ -204,18 +239,25 @@ mojinprince-server/
 │   └── verify.sh                 # 一键端到端：起 + 冒烟 + 压测
 ├── src/
 │   ├── lib.rs                    # 业务模块汇总（让 tests 可用）
-│   ├── bin/mojinprince-server.rs # 启动入口
+│   ├── bin/mojinprince-server.rs # 启动入口 + 路由注册 + 两个 scheduler 接线
 │   ├── config.rs
 │   ├── state.rs
 │   ├── error.rs
-│   ├── model/quote.rs
+│   ├── model/                    # quote / ai / data / review DTO
 │   ├── api/
 │   │   ├── mod.rs
 │   │   ├── health.rs
 │   │   ├── quote.rs
+│   │   ├── ai.rs                 # 阶段 2：chat / analyze / reflect / usage / accuracy / feedback
+│   │   ├── data.rs               # 阶段 3：signals / positions / watchlist / settings
+│   │   ├── review.rs             # 阶段 4：reviews / reviews/run
+│   │   ├── ws.rs                 # 阶段 4：/ws/quote 推送
 │   │   └── openapi.rs            # ApiDoc 汇总
+│   ├── repo/                     # signal / settings 数据访问
 │   └── service/
 │       ├── mod.rs
+│       ├── scheduler.rs          # 阶段 4：交易时段轮询 + 收盘 / 周末自动补报告
+│       ├── ai/                   # mod / openai / ollama / governor / prompt
 │       └── quote/
 │           ├── mod.rs            # enum 派发 + normalize_code
 │           ├── sina.rs           # 默认 https://hq.sinajs.cn
@@ -224,7 +266,12 @@ mojinprince-server/
 │           ├── history.rs        # 腾讯分时 / 前复权日 K
 │           └── failover.rs       # 顺序调度 + 熔断
 ├── tests/
-│   └── quote_integration.rs      # 5 项 mock + 2 项 live
+│   ├── quote_integration.rs      # 5 项 mock + 2 项 live
+│   ├── ai_integration.rs         # 阶段 2 mock
+│   ├── ai_phase2_features.rs     # 阶段 2 analyze / reflect / accuracy / feedback / governor
+│   ├── data_phase3.rs            # 阶段 3 数据接口
+│   ├── review_phase4.rs          # 阶段 4 复盘 / 周报幂等
+│   └── report_scheduler.rs       # 阶段 4：自动触发报告（基线版 / ISO 周 key）
 └── target/                       # 构建产物（gitignore）
 ```
 

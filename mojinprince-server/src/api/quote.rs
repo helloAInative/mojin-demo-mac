@@ -1,6 +1,7 @@
 //! 行情网关阶段 1：实时报价 + 分时 + 日 K
 use crate::error::{AppError, AppResult};
 use crate::service::quote::{history, normalize_code, QuoteError};
+use crate::service::scheduler::persist_quote;
 use crate::state::AppState;
 use actix_web::{web, HttpResponse};
 use serde::Deserialize;
@@ -27,23 +28,8 @@ pub async fn get_quote(
     let code = path.into_inner();
     let (q, src) = state.failover.fetch_quote(&state.http, &code).await?;
     // 写一份到 DB（行情落地，方便回测/统计）
-    let _ = sqlx::query(
-        "INSERT OR REPLACE INTO quote(code,ts,name,price,prev,open,high,low,volume,amount,source) \
-         VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-    )
-    .bind(&q.code)
-    .bind(q.ts.timestamp_millis())
-    .bind(&q.name)
-    .bind(q.price)
-    .bind(q.prev)
-    .bind(q.open)
-    .bind(q.high)
-    .bind(q.low)
-    .bind(q.volume)
-    .bind(q.amount)
-    .bind(&q.source)
-    .execute(&state.db)
-    .await;
+    let _ = persist_quote(&state, &q).await;
+    state.quote_hub.publish(q.clone());
     let _ = src; // 已记录到 DB.source
     Ok(HttpResponse::Ok().json(q))
 }

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 # Web / 异步
 actix-web = "4.9"
+actix = { version = "0.13", default-features = false }
 actix-web-actors = "4.3"
 tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "time", "signal", "sync"] }
 async-trait = "0.1"

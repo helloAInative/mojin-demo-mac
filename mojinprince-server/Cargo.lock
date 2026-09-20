@@ -2031,6 +2031,7 @@ dependencies = [
 name = "mojinprince-server"
 version = "0.1.0"
 dependencies = [
+ "actix",
  "actix-web",
  "actix-web-actors",
  "anyhow",

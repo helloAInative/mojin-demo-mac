@@ -19,6 +19,10 @@ async fn main() -> anyhow::Result<()> {
     // 自动跑 migrations
     sqlx::migrate!("./migrations").run(&state.db).await?;
     tracing::info!("migrations applied");
+    let _quote_scheduler =
+        mojinprince_server::service::scheduler::spawn_quote_scheduler(state.clone());
+    let _report_scheduler =
+        mojinprince_server::service::scheduler::spawn_report_scheduler(state.clone());
 
     let bind = cfg.bind_addr.clone();
     let prefix = cfg.api_prefix.clone();
@@ -36,7 +40,10 @@ async fn main() -> anyhow::Result<()> {
             .service(
                 web::scope(&prefix)
                     .configure(api::quote::configure)
-                    .configure(api::ai::configure),
+                    .configure(api::ai::configure)
+                    .configure(api::data::configure)
+                    .configure(api::review::configure)
+                    .configure(api::ws::configure),
             )
     })
     .bind(bind)?
