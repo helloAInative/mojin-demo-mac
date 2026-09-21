@@ -85,6 +85,17 @@ final class MarketStore: ObservableObject {
     /// AI 智能降级熔断（ROI #7）：自动分析短路、手动放行、成功清零
     let aiDegrade = AIDegradeGovernor()
 
+    /// 多标的组合视图（ROI #10）：聚合持仓 + 实时报价（watchQuotes 含当前标的）。
+    var portfolio: (rows: [PortfolioRow], summary: PortfolioSummary) {
+        var names: [String: String] = [:]
+        for symbol in settings.symbols { names[symbol.code] = symbol.name }
+        return PortfolioBuilder.build(
+            positions: settings.positions,
+            quotes: watchQuotes,
+            names: names
+        )
+    }
+
     /// 命中率时序（ROI #5）：近 30 个日历日按日聚合 level 事件 + 7 日滚动命中率。
     var accuracyTimeline: [AccuracyTimeline.Day] {
         AccuracyTimeline.build(events: signalEvents)

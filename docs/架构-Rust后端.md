@@ -582,6 +582,7 @@ WantedBy=multi-user.target
 - [x] 持仓止盈链路：`PositionNote.takeProfit` 建模 + `PUT /positions` 同步 + `linkTakeToAbove` 对称联动；跌破止损 / 触达止盈专属提醒（`kind=stopTake`，同价时抑制通用到价提醒，通知点击按 side 预填委托草稿）
 - [x] `scheduler.rs::build_report` 止损止盈执行对照：`TicketSummary` 加 `side` / `price`（`#[serde(default)]` 兼容旧客户端），已成交卖出 vs `position` 止损 / 止盈价输出偏差；`tests/review_phase4.rs` +1、`tests/data_phase3.rs` 补 takeProfit 断言
 - [x] 失效归因周报（ROI #9）：`scheduler.rs::attribute_level`（纯函数单测）+ `build_level_attribution`（周报专用，仅 weekly）——level 信号按 `day_bar` 判定 命中 / 穿越未确认 / 未到价（偏离度 TOP3）/ 窗口未满 / 无日线 + `ai_feedback` ignore 计数，`payload.summary` 带结构化字段；`tests/review_phase4.rs` +1（含周一凌晨时间夹取防周界 flake）
+- [x] 多标的组合视图（ROI #10）：`Sources/PortfolioBuilder.swift`（纯函数：市值降序、无报价沉底、名称三级回退 自选名→报价名→code、脏数据过滤）+ `MarketStore.portfolio`（settings.positions × watchQuotes 实时聚合）+ 自选页顶部「持仓组合」卡（总市值 / 浮盈 / 当日盈亏 / 无报价提示，持仓行带占比条与止损止盈标记，点击跳盯盘）；独立编译 19 项断言
 - [ ] 目标设备 / 局域网端到端联调报告
 
 ---
