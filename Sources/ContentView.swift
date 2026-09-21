@@ -2044,8 +2044,20 @@ struct ContentView: View {
                                     reviewHint = "已加载 · \(r.title)"
                                 }
                                 .controlSize(.mini)
+                                Button("导出") {
+                                    exportReport(r)
+                                }
+                                .controlSize(.mini)
+                                .help("导出为 Markdown 文件（分享 / 存档）")
                             }
                             .padding(.vertical, 2)
+                            .contextMenu {
+                                Button("复制全文 Markdown") {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(r.body, forType: .string)
+                                }
+                                Button("导出 .md 文件") { exportReport(r) }
+                            }
                         }
                     }
                 }
@@ -2236,6 +2248,22 @@ struct ContentView: View {
         if panel.runModal() == .OK, let dest = panel.url {
             try? FileManager.default.removeItem(at: dest)
             try? FileManager.default.copyItem(at: tmp, to: dest)
+        }
+    }
+
+    /// 导出复盘 / 周报为 .md（ROI #11）：临时文件 + 保存面板，与分时 CSV 同款交互。
+    private func exportReport(_ report: ScheduledReport) {
+        guard let tmp = store.exportReportMarkdown(report) else {
+            reviewHint = "导出失败（写入临时文件异常，见 app.log）"
+            return
+        }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.nameFieldStringValue = tmp.lastPathComponent
+        if panel.runModal() == .OK, let dest = panel.url {
+            try? FileManager.default.removeItem(at: dest)
+            try? FileManager.default.copyItem(at: tmp, to: dest)
+            reviewHint = "已导出 · \(dest.lastPathComponent)"
         }
     }
 

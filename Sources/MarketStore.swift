@@ -782,6 +782,23 @@ final class MarketStore: ObservableObject {
         return url
     }
 
+    /// 导出复盘 / 周报为 Markdown（ROI #11）：标题 + 导出时间 + 报告正文。
+    func exportReportMarkdown(_ report: ScheduledReport) -> URL? {
+        let safeKey = report.periodKey.replacingOccurrences(of: "/", with: "-")
+        let name = "mojin-\(report.kind)-\(safeKey).md"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        var text = "# \(report.title)\n\n"
+        text += "> 摸金小王子 · 导出于 \(Self.clockString())\n\n"
+        text += report.body
+        do {
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            return url
+        } catch {
+            CrashLog.append("export report \(report.kind)/\(report.periodKey): \(error)")
+            return nil
+        }
+    }
+
     private func loadCache(for code: String) {
         guard let snap = SnapshotCache.load(code: code) else { return }
         if quote.price == 0 { quote = snap.quote }
