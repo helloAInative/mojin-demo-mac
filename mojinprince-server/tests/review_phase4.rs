@@ -8,7 +8,7 @@
 //! - 非法 `kind` 返回 400
 //! - 报告 body 包含后端信号 / AI 用量摘要
 use actix_web::{test, web, App};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use mojinprince_server::{api, state::AppState, Config};
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -262,9 +262,18 @@ async fn report_body_includes_ai_usage_and_signals() {
     )
     .await;
     let body = resp["body"].as_str().unwrap();
-    assert!(body.contains("AI 调用：2 / 2"), "body 应显示 AI 成功/总数，body={body}");
-    assert!(body.contains("tokens_in=240"), "body 应累计 tokens_in，实际：{body}");
-    assert!(body.contains("支撑位 32.30"), "body 应列出后端 signal_event 标题");
+    assert!(
+        body.contains("AI 调用：2 / 2"),
+        "body 应显示 AI 成功/总数，body={body}"
+    );
+    assert!(
+        body.contains("tokens_in=240"),
+        "body 应累计 tokens_in，实际：{body}"
+    );
+    assert!(
+        body.contains("支撑位 32.30"),
+        "body 应列出后端 signal_event 标题"
+    );
     assert!(body.contains("level 命中：1 / 1"), "level 命中率应展示");
     // payload 是手写 json!() 生成的，key 保持 snake_case
     let summary = &resp["payload"]["summary"];
@@ -409,7 +418,10 @@ async fn report_compares_filled_sells_against_stop_take() {
         body.contains("卖出成交 31.80 vs 止损 32.00（-0.20，-0.6%）；止盈 35.00（-3.20，-9.1%）"),
         "sh600460 偏差行：\n{body}"
     );
-    assert!(body.contains("sz000001 卖出成交 10.00 · 未设止损/止盈"), "无价位持仓提示：\n{body}");
+    assert!(
+        body.contains("sz000001 卖出成交 10.00 · 未设止损/止盈"),
+        "无价位持仓提示：\n{body}"
+    );
     // 只有两条已成交卖出参与对照；买入与草稿不产生对照行
     let section = body.split("止损止盈执行对照").nth(1).unwrap_or("");
     assert_eq!(
@@ -417,4 +429,101 @@ async fn report_compares_filled_sells_against_stop_take() {
         2,
         "对照行数应为 2（买入 / 草稿不参与）：\n{body}"
     );
+}
+
+#[actix_web::test]
+async fn weekly_report_includes_level_attribution() {
+    let state = fresh_state().await;
+    let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    let now_cn = chrono::Utc::now().with_timezone(&tz);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    // 信号时间取 now-7h，但夹进本周（周一 0-7 点运行时避免落在上周）
+    let monday = mojinprince_server::service::scheduler::week_start_cn(now_cn.date_naive());
+    let monday_ms = monday
+        .and_hms_opt(0, 0, 0)
+        .map(|dt| {
+            tz.from_local_datetime(&dt)
+                .single()
+                .unwrap()
+                .timestamp_millis()
+        })
+        .unwrap();
+    let at = std::cmp::max(now_ms - 7 * 3600 * 1000, monday_ms + 60_000);
+    let fired_date = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at)
+        .unwrap()
+        .with_timezone(&tz)
+        .format("%Y-%m-%d")
+        .to_string();
+    let today = now_cn.format("%Y-%m-%d").to_string();
+    let yesterday = (now_cn.date_naive() - chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    // A：已命中；B：未命中，支撑 32.0，日线 low 31.9 曾穿越
+    sqlx::query("INSERT INTO signal_event(id, at, kind, code, meta) VALUES(?,?,?,?,?)")
+        .bind("11111111-1111-1111-1111-111111111111")
+        .bind(at)
+        .bind("level")
+        .bind("sh600460")
+        .bind(r#"{"levelKey":"support","levelPrice":"32.0","hit":"1"}"#)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO signal_event(id, at, kind, code, meta) VALUES(?,?,?,?,?)")
+        .bind("22222222-2222-2222-2222-222222222222")
+        .bind(at)
+        .bind("level")
+        .bind("sh600460")
+        .bind(r#"{"levelKey":"support","levelPrice":"32.0","hit":"0"}"#)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    for date in [&fired_date, &yesterday, &today] {
+        sqlx::query("INSERT OR REPLACE INTO day_bar(code, date, high, low) VALUES(?,?,?,?)")
+            .bind("sh600460")
+            .bind(date)
+            .bind(33.5)
+            .bind(31.9)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    sqlx::query("INSERT INTO ai_feedback(at, code, sentiment) VALUES(?,?,?)")
+        .bind(now_ms)
+        .bind("sh600460")
+        .bind("ignore")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::review::configure)),
+    )
+    .await;
+    let resp: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/reviews/run?kind=weekly")
+            .to_request(),
+    )
+    .await;
+    let body = resp["body"].as_str().unwrap();
+    assert!(
+        body.contains("失效归因（level 预警 · 本周）"),
+        "缺少归因小节：\n{body}"
+    );
+    assert!(
+        body.contains("本周 level 信号 2 条") && body.contains("命中 1"),
+        "统计行：\n{body}"
+    );
+    // B 的归类：正常路径是穿越未确认；周一凌晨运行时是窗口未满
+    assert!(
+        body.contains("穿越未确认") || body.contains("窗口未满"),
+        "B 的归因缺失：\n{body}"
+    );
+    assert!(body.contains("被忽略反馈：1 条"), "忽略反馈计数：\n{body}");
+    assert_eq!(resp["payload"]["summary"]["ai_feedback_ignored"], 1);
+    assert_eq!(resp["payload"]["summary"]["level_never_reached"], 0);
 }

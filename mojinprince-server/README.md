@@ -22,7 +22,7 @@
 - ✅ 阶段 2：AI 网关（OpenAI 兼容 / Ollama、用量、命中率、熔断）
 - ✅ 阶段 3：信号 / 持仓 / 自选 / 设置 API 与 Swift 双向同步
 - 🚧 阶段 4：WebSocket 行情推送 + 自选股交易时段调度 + 收盘复盘 / 周报生成（按需 API + 收盘 / 周末自动触发，按 `(kind, period_key)` 幂等，9 项集成测试）已完成，Swift 端已接入复盘历史 / 手动生成；**新闻 / 研报 / 板块数据接入（§F.3–F.4）已完成**（按需 API + 每日收盘后增量刷新 + 评级信号化 `kind=report`；Swift 盯盘页已接入「资讯 · 研报 · 板块」面板）
-- ✅ 测试全绿（2026-09-21 复跑 `cargo test --offline`）：单元 21 项 + 集成 37 项（行情 5 / AI 5+6 / 数据 3 / 复盘 7 / 报告调度 2 / 数据接入 9），另有 5 项真实外网用例默认 `#[ignore]`；3 项数据接入 live 用例已联网验证通过
+- ✅ 测试全绿（2026-09-21 复跑 `cargo test --offline`）：单元 22 项 + 集成 39 项（行情 5 / AI 5+6 / 数据 3 / 复盘 9 / 报告调度 2 / 数据接入 9），另有 5 项真实外网用例默认 `#[ignore]`；3 项数据接入 live 用例已联网验证通过
 
 ---
 
@@ -185,7 +185,7 @@ http://127.0.0.1:8732/api-docs/openapi.json
 - `POST /api/v1/reviews/run?kind=daily|weekly`：生成一份报告。可选 JSON body `{tickets, diary, signals, focusCodes}` 补全 Swift 端内存数据。按 `(kind, period_key)` UPSERT 幂等——重复调用刷新同一条记录（`created_at` 仅首次写入）。`period_key`：daily 为 `YYYY-MM-DD`，weekly 为 `YYYY-Www`（ISO 周，周一为周首日）。
 - `GET /api/v1/reviews?kind=daily|weekly&limit=N`：按 `created_at` 倒序列出已落库报告。
 
-报告 body 汇总后端落库的信号事件、level 命中率、AI 调用成功 / 总数与 token / 成本，并拼接客户端传入的日记、委托与信号时间线，落 `scheduled_report` 表。委托带 `side` / `price` 时（ROI #2），正文还会把「已成交卖出」与 `position` 表的止损 / 止盈价做执行对照（偏差金额与百分比），未设价位的给出纪律提示。
+报告 body 汇总后端落库的信号事件、level 命中率、AI 调用成功 / 总数与 token / 成本，并拼接客户端传入的日记、委托与信号时间线，落 `scheduled_report` 表。委托带 `side` / `price` 时（ROI #2），正文还会把「已成交卖出」与 `position` 表的止损 / 止盈价做执行对照（偏差金额与百分比），未设价位的给出纪律提示。周报（ROI #9）额外带「失效归因（level 预警）」小节：本周 level 信号按 `day_bar` 判定 命中 / 穿越未确认 / 未到价（偏离度 TOP3）/ 窗口未满 / 无日线，并汇总被忽略的 AI 反馈；`payload.summary` 输出结构化计数。
 
 Swift 复盘页通过 `ReportClient` 调用这两个接口：手动生成日报 / 周报 + 拉取历史列表。
 

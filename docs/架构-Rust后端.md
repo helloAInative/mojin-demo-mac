@@ -346,6 +346,7 @@ CREATE INDEX idx_sector_board_code ON sector_board(code);
   - **后端摘要**（服务端拼）：signal_event 时间线、AI 用量、level 命中
   - **客户端上下文**（Swift 主动 POST）：日记 / 委托 / 信号 — 后端原样落到 `payload.context`
   - **止损止盈执行对照**（ROI #2，2026-09-21）：委托 context 带 `side` / `price` 后，服务端把「已成交卖出」与 `position` 表的止损 / 止盈价对比，正文输出偏差金额与百分比（`+0.10（+0.3%）`），未设价位的持仓给出纪律提示；买入与草稿不参与
+  - **失效归因**（ROI #9，2026-09-21，仅周报）：本周 `kind=level` 信号按 `day_bar` 的 high/low 判定失败原因——穿越未确认（发射日后曾触及价位但 6h 内未回写 hit，多为假突破扫损）、未到价（最近偏离度 + 已过天数，取 TOP3）、窗口未满（发射 < 6h）、无日线；`ai_feedback` 中 `ignore` 计数一并汇总；`payload.summary` 带 `level_crossed_unconfirmed` / `level_never_reached` / `level_window_open` / `level_no_bars` / `ai_feedback_ignored`
 - 自动调度：`spawn_report_scheduler` 60s 心跳；工作日 15:05 后补日报，周五 / 周末补周报，**只补缺失的基线版**（已存在的跳过）；Swift 端"生成今日 / 生成本周"按钮相当于在已存在的记录上覆盖正文（含客户端 context），不会改 `created_at`
 
 ---
@@ -580,6 +581,7 @@ WantedBy=multi-user.target
 - [x] 智能止损 / 止盈（ROI #2，2026-09-21）：`Sources/StopTakeAdvisor.swift` ATR14 + 近 20 日结构高低 + 成本回撤 / 阻力三锚点（止损取保守、止盈取先到），盈亏比 < 1.5 / 止损过近自动降级提示；盯盘页建议卡（锚点 tooltip + 手动覆盖标记）一键应用 + 止损/止盈委托草稿预填
 - [x] 持仓止盈链路：`PositionNote.takeProfit` 建模 + `PUT /positions` 同步 + `linkTakeToAbove` 对称联动；跌破止损 / 触达止盈专属提醒（`kind=stopTake`，同价时抑制通用到价提醒，通知点击按 side 预填委托草稿）
 - [x] `scheduler.rs::build_report` 止损止盈执行对照：`TicketSummary` 加 `side` / `price`（`#[serde(default)]` 兼容旧客户端），已成交卖出 vs `position` 止损 / 止盈价输出偏差；`tests/review_phase4.rs` +1、`tests/data_phase3.rs` 补 takeProfit 断言
+- [x] 失效归因周报（ROI #9）：`scheduler.rs::attribute_level`（纯函数单测）+ `build_level_attribution`（周报专用，仅 weekly）——level 信号按 `day_bar` 判定 命中 / 穿越未确认 / 未到价（偏离度 TOP3）/ 窗口未满 / 无日线 + `ai_feedback` ignore 计数，`payload.summary` 带结构化字段；`tests/review_phase4.rs` +1（含周一凌晨时间夹取防周界 flake）
 - [ ] 目标设备 / 局域网端到端联调报告
 
 ---

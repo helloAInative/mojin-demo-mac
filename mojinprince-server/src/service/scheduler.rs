@@ -9,7 +9,7 @@ use crate::error::AppError;
 use crate::model::{Quote, ReviewContext, ScheduledReport, TicketSummary};
 use crate::service::ingest;
 use crate::state::AppState;
-use chrono::{Datelike, FixedOffset, NaiveDate, Timelike, Utc, Weekday};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Timelike, Utc, Weekday};
 use std::time::Duration;
 
 pub fn spawn_quote_scheduler(state: AppState) -> tokio::task::JoinHandle<()> {
@@ -102,6 +102,10 @@ mod tests {
 
 /// A 股时区（Asia/Shanghai，UTC+8）。
 const CN_OFFSET_SECS: i32 = 8 * 3600;
+
+fn cn_tz() -> FixedOffset {
+    FixedOffset::east_opt(CN_OFFSET_SECS).expect("valid UTC+8 offset")
+}
 
 /// 解析"今天（Asia/Shanghai）"日期。
 pub fn today_cn() -> NaiveDate {
@@ -296,6 +300,13 @@ async fn build_report(
     .fetch_one(&state.db)
     .await?;
 
+    // 失效归因（ROI #9，仅周报）：本周 level 信号按 day_bar 判定失败原因
+    let level_attribution = if kind == "weekly" {
+        Some(build_level_attribution(state, start_ms, end_ms, end).await?)
+    } else {
+        None
+    };
+
     let title = match kind {
         "weekly" => format!("周报 · {period_key}"),
         _ => format!("收盘复盘 · {period_key}"),
@@ -330,6 +341,14 @@ async fn build_report(
         "- AI 用量：tokens_in={} tokens_out={} cost≈${:.4}\n\n",
         tokens_in, tokens_out, cost_usd
     ));
+
+    // 失效归因（ROI #9）：让回测有说服力——失败的不是黑盒，给出每条的失败原因
+    if let Some(attribution) = &level_attribution {
+        body.push_str(&attribution.section);
+        if !attribution.section.is_empty() {
+            body.push('\n');
+        }
+    }
 
     // 后端信号时间线
     if !signals.is_empty() {
@@ -396,11 +415,10 @@ async fn build_report(
         let mut lines: Vec<String> = Vec::new();
         for t in &filled_sells {
             let price = t.price.unwrap_or_default();
-            let at_str = t
-                .at
-                .with_timezone(&FixedOffset::east_opt(CN_OFFSET_SECS).unwrap())
-                .format("%m-%d %H:%M")
-                .to_string();
+            let at_str =
+                t.at.with_timezone(&FixedOffset::east_opt(CN_OFFSET_SECS).unwrap())
+                    .format("%m-%d %H:%M")
+                    .to_string();
             let pos = positions.iter().find(|(c, _, _)| *c == t.code);
             let (stop, take) = match pos {
                 Some((_, stop, take)) => (*stop, *take),
@@ -408,10 +426,20 @@ async fn build_report(
             };
             let mut parts: Vec<String> = Vec::new();
             if stop > 0.0 {
-                parts.push(format!("止损 {:.2}（{:+.2}，{:+.1}%）", stop, price - stop, (price - stop) / stop * 100.0));
+                parts.push(format!(
+                    "止损 {:.2}（{:+.2}，{:+.1}%）",
+                    stop,
+                    price - stop,
+                    (price - stop) / stop * 100.0
+                ));
             }
             if take > 0.0 {
-                parts.push(format!("止盈 {:.2}（{:+.2}，{:+.1}%）", take, price - take, (price - take) / take * 100.0));
+                parts.push(format!(
+                    "止盈 {:.2}（{:+.2}，{:+.1}%）",
+                    take,
+                    price - take,
+                    (price - take) / take * 100.0
+                ));
             }
             if parts.is_empty() {
                 lines.push(format!(
@@ -464,7 +492,7 @@ async fn build_report(
 
     let id = uuid_like(&period_key, kind);
     let now = Utc::now();
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "kind": kind,
         "period_key": period_key,
         "start": start.format("%Y-%m-%d").to_string(),
@@ -498,6 +526,21 @@ async fn build_report(
             })
             .collect::<Vec<_>>(),
     });
+    if let Some(attribution) = &level_attribution {
+        if let Some(summary) = payload.get_mut("summary").and_then(|s| s.as_object_mut()) {
+            summary.insert(
+                "level_crossed_unconfirmed".into(),
+                attribution.crossed_unconfirmed.into(),
+            );
+            summary.insert(
+                "level_never_reached".into(),
+                attribution.never_reached.into(),
+            );
+            summary.insert("level_window_open".into(), attribution.window_open.into());
+            summary.insert("level_no_bars".into(), attribution.no_bars.into());
+            summary.insert("ai_feedback_ignored".into(), attribution.ignored.into());
+        }
+    }
 
     Ok(ScheduledReport {
         id,
@@ -593,6 +636,296 @@ fn cn_date_end_ms(date: NaiveDate) -> i64 {
         .and_local_timezone(offset)
         .unwrap();
     dt.timestamp_millis()
+}
+
+// ============================================================================
+// 失效归因（ROI #9）：周报里解释 level 预警为什么失败
+// ============================================================================
+
+#[derive(Debug, Clone)]
+struct LevelSignalInfo {
+    id: String,
+    code: String,
+    at_ms: i64,
+    level_key: String,
+    level_price: f64,
+    hit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LevelOutcome {
+    Hit,
+    /// 曾穿越价位（当日高/低触及）但 6h 内未确认——多为假突破扫损或客户端没盯到
+    CrossedUnconfirmed {
+        date: String,
+        cross_price: f64,
+    },
+    /// 从未到价：给出最近偏离度与已过天数（价位设得太远的证据）
+    NeverReached {
+        days: i64,
+        nearest_pct: f64,
+    },
+    /// 6h 判定窗口未满（周五尾盘发射的信号）
+    WindowOpen,
+    /// 无日线数据（网关没拉过该 code 的日 K）
+    NoBars,
+}
+
+#[derive(Debug, Clone)]
+struct DayBarLite {
+    date: String,
+    high: f64,
+    low: f64,
+}
+
+struct LevelAttribution {
+    section: String,
+    crossed_unconfirmed: usize,
+    never_reached: usize,
+    window_open: usize,
+    no_bars: usize,
+    ignored: i64,
+}
+
+/// 单条信号的归因（纯函数，`now` / `today` 参数化便于测试）。
+fn attribute_level(
+    signal: &LevelSignalInfo,
+    bars: &[DayBarLite],
+    now_ms: i64,
+    today: NaiveDate,
+) -> LevelOutcome {
+    if signal.hit {
+        return LevelOutcome::Hit;
+    }
+    // 客户端命中回写窗口是发射后 6h；窗口未满不归因
+    if signal.at_ms + 6 * 3600 * 1000 > now_ms {
+        return LevelOutcome::WindowOpen;
+    }
+    if signal.level_price <= 0.0 {
+        return LevelOutcome::NoBars;
+    }
+    let fired = DateTime::<Utc>::from_timestamp_millis(signal.at_ms)
+        .map(|dt| dt.with_timezone(&cn_tz()).date_naive());
+    let relevant: Vec<&DayBarLite> = bars
+        .iter()
+        .filter(|b| {
+            NaiveDate::parse_from_str(&b.date, "%Y-%m-%d")
+                .map(|d| fired.map_or(false, |f| d >= f) && d <= today)
+                .unwrap_or(false)
+        })
+        .collect();
+    if relevant.is_empty() {
+        return LevelOutcome::NoBars;
+    }
+    for bar in &relevant {
+        let crossed = match signal.level_key.as_str() {
+            "support" => bar.low > 0.0 && bar.low <= signal.level_price,
+            "resistance" => bar.high >= signal.level_price,
+            _ => {
+                (bar.high >= signal.level_price) || (bar.low > 0.0 && bar.low <= signal.level_price)
+            }
+        };
+        if crossed {
+            return LevelOutcome::CrossedUnconfirmed {
+                date: bar.date.clone(),
+                cross_price: if signal.level_key == "support" {
+                    bar.low
+                } else {
+                    bar.high
+                },
+            };
+        }
+    }
+    let mut nearest = f64::MAX;
+    for bar in &relevant {
+        for price in [bar.high, bar.low] {
+            if price > 0.0 {
+                nearest =
+                    nearest.min((price - signal.level_price).abs() / signal.level_price * 100.0);
+            }
+        }
+    }
+    let days = fired.map(|f| (today - f).num_days().max(0)).unwrap_or(0);
+    LevelOutcome::NeverReached {
+        days,
+        nearest_pct: if nearest == f64::MAX { 100.0 } else { nearest },
+    }
+}
+
+fn level_key_label(key: &str) -> &'static str {
+    match key {
+        "support" => "支撑",
+        "resistance" => "阻力",
+        _ => "基准",
+    }
+}
+
+async fn build_level_attribution(
+    state: &AppState,
+    start_ms: i64,
+    end_ms: i64,
+    today: NaiveDate,
+) -> Result<LevelAttribution, AppError> {
+    let rows: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT id, code, at, meta FROM signal_event \
+         WHERE kind='level' AND at >= ? AND at <= ? ORDER BY at ASC",
+    )
+    .bind(start_ms)
+    .bind(end_ms)
+    .fetch_all(&state.db)
+    .await?;
+    let now_ms = Utc::now().timestamp_millis();
+
+    let mut infos: Vec<LevelSignalInfo> = Vec::with_capacity(rows.len());
+    for (id, code, at_ms, meta) in &rows {
+        let meta: serde_json::Value =
+            serde_json::from_str(meta.as_deref().unwrap_or("{}")).unwrap_or_default();
+        let level_price = meta
+            .get("levelPrice")
+            .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+            .or_else(|| meta.get("levelPrice").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+        infos.push(LevelSignalInfo {
+            id: id.clone(),
+            code: code.clone(),
+            at_ms: *at_ms,
+            level_key: meta
+                .get("levelKey")
+                .and_then(|v| v.as_str())
+                .unwrap_or("base")
+                .to_string(),
+            level_price,
+            hit: meta.get("hit").and_then(|v| v.as_str()) == Some("1")
+                || meta.get("hit").and_then(|v| v.as_i64()) == Some(1),
+        });
+    }
+
+    // 每个 code 一次性拉日 K（date >= start 提前一周余量，归因时按发射日过滤）
+    let mut bars_by_code: std::collections::HashMap<String, Vec<DayBarLite>> =
+        std::collections::HashMap::new();
+    for code in infos
+        .iter()
+        .map(|i| i.code.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let bars: Vec<(String, f64, f64)> =
+            sqlx::query_as("SELECT date, high, low FROM day_bar WHERE code = ? ORDER BY date ASC")
+                .bind(&code)
+                .fetch_all(&state.db)
+                .await?;
+        bars_by_code.insert(
+            code,
+            bars.into_iter()
+                .map(|(date, high, low)| DayBarLite { date, high, low })
+                .collect(),
+        );
+    }
+
+    let mut hit = 0usize;
+    let mut crossed = 0usize;
+    let mut crossed_lines: Vec<String> = Vec::new();
+    let mut never = 0usize;
+    let mut never_lines: Vec<(f64, String)> = Vec::new();
+    let mut window_open = 0usize;
+    let mut no_bars = 0usize;
+    for info in &infos {
+        let bars = bars_by_code.get(&info.code).cloned().unwrap_or_default();
+        match attribute_level(info, &bars, now_ms, today) {
+            LevelOutcome::Hit => hit += 1,
+            LevelOutcome::WindowOpen => window_open += 1,
+            LevelOutcome::NoBars => no_bars += 1,
+            LevelOutcome::CrossedUnconfirmed { date, cross_price } => {
+                crossed += 1;
+                crossed_lines.push(format!(
+                    "- {} {} {} {:.2}（{} 日 {} 触及后未确认）",
+                    date,
+                    info.code,
+                    level_key_label(&info.level_key),
+                    info.level_price,
+                    if info.level_key == "support" {
+                        "低"
+                    } else {
+                        "高"
+                    },
+                    format!("{cross_price:.2}")
+                ));
+            }
+            LevelOutcome::NeverReached { days, nearest_pct } => {
+                never += 1;
+                never_lines.push((
+                    nearest_pct,
+                    format!(
+                        "- {} {} {} {:.2} · 最近偏离 {:.1}% · 已 {} 天",
+                        ms_cn_date(info.at_ms),
+                        info.code,
+                        level_key_label(&info.level_key),
+                        info.level_price,
+                        nearest_pct,
+                        days
+                    ),
+                ));
+            }
+        }
+    }
+
+    let ignored: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ai_feedback WHERE sentiment='ignore' AND at >= ? AND at <= ?",
+    )
+    .bind(start_ms)
+    .bind(end_ms)
+    .fetch_one(&state.db)
+    .await?;
+
+    let mut section = String::new();
+    if !infos.is_empty() {
+        section.push_str("## 失效归因（level 预警 · 本周）\n");
+        section.push_str(&format!(
+            "- 本周 level 信号 {} 条：命中 {}、穿越未确认 {}、未到价 {}、窗口未满 {}、无日线 {}\n",
+            infos.len(),
+            hit,
+            crossed,
+            never,
+            window_open,
+            no_bars
+        ));
+        if !crossed_lines.is_empty() {
+            section.push_str("- 穿越未确认（曾到价但 6h 内未确认，多为假突破扫损）:\n");
+            for line in crossed_lines.iter().take(5) {
+                section.push_str(line);
+                section.push('\n');
+            }
+        }
+        if !never_lines.is_empty() {
+            section.push_str("- 未到价 TOP3（按最近偏离度，价位可能设得太远）:\n");
+            never_lines.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            for (_, line) in never_lines.iter().take(3) {
+                section.push_str(line);
+                section.push('\n');
+            }
+        }
+        if ignored > 0 {
+            section.push_str(&format!(
+                "- 被忽略反馈：{} 条（AI 结论被标记 ignore，考虑收紧阈值）\n",
+                ignored
+            ));
+        }
+    }
+
+    Ok(LevelAttribution {
+        section,
+        crossed_unconfirmed: crossed,
+        never_reached: never,
+        window_open,
+        no_bars,
+        ignored,
+    })
+}
+
+/// 毫秒时间戳 → 北京时间 MM-dd。
+fn ms_cn_date(ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(ms)
+        .map(|dt| dt.with_timezone(&cn_tz()).format("%m-%d").to_string())
+        .unwrap_or_else(|| "--".into())
 }
 
 // ============================================================================
@@ -699,6 +1032,119 @@ fn uuid_like(period_key: &str, kind: &str) -> String {
 mod review_tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn attribute_level_classifies_all_outcomes() {
+        let tz = FixedOffset::east_opt(CN_OFFSET_SECS).unwrap();
+        // 周五收盘后生成周报
+        let now = tz.with_ymd_and_hms(2026, 9, 25, 16, 0, 0).unwrap();
+        let now_ms = now.timestamp_millis();
+        let today = now.date_naive();
+        let base = LevelSignalInfo {
+            id: "1".into(),
+            code: "sh600460".into(),
+            at_ms: now_ms - 3 * 86400 * 1000, // 周二发射
+            level_key: "support".into(),
+            level_price: 32.0,
+            hit: false,
+        };
+
+        // 命中优先于一切
+        let mut hit_sig = base.clone();
+        hit_sig.hit = true;
+        assert_eq!(
+            attribute_level(&hit_sig, &[], now_ms, today),
+            LevelOutcome::Hit
+        );
+
+        // 6h 窗口未满不归因
+        let mut fresh = base.clone();
+        fresh.at_ms = now_ms - 3600 * 1000;
+        assert_eq!(
+            attribute_level(&fresh, &[], now_ms, today),
+            LevelOutcome::WindowOpen
+        );
+
+        // 支撑穿越未确认：发射后首个触及日（low 31.9 ≤ 32.0）
+        let bars = vec![
+            DayBarLite {
+                date: "2026-09-23".into(),
+                high: 33.0,
+                low: 31.9,
+            },
+            DayBarLite {
+                date: "2026-09-24".into(),
+                high: 33.5,
+                low: 32.4,
+            },
+        ];
+        match attribute_level(&base, &bars, now_ms, today) {
+            LevelOutcome::CrossedUnconfirmed { date, cross_price } => {
+                assert_eq!(date, "2026-09-23");
+                assert!((cross_price - 31.9).abs() < 1e-9);
+            }
+            other => panic!("expect crossed, got {other:?}"),
+        }
+
+        // 未到价：最近偏离 0.5/32 = 1.5625%，已过 3 天
+        let far = vec![
+            DayBarLite {
+                date: "2026-09-23".into(),
+                high: 33.0,
+                low: 32.5,
+            },
+            DayBarLite {
+                date: "2026-09-24".into(),
+                high: 33.5,
+                low: 32.6,
+            },
+        ];
+        match attribute_level(&base, &far, now_ms, today) {
+            LevelOutcome::NeverReached { days, nearest_pct } => {
+                assert_eq!(days, 3);
+                assert!((nearest_pct - 1.5625).abs() < 0.01);
+            }
+            other => panic!("expect never reached, got {other:?}"),
+        }
+
+        // 阻力穿越：high ≥ level（33.0 ≥ 32.5 不到位，33.5 达标 → 09-24）
+        let mut res = base.clone();
+        res.level_key = "resistance".into();
+        res.level_price = 33.2;
+        match attribute_level(&res, &bars, now_ms, today) {
+            LevelOutcome::CrossedUnconfirmed { date, cross_price } => {
+                assert_eq!(date, "2026-09-24");
+                assert!((cross_price - 33.5).abs() < 1e-9);
+            }
+            other => panic!("expect crossed resistance, got {other:?}"),
+        }
+
+        // 无日线 / 发射日之前的 bar 不算
+        assert_eq!(
+            attribute_level(&base, &[], now_ms, today),
+            LevelOutcome::NoBars
+        );
+        let early = vec![DayBarLite {
+            date: "2026-09-19".into(),
+            high: 33.0,
+            low: 30.0,
+        }];
+        assert_eq!(
+            attribute_level(&base, &early, now_ms, today),
+            LevelOutcome::NoBars
+        );
+
+        // 未来日期的 bar 不算（today 之后）
+        let future = vec![DayBarLite {
+            date: "2026-09-26".into(),
+            high: 33.0,
+            low: 30.0,
+        }];
+        assert_eq!(
+            attribute_level(&base, &future, now_ms, today),
+            LevelOutcome::NoBars
+        );
+    }
 
     #[test]
     fn period_key_for_daily_uses_iso_date() {
