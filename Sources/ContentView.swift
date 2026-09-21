@@ -244,6 +244,7 @@ struct ContentView: View {
                 minutePanel
                 indicatorPanel
                 levels
+                codeInfoPanel
                 Button {
                     store.syncTicketFromMarket(forcePrice: true)
                     tab = .trade
@@ -265,6 +266,135 @@ struct ContentView: View {
             }
             .padding(.bottom, 4)
         }
+        .onAppear { store.ensureCodeInfo() }
+    }
+
+    /// §F.3–F.4：当前标的的概念板块 / 机构研报 / 近期新闻（走网关，点击打开东财原文）。
+    private var codeInfoPanel: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Text("资讯 · 研报 · 板块")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.secondary)
+                if store.codeInfoBusy {
+                    ProgressView().controlSize(.mini)
+                }
+                if let error = store.codeInfoError {
+                    Text(error)
+                        .font(.system(size: 9))
+                        .foregroundStyle(trendUp)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Button {
+                    store.reloadCodeInfo()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.plain)
+                .controlSize(.mini)
+                .help("重新拉取当前标的的新闻 / 研报 / 板块")
+            }
+
+            if !store.sectorBoards.isEmpty {
+                let boards = store.sectorBoards.sorted {
+                    if $0.isPrecise != $1.isPrecise { return $0.isPrecise }
+                    return ($0.changePct ?? -99) > ($1.changePct ?? -99)
+                }
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 86), spacing: 4)],
+                          alignment: .leading, spacing: 4) {
+                    ForEach(boards.prefix(9)) { board in
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(board.name)
+                                .font(.system(size: 9, weight: .semibold))
+                                .lineLimit(1)
+                            if let pct = board.changePct {
+                                Text(String(format: "%@%.2f%%", pct >= 0 ? "+" : "", pct))
+                                    .font(.system(size: 9))
+                                    .monospacedDigit()
+                                    .foregroundStyle(pctColor(pct))
+                            } else {
+                                Text("—")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 3)
+                        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 5))
+                        .help(board.reason.isEmpty ? board.name : "\(board.name) · \(board.reason)")
+                    }
+                }
+            }
+
+            if !store.researchReports.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(store.researchReports.prefix(3)) { report in
+                        Button {
+                            if let url = URL(string: report.url) { NSWorkspace.shared.open(url) }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Text(report.publishDate)
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.secondary)
+                                Text("\(report.org)·\(report.rating)")
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundStyle(
+                                        report.isBullish == true ? trendUp :
+                                        report.isBullish == false ? trendDown : .secondary)
+                                Text(report.ratingChangeText)
+                                    .font(.system(size: 8))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 3)
+                                    .padding(.vertical, 1)
+                                    .background(Color.primary.opacity(0.06), in: Capsule())
+                                Text(report.title)
+                                    .font(.system(size: 9))
+                                    .lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help("\(report.title)\n\(report.researcher)\(report.industry.isEmpty ? "" : "（\(report.industry)）") · 目标价 \(report.aimPriceText)\n\(report.url)")
+                    }
+                }
+            }
+
+            if !store.newsItems.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(store.newsItems.prefix(4)) { item in
+                        Button {
+                            if let url = URL(string: item.url) { NSWorkspace.shared.open(url) }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Text(item.cnClock)
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.secondary)
+                                Text(item.media.isEmpty ? "新闻" : item.media)
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundStyle(Color.accentColor)
+                                    .lineLimit(1)
+                                Text(item.title)
+                                    .font(.system(size: 9))
+                                    .lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help(item.summary.isEmpty ? item.title : "\(item.title)\n\(item.summary)")
+                    }
+                }
+            }
+
+            if !store.codeInfoBusy, store.codeInfoError == nil,
+               store.newsItems.isEmpty, store.researchReports.isEmpty, store.sectorBoards.isEmpty {
+                Text("暂无资讯 · 东财无数据或网关未启动")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(8)
+        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private var boardIndexStrip: some View {

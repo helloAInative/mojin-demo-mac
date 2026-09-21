@@ -79,6 +79,16 @@ final class MarketStore: ObservableObject {
     @Published var suggestedOrderLine: String = ""
     @Published var ticketSource: String = ""
 
+    // §F.3–F.4：当前标的的新闻 / 研报 / 板块（走网关，失败只降级为提示）
+    @Published var newsItems: [GatewayNewsItem] = []
+    @Published var researchReports: [GatewayResearchReport] = []
+    @Published var sectorBoards: [GatewaySectorBoard] = []
+    @Published var codeInfoBusy = false
+    @Published var codeInfoError: String?
+    /// 已加载过的标的，切换自选时按此去重
+    private var codeInfoLoadedCode: String?
+    private var codeInfoTask: Task<Void, Never>?
+
     // 半自动委托条（国盛照抄，不报单）
     @Published var ticketSide: OrderSide = .buy
     @Published var ticketPrice: Double = 0
@@ -330,6 +340,7 @@ final class MarketStore: ObservableObject {
         settings.selectSymbol(code)
         restartLoops()
         syncTicketFromMarket(forcePrice: true)
+        ensureCodeInfo()
     }
 
     /// 用现价/持仓刷新委托条
@@ -630,6 +641,53 @@ final class MarketStore: ObservableObject {
             status = "拉取复盘历史失败：\(error.localizedDescription)"
             return []
         }
+    }
+
+    /// §F.3–F.4：当前标的切换或首次进入盯盘页时加载资讯；同标的只拉一次。
+    func ensureCodeInfo() {
+        let code = settings.currentCode
+        guard codeInfoLoadedCode != code else { return }
+        codeInfoTask?.cancel()
+        codeInfoLoadedCode = code
+        newsItems = []
+        researchReports = []
+        sectorBoards = []
+        codeInfoError = nil
+        codeInfoTask = Task { [weak self] in
+            await self?.loadCodeInfo(code: code)
+        }
+    }
+
+    /// 强制刷新当前标的的资讯（按钮触发，即使同标的）。
+    func reloadCodeInfo() {
+        codeInfoLoadedCode = nil
+        ensureCodeInfo()
+    }
+
+    private func loadCodeInfo(code: String) async {
+        codeInfoBusy = true
+        defer { codeInfoBusy = false }
+        do {
+            async let news = GatewayMarketClient.news(code: code, limit: 6, hours: 72)
+            async let reports = GatewayMarketClient.reports(code: code, limit: 5, days: 180)
+            async let boards = GatewayMarketClient.sector(code: code)
+            let (n, r, b) = try await (news, reports, boards)
+            guard settings.currentCode == code, !Task.isCancelled else { return }
+            newsItems = n
+            researchReports = r
+            sectorBoards = b
+            codeInfoError = nil
+        } catch {
+            guard settings.currentCode == code, !Task.isCancelled else { return }
+            // 网关未启用 / 不可达时只降级为提示，不刷时间线、不发通知
+            codeInfoError = Self.describeGatewayError(error)
+        }
+    }
+
+    private static func describeGatewayError(_ error: Error) -> String {
+        if case GatewayMarketClient.GatewayError.disabled = error { return "网关未启用" }
+        if case GatewayMarketClient.GatewayError.invalidURL = error { return "网关地址非法" }
+        return "拉取失败：\(error.localizedDescription)"
     }
 
     func selectBoardIndex(_ code: String) {

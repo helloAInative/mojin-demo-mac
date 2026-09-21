@@ -60,6 +60,108 @@ struct GatewayQuoteUpdate {
     var quote: Quote
 }
 
+/// §F.3：个股新闻（东财，经网关缓存）。
+struct GatewayNewsItem: Codable, Equatable, Identifiable {
+    var code: String
+    var title: String
+    var summary: String
+    var media: String
+    var url: String
+    var publishedAt: Date
+
+    var id: String { url }
+
+    enum CodingKeys: String, CodingKey {
+        case code, title, summary, media, url
+        case publishedAt = "published_at"
+    }
+
+    /// 北京时间的 "MM-dd HH:mm"。
+    var cnClock: String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        formatter.dateFormat = "MM-dd HH:mm"
+        return formatter.string(from: publishedAt)
+    }
+}
+
+/// §F.4：机构研报（东财研报库）。
+struct GatewayResearchReport: Codable, Equatable, Identifiable {
+    var code: String
+    var title: String
+    var org: String
+    var publishDate: String
+    var rating: String
+    var lastRating: String
+    var ratingChange: Int?
+    var researcher: String
+    var industry: String
+    var aimPriceHigh: Double?
+    var aimPriceLow: Double?
+    var url: String
+
+    var id: String { url }
+
+    /// 东财评级文案 → 涨跌色：买入 / 增持类红，卖出 / 减持类绿。
+    var isBullish: Bool? {
+        switch rating {
+        case "买入", "增持", "强买", "推荐", "强烈推荐": return true
+        case "卖出", "减持", "回避": return false
+        default: return nil
+        }
+    }
+
+    var ratingChangeText: String {
+        switch ratingChange {
+        case 1: return "上调"
+        case 2: return "下调"
+        case 3: return "维持"
+        default: return lastRating.isEmpty ? "新覆盖" : "续评"
+        }
+    }
+
+    /// 目标价摘要（详情 tooltip 用）。
+    var aimPriceText: String {
+        switch (aimPriceLow, aimPriceHigh) {
+        case let (low?, high?) where high > 0:
+            return String(format: "%.2f-%.2f", min(low, high), max(low, high))
+        case let (high?, _) where high > 0:
+            return String(format: "%.2f", high)
+        default: return "未给出"
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case code, title, org, rating, researcher, industry, url
+        case publishDate = "publish_date"
+        case lastRating = "last_rating"
+        case ratingChange = "rating_change"
+        case aimPriceHigh = "aim_price_high"
+        case aimPriceLow = "aim_price_low"
+    }
+}
+
+/// §F.4：个股所属概念 / 行业板块（含板块指数与涨跌幅）。
+struct GatewaySectorBoard: Codable, Equatable, Identifiable {
+    var code: String
+    var boardCode: String
+    var name: String
+    var isPrecise: Bool
+    var reason: String
+    var price: Double?
+    var changePct: Double?
+
+    var id: String { boardCode }
+
+    enum CodingKeys: String, CodingKey {
+        case code, name, reason, price
+        case boardCode = "board_code"
+        case isPrecise = "is_precise"
+        case changePct = "change_pct"
+    }
+}
+
 /// Rust 行情网关的 Swift DTO 适配层。这里不访问第三方行情源。
 enum GatewayMarketClient {
     private static let session: URLSession = {
@@ -240,6 +342,21 @@ enum GatewayMarketClient {
     /// 阶段 3：服务端信号时间线。调用失败时上层继续使用本地 JSON 缓存。
     static func signals(limit: Int = 200) async throws -> [SignalEvent] {
         try await getData("signals?limit=\(max(1, min(limit, 1000)))")
+    }
+
+    /// §F.3：个股新闻（`hours` 为响应时间窗；落库的始终是全量）。
+    static func news(code: String, limit: Int = 10, hours: Int = 72) async throws -> [GatewayNewsItem] {
+        try await getData("news/\(code)?limit=\(max(1, min(limit, 50)))&hours=\(max(1, min(hours, 720)))")
+    }
+
+    /// §F.4：机构研报（近 `days` 天，按发布日倒序）。
+    static func reports(code: String, limit: Int = 10, days: Int = 90) async throws -> [GatewayResearchReport] {
+        try await getData("reports/\(code)?limit=\(max(1, min(limit, 50)))&days=\(max(1, min(days, 1095)))")
+    }
+
+    /// §F.4：所属概念 / 行业板块（板块指数 + 涨跌幅）。
+    static func sector(code: String) async throws -> [GatewaySectorBoard] {
+        try await getData("sector/\(code)")
     }
 
     /// 本地先写、服务端后写；网络错误不会影响盯盘主流程。
