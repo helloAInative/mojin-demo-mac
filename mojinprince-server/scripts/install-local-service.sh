@@ -14,6 +14,8 @@ DATABASE_URL="sqlite://$DATA_DIR/mojinprince.db"
 mkdir -p "$DATA_DIR" "$LOG_DIR" "$HOME/Library/LaunchAgents"
 cargo build --release --offline --manifest-path "$ROOT/Cargo.toml"
 cp "$ROOT/target/release/mojinprince-server" "$BINARY"
+# 只 strip 可执行文件（proc-macro dylib 不能 strip，见 Cargo.toml 注释）
+strip "$BINARY" 2>/dev/null || true
 chmod 755 "$BINARY"
 
 sed \

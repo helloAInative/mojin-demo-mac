@@ -43,7 +43,9 @@ impl Provider for OpenAIProvider {
 
     async fn chat(&self, req: ChatRequest<'_>) -> Result<ChatResponse, ProviderError> {
         if self.api_key.is_empty() {
-            return Err(ProviderError::NotConfigured("openai api_key is empty".into()));
+            return Err(ProviderError::NotConfigured(
+                "openai api_key is empty".into(),
+            ));
         }
         let url = format!("{}/chat/completions", self.base_url);
         // 即使为 None 也显式写 false，避免阿里 Maas 等上游默认开启思考模式
@@ -82,12 +84,13 @@ impl Provider for OpenAIProvider {
                 body: raw.chars().take(400).collect(),
             });
         }
-        let parsed: ChatCompletions = serde_json::from_str(&raw)
-            .map_err(|e| ProviderError::Decode(format!("{e}; raw={}", raw.chars().take(200).collect::<String>())))?;
-        let choice = parsed
-            .choices
-            .first()
-            .ok_or(ProviderError::Empty)?;
+        let parsed: ChatCompletions = serde_json::from_str(&raw).map_err(|e| {
+            ProviderError::Decode(format!(
+                "{e}; raw={}",
+                raw.chars().take(200).collect::<String>()
+            ))
+        })?;
+        let choice = parsed.choices.first().ok_or(ProviderError::Empty)?;
         let text = pick_text(choice)
             .ok_or(ProviderError::Empty)?
             .trim()

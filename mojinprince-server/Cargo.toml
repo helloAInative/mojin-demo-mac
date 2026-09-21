@@ -50,4 +50,6 @@ tokio = { version = "1.41", features = ["macros", "rt-multi-thread"] }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-strip = true
+# 不能 strip：proc-macro dylib 被 strip 后 dlopen 报 "mis-aligned LINKEDIT string
+# pool"（2026-09-21 实测）；改由 install-local-service.sh 只 strip 最终可执行文件。
+strip = false

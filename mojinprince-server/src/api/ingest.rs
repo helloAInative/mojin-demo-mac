@@ -48,10 +48,7 @@ pub async fn get_news(
     let code = path.into_inner();
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let hours = query.hours.unwrap_or(72).clamp(1, 720);
-    let items = state
-        .news
-        .fetch(&state.http, &code, limit as usize)
-        .await?;
+    let items = state.news.fetch(&state.http, &code, limit as usize).await?;
     persist_news(&state.db, &items).await?;
     let cutoff = Utc::now() - Duration::hours(hours);
     let recent: Vec<NewsItem> = items

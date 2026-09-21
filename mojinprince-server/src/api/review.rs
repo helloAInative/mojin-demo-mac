@@ -43,7 +43,11 @@ pub async fn list(
         .fetch_all(&state.db)
         .await?
     };
-    Ok(HttpResponse::Ok().json(raw.into_iter().map(ScheduledReport::from).collect::<Vec<_>>()))
+    Ok(HttpResponse::Ok().json(
+        raw.into_iter()
+            .map(ScheduledReport::from)
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// 生成一份日报 / 周报。
@@ -100,7 +104,8 @@ impl From<ReportRaw> for ScheduledReport {
             title: row.title,
             body: row.body,
             payload: serde_json::from_str(&row.payload).unwrap_or_else(|_| serde_json::json!({})),
-            created_at: DateTime::<Utc>::from_timestamp_millis(row.created_at).unwrap_or_else(Utc::now),
+            created_at: DateTime::<Utc>::from_timestamp_millis(row.created_at)
+                .unwrap_or_else(Utc::now),
         }
     }
 }

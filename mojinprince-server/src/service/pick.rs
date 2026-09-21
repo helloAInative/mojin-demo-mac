@@ -16,6 +16,94 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 use std::time::Duration as StdDuration;
 
+/// 新浪 A 股涨幅榜（东财 push2 断连时候选池 fallback；同属既有三源）。
+/// 无行业字段 → 板块动量因子自动降级（industry 为空不参与聚合）。
+#[derive(Debug, Clone)]
+pub struct SinaRanking {
+    /// 测试可覆写（默认 `https://vip.stock.finance.sina.com.cn`）
+    pub base_url: String,
+}
+
+impl Default for SinaRanking {
+    fn default() -> Self {
+        Self {
+            base_url: "https://vip.stock.finance.sina.com.cn".into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SinaRow {
+    /// 已带 sh/sz/bj 前缀
+    symbol: String,
+    name: String,
+    trade: Option<String>,
+    changepercent: Option<f64>,
+}
+
+impl SinaRanking {
+    pub async fn fetch(
+        &self,
+        http: &reqwest::Client,
+        limit: usize,
+    ) -> Result<Vec<Candidate>, PickError> {
+        let limit_text = limit.to_string();
+        let response = http
+            .get(format!(
+                "{}/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
+                self.base_url
+            ))
+            .query(&[
+                ("page", "1"),
+                ("num", limit_text.as_str()),
+                ("sort", "changepercent"),
+                ("asc", "0"),
+                ("node", "hs_a"),
+            ])
+            .send()
+            .await
+            .map_err(|e| PickError::Network(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(PickError::Network(format!("status {}", response.status())));
+        }
+        let rows: Vec<SinaRow> = response
+            .json()
+            .await
+            .map_err(|e| PickError::Parse(e.to_string()))?;
+        Ok(filter_sina_rows(rows))
+    }
+}
+
+/// 北交所（bj）与 ST/退市/次新剔除；价格字符串转 f64。
+fn filter_sina_rows(rows: Vec<SinaRow>) -> Vec<Candidate> {
+    rows.into_iter()
+        .filter_map(|row| {
+            if !row.symbol.starts_with("sh") && !row.symbol.starts_with("sz") {
+                return None;
+            }
+            if row.name.contains("ST")
+                || row.name.contains("退")
+                || row.name.starts_with('N')
+                || row.name.starts_with('C')
+            {
+                return None;
+            }
+            let price = row.trade.as_deref().and_then(|p| p.parse::<f64>().ok())?;
+            let pct = row.changepercent?;
+            if price <= 0.0 || price > 2000.0 {
+                return None;
+            }
+            Some(Candidate {
+                code: row.symbol,
+                name: row.name,
+                price,
+                pct,
+                industry: String::new(),
+            })
+        })
+        .collect()
+}
+
 /// 腾讯前复权日 K 源（base_url 可在测试覆写，默认 web.ifzq.gtimg.cn）。
 #[derive(Debug, Clone)]
 pub struct DayKSource {
@@ -616,7 +704,15 @@ pub async fn generate_picks(
     date: NaiveDate,
     ai_config: Option<&AiRankConfig>,
 ) -> Result<PicksDocument, PickError> {
-    let candidates = state.pick_ranking.fetch(&state.http, 100).await?;
+    // 候选池：东财 push2 断连时切新浪榜（板块动量因子因无行业字段自动降级）
+    let candidates = match state.pick_ranking.fetch(&state.http, 100).await {
+        Ok(rows) if !rows.is_empty() => rows,
+        Ok(_) => return Err(PickError::Parse("涨幅榜为空".into())),
+        Err(error) => {
+            tracing::warn!(%error, "eastmoney ranking failed, fallback to sina");
+            state.sina_ranking.fetch(&state.http, 100).await?
+        }
+    };
     if candidates.is_empty() {
         return Err(PickError::Parse("涨幅榜为空".into()));
     }
@@ -1320,6 +1416,42 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         assert_eq!(k.len(), closes.len());
         assert!((0.0..=100.0).contains(k.last().unwrap()));
         assert!((0.0..=100.0).contains(d.last().unwrap()));
+    }
+
+    #[test]
+    fn sina_rows_filter_bj_st_and_parse_price() {
+        let rows = vec![
+            SinaRow {
+                symbol: "sz300623".into(),
+                name: "捷捷微电".into(),
+                trade: Some("35.110".into()),
+                changepercent: Some(2.8),
+            },
+            SinaRow {
+                symbol: "bj920427".into(),
+                name: "华维设计".into(),
+                trade: Some("11.030".into()),
+                changepercent: Some(29.9),
+            },
+            SinaRow {
+                symbol: "sh600000".into(),
+                name: "ST 测试".into(),
+                trade: Some("1.0".into()),
+                changepercent: Some(5.0),
+            },
+            SinaRow {
+                symbol: "sh600001".into(),
+                name: "坏价格".into(),
+                trade: Some("abc".into()),
+                changepercent: Some(5.0),
+            },
+        ];
+        let out = filter_sina_rows(rows);
+        assert_eq!(out.len(), 1, "bj / ST / 坏价格都剔除");
+        assert_eq!(out[0].code, "sz300623");
+        assert_eq!(out[0].price, 35.110);
+        assert_eq!(out[0].pct, 2.8);
+        assert!(out[0].industry.is_empty(), "无行业字段，板块动量自动降级");
     }
 
     #[test]

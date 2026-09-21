@@ -91,12 +91,18 @@ pub trait Provider: Send + Sync {
 }
 
 /// 根据 id + 路径参数解析 provider（解耦 config 与构造）。
-pub fn resolve(id: &str, base_url: &str, api_key: &str) -> Result<Box<dyn Provider>, ProviderError> {
+pub fn resolve(
+    id: &str,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Box<dyn Provider>, ProviderError> {
     let id = id.trim().to_ascii_lowercase();
     match id.as_str() {
         "openai" | "remote" | "" => Ok(Box::new(openai::OpenAIProvider::new(base_url, api_key))),
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new(base_url))),
-        other => Err(ProviderError::NotConfigured(format!("unknown provider id: {other}"))),
+        other => Err(ProviderError::NotConfigured(format!(
+            "unknown provider id: {other}"
+        ))),
     }
 }
 
@@ -106,10 +112,7 @@ mod tests {
 
     #[test]
     fn resolve_routes_known_ids() {
-        assert_eq!(
-            resolve("openai", "https://x", "k").unwrap().id(),
-            "openai"
-        );
+        assert_eq!(resolve("openai", "https://x", "k").unwrap().id(), "openai");
         assert_eq!(resolve("", "http://x", "k").unwrap().id(), "openai");
         assert_eq!(resolve("ollama", "http://x", "").unwrap().id(), "ollama");
         assert!(resolve("bogus", "x", "y").is_err());

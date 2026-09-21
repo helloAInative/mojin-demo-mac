@@ -93,12 +93,11 @@ async fn analyze_persists_signal_event_and_usage() {
     assert!(resp["signal_id"].as_str().unwrap().len() > 0);
     mock.assert();
 
-    let row: (i64, String, String) = sqlx::query_as(
-        "SELECT at, kind, code FROM signal_event ORDER BY at DESC LIMIT 1",
-    )
-    .fetch_one(&db)
-    .await
-    .unwrap();
+    let row: (i64, String, String) =
+        sqlx::query_as("SELECT at, kind, code FROM signal_event ORDER BY at DESC LIMIT 1")
+            .fetch_one(&db)
+            .await
+            .unwrap();
     assert_eq!(row.1, "ai");
     assert_eq!(row.2, "sh600460");
 }
@@ -178,12 +177,16 @@ async fn accuracy_counts_hit_ratio() {
     }
     let resp: Value = test::call_and_read_body_json(
         &app,
-        test::TestRequest::get().uri("/api/v1/ai/accuracy?window_hours=24").to_request(),
+        test::TestRequest::get()
+            .uri("/api/v1/ai/accuracy?window_hours=24")
+            .to_request(),
     )
     .await;
     assert_eq!(resp["total"], 3);
     assert_eq!(resp["hit"], 2);
-    let rate = resp["rate"].as_f64().unwrap_or(resp["hit_rate"].as_f64().unwrap_or(0.0));
+    let rate = resp["rate"]
+        .as_f64()
+        .unwrap_or(resp["hit_rate"].as_f64().unwrap_or(0.0));
     assert!((rate - 2.0 / 3.0).abs() < 0.001);
 }
 
@@ -278,7 +281,10 @@ async fn chat_cooldown_returns_429() {
             break;
         }
     }
-    assert!(saw_deny, "expected at least one 429/503 after consecutive failures");
+    assert!(
+        saw_deny,
+        "expected at least one 429/503 after consecutive failures"
+    );
 }
 
 use chrono::Utc;

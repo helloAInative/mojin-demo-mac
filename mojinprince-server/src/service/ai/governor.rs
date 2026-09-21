@@ -40,7 +40,9 @@ pub enum DenyReason {
 impl std::fmt::Display for DenyReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DenyReason::CoolingDown { wait_ms } => write!(f, "cooling_down: retry after {wait_ms}ms"),
+            DenyReason::CoolingDown { wait_ms } => {
+                write!(f, "cooling_down: retry after {wait_ms}ms")
+            }
             DenyReason::DailyQuotaExceeded { used, cap } => {
                 write!(f, "daily_quota_exceeded: used={used} cap={cap}")
             }
@@ -145,7 +147,8 @@ impl Governor {
         s.today_count = s.today_count.saturating_add(1);
         s.fail_streak = s.fail_streak.saturating_add(1);
         if s.fail_streak >= self.cfg.fail_threshold {
-            s.breaker_until = Some(Instant::now() + Duration::from_millis(self.cfg.breaker_cooldown_ms));
+            s.breaker_until =
+                Some(Instant::now() + Duration::from_millis(self.cfg.breaker_cooldown_ms));
             s.fail_streak = 0;
         }
     }

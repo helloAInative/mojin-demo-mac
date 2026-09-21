@@ -41,19 +41,13 @@ impl Provider for OllamaProvider {
             }
         });
         let started = std::time::Instant::now();
-        let resp = self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout(120_000)
-                } else {
-                    ProviderError::Other(anyhow::anyhow!(e))
-                }
-            })?;
+        let resp = self.http.post(&url).json(&body).send().await.map_err(|e| {
+            if e.is_timeout() {
+                ProviderError::Timeout(120_000)
+            } else {
+                ProviderError::Other(anyhow::anyhow!(e))
+            }
+        })?;
         let status = resp.status();
         let raw = resp
             .text()
@@ -65,8 +59,12 @@ impl Provider for OllamaProvider {
                 body: raw.chars().take(400).collect(),
             });
         }
-        let parsed: OllamaChat = serde_json::from_str(&raw)
-            .map_err(|e| ProviderError::Decode(format!("{e}; raw={}", raw.chars().take(200).collect::<String>())))?;
+        let parsed: OllamaChat = serde_json::from_str(&raw).map_err(|e| {
+            ProviderError::Decode(format!(
+                "{e}; raw={}",
+                raw.chars().take(200).collect::<String>()
+            ))
+        })?;
         let text = parsed.message.content.trim().to_string();
         if text.is_empty() {
             return Err(ProviderError::Empty);

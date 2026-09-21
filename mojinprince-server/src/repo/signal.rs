@@ -83,20 +83,17 @@ impl SignalRepo {
         Ok(rows.into_iter().map(SignalEventRow::from).collect())
     }
 
-    pub async fn patch_meta(
-        &self,
-        id: &str,
-        patch: &serde_json::Value,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn patch_meta(&self, id: &str, patch: &serde_json::Value) -> Result<(), sqlx::Error> {
         // 读取后合并再写回（事务）。
         let mut tx = self.db.begin().await?;
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT meta FROM signal_event WHERE id=?")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT meta FROM signal_event WHERE id=?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
         let mut cur: serde_json::Value = match row {
-            Some((s,)) if !s.is_empty() => serde_json::from_str(&s).unwrap_or(serde_json::json!({})),
+            Some((s,)) if !s.is_empty() => {
+                serde_json::from_str(&s).unwrap_or(serde_json::json!({}))
+            }
             _ => serde_json::json!({}),
         };
         if let (Some(cur_obj), Some(patch_obj)) = (cur.as_object_mut(), patch.as_object()) {

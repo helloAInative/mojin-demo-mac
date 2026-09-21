@@ -31,11 +31,9 @@ impl SettingsRepo {
     }
 
     pub async fn get_all(&self) -> Result<HashMap<String, serde_json::Value>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT key, value FROM settings",
-        )
-        .fetch_all(&self.db)
-        .await?;
+        let rows = sqlx::query_as::<_, (String, String)>("SELECT key, value FROM settings")
+            .fetch_all(&self.db)
+            .await?;
         let mut out = HashMap::new();
         for (k, v) in rows {
             let parsed: serde_json::Value =
@@ -46,11 +44,10 @@ impl SettingsRepo {
     }
 
     pub async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, sqlx::Error> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT value FROM settings WHERE key=?")
-                .bind(key)
-                .fetch_optional(&self.db)
-                .await?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key=?")
+            .bind(key)
+            .fetch_optional(&self.db)
+            .await?;
         Ok(row.and_then(|(s,)| {
             if s.is_empty() {
                 None
@@ -74,7 +71,10 @@ impl SettingsRepo {
         Ok(())
     }
 
-    pub async fn put_many(&self, items: &HashMap<String, serde_json::Value>) -> Result<(), sqlx::Error> {
+    pub async fn put_many(
+        &self,
+        items: &HashMap<String, serde_json::Value>,
+    ) -> Result<(), sqlx::Error> {
         let mut tx = self.db.begin().await?;
         let now = Utc::now().timestamp_millis();
         for (k, v) in items {
