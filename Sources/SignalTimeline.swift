@@ -165,3 +165,53 @@ enum SignalTimeline {
         Task { try? await GatewayMarketClient.deleteSignals() }
     }
 }
+
+/// 命中率时序化（ROI #5 / D.1 升级）：把累计「三件套」拆成按日曲线。
+/// - 近 N 个日历日（含无事件日，空档直观）按北京时间分桶 level 事件
+/// - `rolling` 是含当日的 7 个日历日累计命中率（窗口内 total=0 时为 nil）
+enum AccuracyTimeline {
+    struct Day: Equatable {
+        /// 北京时间 yyyy-MM-dd
+        var date: String
+        var total: Int
+        var hit: Int
+        /// 近 7 日滚动命中率（0…1）；窗口内无事件为 nil
+        var rolling: Double?
+    }
+
+    static func build(events: [SignalEvent], lookbackDays: Int = 30) -> [Day] {
+        let tz = TimeZone(identifier: "Asia/Shanghai") ?? .current
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = tz
+        formatter.dateFormat = "yyyy-MM-dd"
+
+        let lookback = max(7, lookbackDays)
+        // 从今天往回铺 N 个日历日（升序）
+        var dates: [String] = []
+        for back in stride(from: lookback - 1, through: 0, by: -1) {
+            if let day = cal.date(byAdding: .day, value: -back, to: Date()) {
+                dates.append(formatter.string(from: day))
+            }
+        }
+        let index = Dictionary(uniqueKeysWithValues: dates.enumerated().map { ($1, $0) })
+        var total = [Int](repeating: 0, count: dates.count)
+        var hit = [Int](repeating: 0, count: dates.count)
+        for event in events where event.kind == "level" {
+            guard let i = index[formatter.string(from: event.at)] else { continue }
+            total[i] += 1
+            if event.meta["hit"] == "1" { hit[i] += 1 }
+        }
+        return dates.enumerated().map { i, date in
+            var rolling: Double?
+            let start = max(0, i - 6)
+            let windowTotal = total[start...i].reduce(0, +)
+            if windowTotal > 0 {
+                rolling = Double(hit[start...i].reduce(0, +)) / Double(windowTotal)
+            }
+            return Day(date: date, total: total[i], hit: hit[i], rolling: rolling)
+        }
+    }
+}

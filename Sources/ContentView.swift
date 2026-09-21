@@ -814,7 +814,35 @@ struct ContentView: View {
             }
             .frame(minHeight: 120, maxHeight: 200)
 
+            accuracyTrendSection
+
             aiUsagePanel
+        }
+    }
+
+    /// 命中率时序曲线（ROI #5）：近 30 天按日信号数 + 7 日滚动命中率。
+    @ViewBuilder private var accuracyTrendSection: some View {
+        let days = store.accuracyTimeline
+        if days.contains(where: { $0.total > 0 }) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text("命中率曲线 · 近 30 天")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.secondary)
+                    Circle().fill(Color.accentColor).frame(width: 5, height: 5)
+                    Text("7日滚动")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.tertiary)
+                    Circle().fill(Color(red: 0.2, green: 0.84, blue: 0.29)).frame(width: 5, height: 5)
+                    Text("命中数/信号数")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.tertiary)
+                    Spacer()
+                }
+                AccuracyTrendChart(days: days)
+                    .frame(height: 92)
+                    .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+            }
         }
     }
 

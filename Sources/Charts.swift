@@ -1004,3 +1004,140 @@ struct VolumeChart: View {
         .drawingGroup()
     }
 }
+
+/// 命中率时序曲线（ROI #5 / D.1 升级）：
+/// 上区 7 日滚动命中率折线（0–100%），下区每日 level 信号数柱（命中部分着色）。
+/// 悬停看单日明细与滚动值；空档日一目了然。
+struct AccuracyTrendChart: View {
+    var days: [AccuracyTimeline.Day]
+
+    @State private var hoverIndex: Int? = nil
+
+    private let hitColor = Color(red: 0.2, green: 0.84, blue: 0.29)
+    private let missColor = Color.primary.opacity(0.14)
+    private let lineColor = Color.accentColor
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .topLeading) {
+                Canvas { context, size in
+                    draw(context: context, size: size)
+                }
+                .drawingGroup()
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            hoverIndex = index(atX: value.location.x, in: geo.size)
+                        }
+                        .onEnded { _ in hoverIndex = nil }
+                )
+
+                if let i = hoverIndex, i < days.count, i >= 0 {
+                    let d = days[i]
+                    let rate = d.total > 0 ? Double(d.hit) / Double(d.total) * 100 : 0
+                    let rolling = d.rolling.map { String(format: "%.0f%%", $0 * 100) } ?? "—"
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(String(format: "%@ · 信号 %d · 命中 %d", shortDate(d.date), d.total, d.hit))
+                        Text(String(format: "当日 %.0f%% · 近7日 %@", rate, rolling))
+                    }
+                    .font(.system(size: 9, weight: .semibold))
+                    .padding(.horizontal, 6).padding(.vertical, 3)
+                    .background(Color.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 4))
+                    .foregroundColor(.white)
+                    .offset(x: min(geo.size.width - 150, max(0, xFor(i, in: geo.size) - 60)),
+                            y: 2)
+                }
+            }
+        }
+    }
+
+    private func shortDate(_ d: String) -> String {
+        String(d.suffix(5)) // yyyy-MM-dd → MM-dd
+    }
+
+    private func xFor(_ i: Int, in size: CGSize) -> CGFloat {
+        let padL: CGFloat = 2, padR: CGFloat = 2
+        let count = max(days.count, 1)
+        return padL + (CGFloat(i) + 0.5) / CGFloat(count) * (size.width - padL - padR)
+    }
+
+    private func index(atX x: CGFloat, in size: CGSize) -> Int? {
+        guard days.count > 0, size.width > 4 else { return nil }
+        let count = CGFloat(days.count)
+        let width = size.width - 4
+        let i = Int(((x - 2) / width) * count)
+        return min(max(i, 0), days.count - 1)
+    }
+
+    private func draw(context: GraphicsContext, size: CGSize) {
+        guard days.count > 1 else { return }
+        let padL: CGFloat = 2, padR: CGFloat = 2, padT: CGFloat = 6, padB: CGFloat = 13
+        let drawable = CGSize(width: size.width - padL - padR, height: size.height - padT - padB)
+        let rateH = drawable.height * 0.62
+        let barH = drawable.height * 0.34
+        let gap = drawable.height * 0.04
+        let barTop = padT + rateH + gap
+        let maxTotal = max(days.map(\.total).max() ?? 1, 1)
+        let barW = max(1.5, drawable.width / CGFloat(days.count) * 0.55)
+
+        // 50% 参考线（命中率区）
+        let fiftyY = padT + (1 - 0.5) * rateH
+        var grid = Path()
+        grid.move(to: CGPoint(x: padL, y: fiftyY))
+        grid.addLine(to: CGPoint(x: size.width - padR, y: fiftyY))
+        context.stroke(grid, with: .color(Color.primary.opacity(0.12)),
+                       style: StrokeStyle(lineWidth: 0.8, dash: [3, 3]))
+        let fiftyLabel = Text("50%").font(.system(size: 8)).foregroundColor(.secondary)
+        context.draw(fiftyLabel, at: CGPoint(x: size.width - 12, y: fiftyY - 5))
+
+        // 每日信号柱：命中部分绿色，未命中灰色叠加
+        for (i, d) in days.enumerated() {
+            guard d.total > 0 else { continue }
+            let x = xFor(i, in: size)
+            let full = CGFloat(d.total) / CGFloat(maxTotal) * barH
+            let hitPart = CGFloat(d.hit) / CGFloat(maxTotal) * barH
+            let baseY = padT + drawable.height
+            if d.hit > 0 {
+                let hitRect = CGRect(x: x - barW / 2, y: baseY - hitPart, width: barW, height: max(hitPart, 1))
+                context.fill(Path(hitRect), with: .color(hitColor.opacity(0.75)))
+            }
+            if d.hit < d.total {
+                let missRect = CGRect(x: x - barW / 2, y: baseY - full, width: barW,
+                                      height: max(full - hitPart, 1))
+                context.fill(Path(missRect), with: .color(missColor))
+            }
+        }
+
+        // 7 日滚动命中率折线（只在有定义的相邻点之间连线）
+        var line = Path()
+        var started = false
+        for (i, d) in days.enumerated() {
+            guard let rate = d.rolling else { started = false; continue }
+            let x = xFor(i, in: size)
+            let y = padT + (1 - CGFloat(rate)) * rateH
+            if started {
+                line.addLine(to: CGPoint(x: x, y: y))
+            } else {
+                line.move(to: CGPoint(x: x, y: y))
+                started = true
+            }
+        }
+        context.stroke(line, with: .color(lineColor), style: StrokeStyle(lineWidth: 1.4, lineJoin: .round))
+        for (i, d) in days.enumerated() {
+            guard let rate = d.rolling, d.total > 0 else { continue }
+            let x = xFor(i, in: size)
+            let y = padT + (1 - CGFloat(rate)) * rateH
+            let dot = CGRect(x: x - 1.5, y: y - 1.5, width: 3, height: 3)
+            context.fill(Path(ellipseIn: dot), with: .color(lineColor))
+        }
+
+        // X 轴稀疏日期
+        for i in [0, days.count / 2, days.count - 1] {
+            let label = Text(shortDate(days[i].date))
+                .font(.system(size: 8))
+                .foregroundColor(.secondary)
+            let x = xFor(i, in: size)
+            context.draw(label, at: CGPoint(x: x, y: size.height - 5))
+        }
+    }
+}

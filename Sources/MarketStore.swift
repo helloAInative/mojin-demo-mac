@@ -82,6 +82,11 @@ final class MarketStore: ObservableObject {
     /// 智能止损 / 止盈建议（refreshDaily / 持仓变更时重算，不逐 tick）
     @Published var stopTakeAdvice: StopTakeAdvisor.Advice?
 
+    /// 命中率时序（ROI #5）：近 30 个日历日按日聚合 level 事件 + 7 日滚动命中率。
+    var accuracyTimeline: [AccuracyTimeline.Day] {
+        AccuracyTimeline.build(events: signalEvents)
+    }
+
     // §F.3–F.4：当前标的的新闻 / 研报 / 板块（走网关，失败只降级为提示）
     @Published var newsItems: [GatewayNewsItem] = []
     @Published var researchReports: [GatewayResearchReport] = []
