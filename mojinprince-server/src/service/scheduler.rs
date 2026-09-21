@@ -144,6 +144,12 @@ pub fn spawn_report_scheduler(state: AppState) -> tokio::task::JoinHandle<()> {
             if let Err(error) = maybe_generate_reports(&state).await {
                 tracing::warn!(%error, "report scheduler tick failed");
             }
+            // ROI #12：收盘后顺带把最近交易日的数据归档到 data/archives/
+            let offset = FixedOffset::east_opt(CN_OFFSET_SECS).expect("valid UTC+8 offset");
+            let now = Utc::now().with_timezone(&offset);
+            if let Err(error) = maybe_dump_daily_archive(&state, now).await {
+                tracing::warn!(%error, "daily archive dump failed");
+            }
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
     })
@@ -929,6 +935,170 @@ fn ms_cn_date(ms: i64) -> String {
 }
 
 // ============================================================================
+// 每日数据归档（ROI #12）：收盘后把最近交易日的全量快照 dump 成 JSON 文件
+// ============================================================================
+
+/// 归档目录跟着数据库走：dev 在 `data/archives/`，常驻安装在 Application Support。
+fn archives_dir(state: &AppState) -> std::path::PathBuf {
+    let raw = state
+        .cfg
+        .database_url
+        .trim_start_matches("sqlite://")
+        .trim_start_matches("sqlite:");
+    let parent = std::path::Path::new(raw)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    parent.join("archives")
+}
+
+/// 最近**已收盘**的交易日：工作日 15:10 后是今天；否则回退到上一个工作日
+/// （周末 / 节前不拦，覆盖"周五晚间没开机"的补归档；无节假日感知）。
+fn last_closed_trading_day(now: chrono::DateTime<FixedOffset>) -> NaiveDate {
+    let after_close = now.hour() * 60 + now.minute() >= 15 * 60 + 10;
+    let mut day = now.date_naive();
+    let today_is_trading = !matches!(day.weekday(), Weekday::Sat | Weekday::Sun);
+    if !(after_close && today_is_trading) {
+        day = day.pred_opt().unwrap_or(day);
+    }
+    while matches!(day.weekday(), Weekday::Sat | Weekday::Sun) {
+        day = day.pred_opt().unwrap_or(day);
+    }
+    day
+}
+
+/// 为最近已收盘交易日写 `archives/{date}.json`：文件已存在即跳过——同一天幂等，
+/// 且周五晚间没开机时周六 / 周日 / 周一自动补。
+pub async fn maybe_dump_daily_archive(
+    state: &AppState,
+    now: chrono::DateTime<FixedOffset>,
+) -> anyhow::Result<bool> {
+    let date = last_closed_trading_day(now);
+    let dir = archives_dir(state);
+    let file = dir.join(format!("{}.json", date.format("%Y-%m-%d")));
+    if file.exists() {
+        return Ok(false);
+    }
+    let archive = build_day_archive(state, date).await?;
+    let text = serde_json::to_string_pretty(&archive)?;
+    std::fs::create_dir_all(&dir).ok();
+    std::fs::write(&file, text)?;
+    tracing::info!(date = %date.format("%Y-%m-%d"), "daily archive dumped");
+    Ok(true)
+}
+
+/// 组装某交易日的归档：自选股分时（minute_bar）+ 当日收盘快照（quote 表最后一条）
+/// + 当日信号 + AI 用量汇总 + 持仓快照（dump 时刻状态，历史日无法回溯持仓）。
+async fn build_day_archive(
+    state: &AppState,
+    date: NaiveDate,
+) -> Result<serde_json::Value, AppError> {
+    let start_ms = cn_date_start_ms(date);
+    let end_ms = cn_date_end_ms(date);
+    let date_key = date.format("%Y-%m-%d").to_string();
+
+    let watch: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT code, name FROM watchlist ORDER BY pinned DESC, added_at ASC")
+            .fetch_all(&state.db)
+            .await?;
+
+    let mut codes = serde_json::Map::new();
+    for (code, name) in &watch {
+        // 当日分时（分钟粒度即可，逐笔回放是 §B.4 的事）
+        // volume 是 INTEGER 列，按 i64 解码再转 JSON
+        let minutes: Vec<(i64, f64, f64, i64)> = sqlx::query_as(
+            "SELECT ts, price, avg_price, volume FROM minute_bar \
+             WHERE code = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC",
+        )
+        .bind(code)
+        .bind(start_ms)
+        .bind(end_ms)
+        .fetch_all(&state.db)
+        .await?;
+        let quote: Option<(f64, f64, f64, f64, f64)> = sqlx::query_as(
+            "SELECT price, prev, open, high, low FROM quote \
+             WHERE code = ? AND ts >= ? AND ts <= ? ORDER BY ts DESC LIMIT 1",
+        )
+        .bind(code)
+        .bind(start_ms)
+        .bind(end_ms)
+        .fetch_optional(&state.db)
+        .await?;
+        let quote_json = match quote {
+            Some((price, prev, open, high, low)) => serde_json::json!({
+                "close": price, "prev": prev, "open": open, "high": high, "low": low,
+            }),
+            None => serde_json::Value::Null,
+        };
+        codes.insert(
+            code.clone(),
+            serde_json::json!({
+                "name": name,
+                "quote": quote_json,
+                // [ts(ms), price, avg, volume] 紧凑数组省体积
+                "minutes": minutes
+                    .into_iter()
+                    .map(|(ts, price, avg, volume)| serde_json::json!([ts, price, avg, volume]))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+
+    let signals: Vec<serde_json::Value> = sqlx::query_as::<_, (String, i64, String, String, String)>(
+        "SELECT id, at, kind, code, title FROM signal_event \
+         WHERE at >= ? AND at <= ? ORDER BY at ASC",
+    )
+    .bind(start_ms)
+    .bind(end_ms)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .map(|(id, at, kind, code, title)| {
+        serde_json::json!({ "id": id, "at": at, "kind": kind, "code": code, "title": title })
+    })
+    .collect();
+
+    let (ai_total, ai_success, tokens_in, tokens_out, cost_usd): (i64, i64, i64, i64, f64) =
+        sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(success),0), COALESCE(SUM(tokens_in),0), \
+             COALESCE(SUM(tokens_out),0), CAST(COALESCE(SUM(cost),0) AS REAL) \
+             FROM ai_usage WHERE at >= ? AND at <= ?",
+        )
+        .bind(start_ms)
+        .bind(end_ms)
+        .fetch_one(&state.db)
+        .await?;
+
+    let positions: Vec<serde_json::Value> = sqlx::query_as::<_, (String, f64, f64, f64, f64, f64)>(
+        "SELECT code, cost, shares, stop_loss, take_profit, position_pct FROM position",
+    )
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .map(
+        |(code, cost, shares, stop_loss, take_profit, position_pct)| {
+            serde_json::json!({
+                "code": code, "cost": cost, "shares": shares,
+                "stop_loss": stop_loss, "take_profit": take_profit, "position_pct": position_pct,
+            })
+        },
+    )
+    .collect();
+
+    Ok(serde_json::json!({
+        "date": date_key,
+        "generated_at": Utc::now().to_rfc3339(),
+        "ai_usage": {
+            "total": ai_total, "success": ai_success,
+            "tokens_in": tokens_in, "tokens_out": tokens_out, "cost_usd": cost_usd,
+        },
+        "positions": positions,
+        "signals": signals,
+        "codes": codes,
+    }))
+}
+
+// ============================================================================
 // §F.3–F.4 每日增量拉取：自选股新闻 / 研报 / 概念板块
 // ============================================================================
 
@@ -1032,6 +1202,39 @@ fn uuid_like(period_key: &str, kind: &str) -> String {
 mod review_tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn last_closed_trading_day_walks_back_until_closed() {
+        let tz = FixedOffset::east_opt(CN_OFFSET_SECS).unwrap();
+        let at = |y, m, d, h, mi| tz.with_ymd_and_hms(y, m, d, h, mi, 0).unwrap();
+        // 周末任何时刻 → 上周五
+        assert_eq!(
+            last_closed_trading_day(at(2026, 9, 20, 10, 0)),
+            NaiveDate::from_ymd_opt(2026, 9, 18).unwrap()
+        );
+        assert_eq!(
+            last_closed_trading_day(at(2026, 9, 19, 9, 0)),
+            NaiveDate::from_ymd_opt(2026, 9, 18).unwrap()
+        );
+        // 周一早上（今天没收盘）→ 上周五；周一收盘后 → 今天
+        assert_eq!(
+            last_closed_trading_day(at(2026, 9, 21, 10, 0)),
+            NaiveDate::from_ymd_opt(2026, 9, 18).unwrap()
+        );
+        assert_eq!(
+            last_closed_trading_day(at(2026, 9, 21, 16, 0)),
+            NaiveDate::from_ymd_opt(2026, 9, 21).unwrap()
+        );
+        // 工作日盘中 → 昨天；收盘后 → 今天
+        assert_eq!(
+            last_closed_trading_day(at(2026, 9, 22, 11, 0)),
+            NaiveDate::from_ymd_opt(2026, 9, 21).unwrap()
+        );
+        assert_eq!(
+            last_closed_trading_day(at(2026, 9, 22, 16, 0)),
+            NaiveDate::from_ymd_opt(2026, 9, 22).unwrap()
+        );
+    }
 
     #[test]
     fn attribute_level_classifies_all_outcomes() {
