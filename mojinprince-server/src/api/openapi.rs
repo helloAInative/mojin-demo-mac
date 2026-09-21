@@ -3,6 +3,7 @@ use utoipa::OpenApi;
 
 use super::ai;
 use super::data;
+use super::export;
 use super::health;
 use super::ingest;
 use super::pick;
@@ -48,6 +49,7 @@ use super::review;
         ingest::get_sector,
         pick::list,
         pick::run,
+        export::day,
     ),
     components(
         schemas(
@@ -89,6 +91,7 @@ use super::review;
         (name = "review", description = "收盘复盘 / 周报（按日期幂等）"),
         (name = "ingest", description = "新闻 / 研报 / 概念板块（东财按需拉取 + 落库）"),
         (name = "pick", description = "A 股池智能推荐（涨幅榜 → 量化 → 消息面 → AI 精排）"),
+        (name = "export", description = "每日数据归档导出（与 data/archives 同构）"),
         (name = "realtime", description = "WebSocket 实时行情：/api/v1/ws/quote")
     )
 )]

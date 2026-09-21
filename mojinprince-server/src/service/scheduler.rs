@@ -990,7 +990,7 @@ pub async fn maybe_dump_daily_archive(
 
 /// 组装某交易日的归档：自选股分时（minute_bar）+ 当日收盘快照（quote 表最后一条）
 /// + 当日信号 + AI 用量汇总 + 持仓快照（dump 时刻状态，历史日无法回溯持仓）。
-async fn build_day_archive(
+pub(crate) async fn build_day_archive(
     state: &AppState,
     date: NaiveDate,
 ) -> Result<serde_json::Value, AppError> {

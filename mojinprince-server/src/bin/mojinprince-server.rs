@@ -47,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
                     .configure(api::review::configure)
                     .configure(api::ingest::configure)
                     .configure(api::pick::configure)
+                    .configure(api::export::configure)
                     .configure(api::ws::configure),
             )
     })

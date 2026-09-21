@@ -237,6 +237,56 @@ struct GatewayPicksDocument: Decodable, Equatable {
     }
 }
 
+/// 每日数据归档（ROI #12 回放）：与服务端 `data/archives/{date}.json` 同构。
+struct GatewayDayExport: Decodable, Equatable {
+    var date: String
+    var signals: [Signal]
+    var codes: [String: Code]
+
+    struct Signal: Decodable, Equatable, Identifiable {
+        var id: String
+        /// 发射时间（unix ms）
+        var at: Double
+        var kind: String
+        var code: String
+        var title: String
+    }
+
+    struct Code: Decodable, Equatable {
+        var name: String?
+        var quote: Quote?
+        /// [ts(ms), price, avg, volume] 紧凑数组
+        var minutes: [[Double]]?
+
+        struct Quote: Decodable, Equatable {
+            var close: Double?
+            var prev: Double?
+            var open: Double?
+            var high: Double?
+            var low: Double?
+        }
+    }
+
+    /// 当前标的的回放分时（ts ms → 北京时间 HHmm）。
+    func minuteBars(code: String) -> (bars: [MinuteBar], prev: Double) {
+        guard let node = codes[code], let rows = node.minutes, !rows.isEmpty else {
+            guard let node = codes[code] else { return ([], 0) }
+            return ([], node.quote?.prev ?? 0)
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        formatter.dateFormat = "HHmm"
+        let bars: [MinuteBar] = rows.compactMap { row in
+            guard row.count >= 4, row[0] > 0, row[1] > 0 else { return nil }
+            let clock = formatter.string(from: Date(timeIntervalSince1970: row[0] / 1000.0))
+            guard clock.count == 4 else { return nil }
+            return MinuteBar(minute: clock, price: row[1], avg: row[2], vol: row[3])
+        }
+        return (bars, node.quote?.prev ?? 0)
+    }
+}
+
 /// Rust 行情网关的 Swift DTO 适配层。这里不访问第三方行情源。
 enum GatewayMarketClient {
     private static let session: URLSession = {
@@ -437,6 +487,21 @@ enum GatewayMarketClient {
     /// A 股池智能推荐：最近一份（含 T+5 回测统计）。
     static func picks() async throws -> GatewayPicksDocument {
         try await getData("picks")
+    }
+
+    /// 每日数据归档原始 JSON（存档 / 回放共用）。
+    static func dayExportData(date: String?) async throws -> Data {
+        let path = date.map { "export/day?date=\($0)" } ?? "export/day"
+        let request = try await dataRequest(path: path, method: "GET")
+        let (data, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse,
+              (200..<300).contains(response.statusCode) else { throw GatewayError.badResponse }
+        return data
+    }
+
+    /// 回放用：归档解码为结构化文档。
+    static func dayExport(date: String?) async throws -> GatewayDayExport {
+        try JSONDecoder().decode(GatewayDayExport.self, from: await dayExportData(date: date))
     }
 
     /// 重新生成当日推荐；`ai` 透传本机 AI 配置做精排（密钥只在请求内使用）。

@@ -87,6 +87,46 @@ final class MarketStore: ObservableObject {
     @Published var picksBusy = false
     @Published var picksHint = ""
 
+    /// 历史回放（ROI #12 M2）：某交易日的归档 + 当前标的分时
+    @Published var replayDoc: GatewayDayExport?
+    @Published var replayBusy = false
+    @Published var replayHint = ""
+
+    /// 当前标的的回放分时（换标的后调用方重读即可，纯计算）。
+    var replayMinutes: (bars: [MinuteBar], prev: Double) {
+        guard let doc = replayDoc else { return ([], 0) }
+        return doc.minuteBars(code: settings.currentCode)
+    }
+
+    func loadReplay(date: String) async {
+        guard !replayBusy else { return }
+        replayBusy = true
+        defer { replayBusy = false }
+        do {
+            replayDoc = try await GatewayMarketClient.dayExport(date: date)
+            let bars = replayMinutes.bars
+            replayHint = bars.isEmpty
+                ? "该日无 \(settings.currentSymbol.name) 分时（网关未拉取或非交易日）"
+                : "\(date) · \(settings.currentSymbol.name) \(bars.count) 根分时"
+        } catch {
+            replayHint = "回放拉取失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// 导出某交易日归档为 .json（原始字节落盘，含 AI 用量 / 持仓 / 信号）。
+    func exportDayArchive(date: String) async -> URL? {
+        do {
+            let data = try await GatewayMarketClient.dayExportData(date: date)
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("mojin-archive-\(date).json")
+            try data.write(to: url, options: .atomic)
+            return url
+        } catch {
+            replayHint = "归档导出失败：\(error.localizedDescription)"
+            return nil
+        }
+    }
+
     func loadPicks() async {
         do {
             picksDoc = try await GatewayMarketClient.picks()

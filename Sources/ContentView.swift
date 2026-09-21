@@ -32,11 +32,13 @@ struct ContentView: View {
     @State private var tradeStoryText = ""
     @State private var showPositionDetails = false
     @State private var copiedPositionSummary = ""
-    /// 阶段 4：复盘页后端报告相关 UI 状态。
+    /// 收盘复盘通知相关 UI 状态。
     @State private var serverReport: ScheduledReport?
     @State private var reviewHint: String = ""
     @State private var reviewHistory: [ScheduledReport] = []
     @State private var reviewHistoryKind: ReviewKindFilter = .all
+    /// 历史回放（ROI #12）当前选中日期
+    @State private var replayDate: String = ""
     var embeddedInMenu: Bool = false
 
     enum ReviewKindFilter: Hashable {
@@ -2049,6 +2051,106 @@ struct ContentView: View {
         .help("\(pick.name) \(pick.code) · 基准日 \(pick.date)\n\(pick.reasons.joined(separator: " / ")) · 量化分 \(Int(pick.score))\(pick.aiNote.isEmpty ? "" : "\nAI：\(pick.aiNote)")\n点击加入自选并去盯盘（仅关注建议，不构成投资建议）")
     }
 
+    /// 历史回放（ROI #12 M2）：选交易日 → 归档分时喂 MinuteChart + 当日信号；导出 .json。
+    @ViewBuilder private var replaySection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("历史回放 · 归档")
+                        .font(.system(size: 10, weight: .bold))
+                    Spacer()
+                    if store.replayBusy { ProgressView().controlSize(.mini) }
+                    Picker("", selection: $replayDate) {
+                        ForEach(recentDays(7), id: \.self) { Text($0).tag($0) }
+                    }
+                    .frame(width: 130)
+                    .help("最近 7 个日历日；数据取自服务端归档（minute_bar 落库）")
+                    Button("回放") {
+                        Task { await store.loadReplay(date: replayDate) }
+                    }
+                    .controlSize(.mini)
+                    .disabled(store.replayBusy)
+                    Button("导出 .json") {
+                        Task {
+                            if let url = await store.exportDayArchive(date: replayDate) {
+                                saveArchive(url)
+                            }
+                        }
+                    }
+                    .controlSize(.mini)
+                    .disabled(store.replayBusy)
+                    .help("导出当日完整归档（分时 / 信号 / AI 用量 / 持仓）")
+                }
+                if !store.replayHint.isEmpty {
+                    Text(store.replayHint)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+                if let doc = store.replayDoc {
+                    let replay = store.replayMinutes
+                    if replay.bars.isEmpty {
+                        Text("该日无当前标的数据。点行换标的或换日期。")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                    } else {
+                        Text("\(settings.currentSymbol.name) · \(doc.date)")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        MinuteChart(
+                            bars: replay.bars,
+                            prev: replay.prev,
+                            base: settings.levels.base,
+                            support: settings.levels.support,
+                            resistance: settings.levels.resistance
+                        )
+                        .frame(height: 88)
+                        .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                    if !doc.signals.isEmpty {
+                        Text("当日信号 \(doc.signals.count) 条")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.secondary)
+                        ForEach(doc.signals.prefix(8)) { s in
+                            Text("· \(clockFromMs(s.at)) [\(s.kind)] \(s.code) \(s.title)")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .padding(4)
+        }
+    }
+
+    /// 最近 N 个日历日（含今天，倒序）。
+    private func recentDays(_ n: Int) -> [String] {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return (0..<n).compactMap { Calendar.current.date(byAdding: .day, value: -$0, to: Date()) }
+            .map { formatter.string(from: $0) }
+    }
+
+    private func clockFromMs(_ ms: Double) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        formatter.dateFormat = "MM-dd HH:mm"
+        return formatter.string(from: Date(timeIntervalSince1970: ms / 1000.0))
+    }
+
+    private func saveArchive(_ tmp: URL) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "json") ?? .plainText]
+        panel.nameFieldStringValue = tmp.lastPathComponent
+        if panel.runModal() == .OK, let dest = panel.url {
+            try? FileManager.default.removeItem(at: dest)
+            try? FileManager.default.copyItem(at: tmp, to: dest)
+            store.replayHint = "已导出 · \(dest.lastPathComponent)"
+        }
+    }
+
     private var reviewTab: some View {
         let day = MarketStore.todayString()
         let hits = settings.searchDiaries(code: nil, query: diaryQuery, limit: 8)
@@ -2198,9 +2300,12 @@ struct ContentView: View {
                 .padding(4)
             }
             .onAppear {
+                if replayDate.isEmpty { replayDate = recentDays(7).first ?? "" }
                 Task { await refreshReviewHistory() }
                 Task { await store.loadPicks() }
             }
+
+            replaySection
 
             TextField("检索复盘（标的/日期/关键词）", text: $diaryQuery)
                 .textFieldStyle(.roundedBorder)
