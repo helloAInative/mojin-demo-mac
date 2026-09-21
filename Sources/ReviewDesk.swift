@@ -111,6 +111,9 @@ struct TicketPayload: Codable, Equatable {
     var summary: String
     var status: String
     var note: String?
+    /// buy / sell（供服务端复盘做止损止盈执行对照）
+    var side: String?
+    var price: Double?
 }
 
 struct ClientSignalPayload: Codable, Equatable {
@@ -152,7 +155,9 @@ struct ReviewContextPayload: Codable, Equatable {
                 at: t.at,
                 summary: t.oneLine,
                 status: status,
-                note: t.note.isEmpty ? nil : t.note
+                note: t.note.isEmpty ? nil : t.note,
+                side: t.side == .sell ? "sell" : "buy",
+                price: t.price
             )
         }
         let signalDTOs: [ClientSignalPayload] = signals.map { s in

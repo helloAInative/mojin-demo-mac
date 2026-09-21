@@ -342,3 +342,79 @@ async fn created_at_is_iso8601_string() {
         "createdAt 必须是 ISO-8601: {s}"
     );
 }
+
+#[actix_web::test]
+async fn report_compares_filled_sells_against_stop_take() {
+    let state = fresh_state().await;
+    // 持仓 sh600460 设了止损 32.0 / 止盈 35.0；sz000001 无止损止盈
+    sqlx::query(
+        "INSERT INTO position(code, stop_loss, take_profit, updated_at) VALUES('sh600460', 32.0, 35.0, 0)",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::review::configure)),
+    )
+    .await;
+
+    let resp: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/reviews/run?kind=daily")
+            .set_json(json!({
+                "tickets": [
+                    {
+                        "code": "sh600460",
+                        "at": "2026-09-21T07:00:00Z",
+                        "summary": "卖出 600460 1000股 @31.80",
+                        "status": "filled",
+                        "side": "sell",
+                        "price": 31.8
+                    },
+                    {
+                        "code": "sz000001",
+                        "at": "2026-09-21T07:30:00Z",
+                        "summary": "卖出 000001 500股 @10.00",
+                        "status": "filled",
+                        "side": "sell",
+                        "price": 10.0
+                    },
+                    {
+                        "code": "sh600460",
+                        "at": "2026-09-21T05:00:00Z",
+                        "summary": "买入 600460 500股 @31.50",
+                        "status": "filled",
+                        "side": "buy",
+                        "price": 31.5
+                    },
+                    {
+                        "code": "sh600460",
+                        "at": "2026-09-21T06:00:00Z",
+                        "summary": "未勾成交的草稿",
+                        "status": "draft",
+                        "side": "sell",
+                        "price": 32.0
+                    }
+                ]
+            }))
+            .to_request(),
+    )
+    .await;
+    let body = resp["body"].as_str().unwrap();
+    assert!(body.contains("止损止盈执行对照"), "缺少对照小节：\n{body}");
+    assert!(
+        body.contains("卖出成交 31.80 vs 止损 32.00（-0.20，-0.6%）；止盈 35.00（-3.20，-9.1%）"),
+        "sh600460 偏差行：\n{body}"
+    );
+    assert!(body.contains("sz000001 卖出成交 10.00 · 未设止损/止盈"), "无价位持仓提示：\n{body}");
+    // 只有两条已成交卖出参与对照；买入与草稿不产生对照行
+    let section = body.split("止损止盈执行对照").nth(1).unwrap_or("");
+    assert_eq!(
+        section.matches("卖出成交").count(),
+        2,
+        "对照行数应为 2（买入 / 草稿不参与）：\n{body}"
+    );
+}

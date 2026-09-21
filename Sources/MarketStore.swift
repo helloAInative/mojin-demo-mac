@@ -79,6 +79,9 @@ final class MarketStore: ObservableObject {
     @Published var suggestedOrderLine: String = ""
     @Published var ticketSource: String = ""
 
+    /// 智能止损 / 止盈建议（refreshDaily / 持仓变更时重算，不逐 tick）
+    @Published var stopTakeAdvice: StopTakeAdvisor.Advice?
+
     // §F.3–F.4：当前标的的新闻 / 研报 / 板块（走网关，失败只降级为提示）
     @Published var newsItems: [GatewayNewsItem] = []
     @Published var researchReports: [GatewayResearchReport] = []
@@ -346,6 +349,8 @@ final class MarketStore: ObservableObject {
         restartLoops()
         syncTicketFromMarket(forcePrice: true)
         ensureCodeInfo()
+        // days/quote 还是旧标的的：先清掉，restartLoops→loadCache / refreshDaily 会重算
+        stopTakeAdvice = nil
     }
 
     /// 用现价/持仓刷新委托条
@@ -447,6 +452,17 @@ final class MarketStore: ObservableObject {
             }
             ticketSource = "止损"
             ticketNote = "止损 \(String(format: "%.2f", p))"
+        case "take":
+            let p = settings.position.takeProfit
+            guard p > 0 else { ticketHint = "未设置止盈价"; return }
+            ticketSide = .sell
+            ticketPrice = p
+            let shares = Int(settings.position.shares)
+            if shares > 0 {
+                ticketQty = SemiOrderTicket.normalizeLot(shares, code: settings.currentCode)
+            }
+            ticketSource = "止盈"
+            ticketNote = "止盈 \(String(format: "%.2f", p))（可分批，先卖一半）"
         case "resist":
             let p = settings.levels.resistance
             guard p > 0 else { ticketHint = "未设置阻力"; return }
@@ -754,6 +770,7 @@ final class MarketStore: ObservableObject {
         if days.isEmpty {
             days = snap.days
             recomputeIndicators()
+            refreshStopTakeAdvice()
         }
         usingCache = quote.price > 0
         if usingCache && !liveOK {
@@ -890,6 +907,7 @@ final class MarketStore: ObservableObject {
             }
             days = d
             recomputeIndicators()
+            refreshStopTakeAdvice()
             evaluateMacdAlerts()
             evaluateComboStrategies()
             persist()
@@ -969,6 +987,7 @@ final class MarketStore: ObservableObject {
         let name = new.name.isEmpty ? settings.currentSymbol.name : new.name
         evaluateLevelAlerts(old: old, new: new.price, name: name)
         evaluatePriceTargets(old: old, new: new.price, name: name)
+        evaluatePositionStops(old: old, new: new.price, name: name)
         evaluateDrawdown(new, name: name)
     }
 
@@ -986,13 +1005,44 @@ final class MarketStore: ObservableObject {
     private func evaluatePriceTargets(old: Double?, new: Double, name: String) {
         guard settings.alertsEnabled, let old, old > 0 else { return }
         let st = settings.strategy
-        if st.above > 0, old < st.above, new >= st.above, !lastAboveFired {
+        let pos = settings.position
+        // 止损/止盈已联动写入到价下/上：同价时跳过通用到价提醒，由 posStop / posTake 专用提醒覆盖
+        if st.above > 0, old < st.above, new >= st.above, !lastAboveFired,
+           !(pos.takeProfit > 0 && abs(st.above - pos.takeProfit) < 0.005) {
             lastAboveFired = true
             flashAndNotify(title: "到价(上)", body: "\(name) \(String(format: "%.2f", new)) ≥ \(String(format: "%.2f", st.above))", id: "above")
         }
-        if st.below > 0, old > st.below, new <= st.below, !lastBelowFired {
+        if st.below > 0, old > st.below, new <= st.below, !lastBelowFired,
+           !(pos.stopLoss > 0 && abs(st.below - pos.stopLoss) < 0.005) {
             lastBelowFired = true
             flashAndNotify(title: "到价(下)", body: "\(name) \(String(format: "%.2f", new)) ≤ \(String(format: "%.2f", st.below))", id: "below")
+        }
+    }
+
+    /// 跌破止损 / 触达止盈（持仓专属提醒，点击通知跳止损/止盈委托草稿）。
+    private func evaluatePositionStops(old: Double?, new: Double, name: String) {
+        guard settings.alertsEnabled, let old, old > 0, new > 0 else { return }
+        let pos = settings.position
+        guard pos.shares > 0 else { return }
+        if pos.stopLoss > 0, old > pos.stopLoss, new <= pos.stopLoss {
+            flashAndNotify(
+                title: "跌破止损",
+                body: "\(name) \(String(format: "%.2f", new)) ≤ 止损 \(String(format: "%.2f", pos.stopLoss)) · 持仓 \(Int(pos.shares)) 股",
+                id: "pos-stop",
+                kind: "stopTake",
+                why: "价格跌破持仓止损位，按纪律执行或复核锚点（波动 / 结构 / 成本）",
+                userInfo: ["side": "stop"]
+            )
+        }
+        if pos.takeProfit > 0, old < pos.takeProfit, new >= pos.takeProfit {
+            flashAndNotify(
+                title: "达到止盈",
+                body: "\(name) \(String(format: "%.2f", new)) ≥ 止盈 \(String(format: "%.2f", pos.takeProfit)) · 可分批止盈",
+                id: "pos-take",
+                kind: "stopTake",
+                why: "价格触及持仓止盈位，按计划分批卖出或上移止盈",
+                userInfo: ["side": "take"]
+            )
         }
     }
 
@@ -1079,6 +1129,43 @@ final class MarketStore: ObservableObject {
             id: "review-ready",
             kind: "review",
             why: "服务端收盘后自动生成当日日报，已落库"
+        )
+    }
+
+    // ============================================================================
+    // 智能止损 / 止盈（ROI #2）
+    // ============================================================================
+
+    /// 重算建议（挂 refreshDaily / loadCache / 持仓变更，纯数学 O(20)，不做逐 tick）。
+    func refreshStopTakeAdvice() {
+        guard quote.price > 0, days.count >= 2 else {
+            stopTakeAdvice = nil
+            return
+        }
+        stopTakeAdvice = StopTakeAdvisor.advise(
+            days: days,
+            price: quote.price,
+            cost: settings.position.cost,
+            resistance: settings.levels.resistance,
+            drawdownPct: settings.strategy.drawdownPct
+        )
+    }
+
+    /// 一键应用建议到持仓：写本地 + 网关 PUT（联动到价上/下），并落一条时间线记录供复盘对照。
+    func applyStopTakeAdvice() {
+        guard let advice = stopTakeAdvice, advice.stop > 0 || advice.take > 0 else { return }
+        let pos = settings.position
+        settings.updatePosition(
+            cost: pos.cost, shares: pos.shares,
+            stopLoss: advice.stop, takeProfit: advice.take,
+            positionPct: pos.positionPct
+        )
+        logSignal(
+            kind: "stopTake",
+            title: "应用智能止损/止盈",
+            body: String(format: "止损 %.2f · 止盈 %.2f · 盈亏比 %.2f",
+                         advice.stop, advice.take, advice.ratio),
+            why: (advice.stopAnchors + advice.takeAnchors).joined(separator: "；")
         )
     }
 
@@ -1605,6 +1692,17 @@ final class MarketStore: ObservableObject {
         let pos = settings.position
         if pos.stopLoss > 0 {
             lines.append(String(format: "止损价：%.2f  计划仓位：%.0f%%", pos.stopLoss, pos.positionPct))
+        }
+        if pos.takeProfit > 0 {
+            lines.append(String(format: "止盈价：%.2f", pos.takeProfit))
+        }
+        // 智能止损/止盈建议交给 AI 点评（数值由锚点公式决定，AI 只负责叙事复核）
+        if let advice = stopTakeAdvice, advice.stop > 0 || advice.take > 0 {
+            lines.append(String(format: "智能止损止盈建议：止损 %.2f（距现价 %.1f%%）止盈 %.2f 盈亏比 %.2f",
+                                advice.stop, advice.stopDistPct, advice.take, advice.ratio))
+            let anchors = (advice.stopAnchors + advice.takeAnchors).joined(separator: "；")
+            if !anchors.isEmpty { lines.append("建议依据：\(anchors)") }
+            lines.append("请点评该止损止盈位的合理性（结构 / 波动 / 仓位视角，一两句），不要另给价位。")
         }
         if !lastStrategyWhy.isEmpty {
             lines.append("最近策略对照：\n\(lastStrategyWhy)")

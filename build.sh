@@ -35,6 +35,7 @@ swiftc -parse-as-library \
   "$SRC"/OrderTicket.swift \
   "$SRC"/ReviewDesk.swift \
   "$SRC"/StrategyEngine.swift \
+  "$SRC"/StopTakeAdvisor.swift \
   "$SRC"/MarketStore.swift \
   "$SRC"/Charts.swift \
   "$SRC"/ContentView.swift \

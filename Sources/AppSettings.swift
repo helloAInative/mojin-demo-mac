@@ -104,22 +104,27 @@ struct PositionNote: Codable, Equatable {
     var shares: Double
     /// 止损价（与到价下联动可选）
     var stopLoss: Double
+    /// 止盈价（与到价上联动可选；服务端 position.take_profit 已有列）
+    var takeProfit: Double
     /// 计划仓位占总资金比例 %（笔记用）
     var positionPct: Double
 
-    init(cost: Double = 0, shares: Double = 0, stopLoss: Double = 0, positionPct: Double = 0) {
+    init(cost: Double = 0, shares: Double = 0, stopLoss: Double = 0,
+         takeProfit: Double = 0, positionPct: Double = 0) {
         self.cost = cost
         self.shares = shares
         self.stopLoss = stopLoss
+        self.takeProfit = takeProfit
         self.positionPct = positionPct
     }
 
-    enum CodingKeys: String, CodingKey { case cost, shares, stopLoss, positionPct }
+    enum CodingKeys: String, CodingKey { case cost, shares, stopLoss, takeProfit, positionPct }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         cost = try c.decodeIfPresent(Double.self, forKey: .cost) ?? 0
         shares = try c.decodeIfPresent(Double.self, forKey: .shares) ?? 0
         stopLoss = try c.decodeIfPresent(Double.self, forKey: .stopLoss) ?? 0
+        takeProfit = try c.decodeIfPresent(Double.self, forKey: .takeProfit) ?? 0
         positionPct = try c.decodeIfPresent(Double.self, forKey: .positionPct) ?? 0
     }
 }
@@ -132,16 +137,20 @@ struct StrategyNote: Codable, Equatable {
     var coolDownMin: Int
     /// 止损价同步写入「到价下」
     var linkStopToBelow: Bool
+    /// 止盈价同步写入「到价上」
+    var linkTakeToAbove: Bool
 
-    init(above: Double = 0, below: Double = 0, drawdownPct: Double = 0, coolDownMin: Int = 30, linkStopToBelow: Bool = true) {
+    init(above: Double = 0, below: Double = 0, drawdownPct: Double = 0, coolDownMin: Int = 30,
+         linkStopToBelow: Bool = true, linkTakeToAbove: Bool = true) {
         self.above = above
         self.below = below
         self.drawdownPct = drawdownPct
         self.coolDownMin = coolDownMin
         self.linkStopToBelow = linkStopToBelow
+        self.linkTakeToAbove = linkTakeToAbove
     }
 
-    enum CodingKeys: String, CodingKey { case above, below, drawdownPct, coolDownMin, linkStopToBelow }
+    enum CodingKeys: String, CodingKey { case above, below, drawdownPct, coolDownMin, linkStopToBelow, linkTakeToAbove }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         above = try c.decodeIfPresent(Double.self, forKey: .above) ?? 0
@@ -149,6 +158,7 @@ struct StrategyNote: Codable, Equatable {
         drawdownPct = try c.decodeIfPresent(Double.self, forKey: .drawdownPct) ?? 0
         coolDownMin = try c.decodeIfPresent(Int.self, forKey: .coolDownMin) ?? 30
         linkStopToBelow = try c.decodeIfPresent(Bool.self, forKey: .linkStopToBelow) ?? true
+        linkTakeToAbove = try c.decodeIfPresent(Bool.self, forKey: .linkTakeToAbove) ?? true
     }
 }
 
@@ -405,8 +415,8 @@ final class AppSettings: ObservableObject {
         }
         if !remote.positions.isEmpty {
             positions = Dictionary(uniqueKeysWithValues: remote.positions.map {
-                ($0.code, PositionNote(cost: $0.cost, shares: $0.shares,
-                                       stopLoss: $0.stopLoss, positionPct: $0.positionPct))
+                ($0.code, PositionNote(cost: $0.cost, shares: $0.shares, stopLoss: $0.stopLoss,
+                                       takeProfit: $0.takeProfit, positionPct: $0.positionPct))
             })
         } else {
             for (code, position) in positions {
@@ -471,24 +481,33 @@ final class AppSettings: ObservableObject {
         save()
     }
 
-    func updatePosition(cost: Double, shares: Double, stopLoss: Double = 0, positionPct: Double = 0) {
-        let note = PositionNote(cost: cost, shares: shares, stopLoss: stopLoss, positionPct: positionPct)
+    func updatePosition(cost: Double, shares: Double, stopLoss: Double = 0,
+                        takeProfit: Double = 0, positionPct: Double = 0) {
+        let note = PositionNote(cost: cost, shares: shares, stopLoss: stopLoss,
+                                takeProfit: takeProfit, positionPct: positionPct)
         positions[currentCode] = note
-        // 止损联动到价下
+        // 止损联动到价下、止盈联动到价上（对称）
         var st = strategies[currentCode] ?? StrategyNote()
-        if st.linkStopToBelow, stopLoss > 0 {
+        var stDirty = false
+        if st.linkStopToBelow, stopLoss > 0, st.below != stopLoss {
             st.below = stopLoss
-            strategies[currentCode] = st
+            stDirty = true
         }
+        if st.linkTakeToAbove, takeProfit > 0, st.above != takeProfit {
+            st.above = takeProfit
+            stDirty = true
+        }
+        if stDirty { strategies[currentCode] = st }
         save()
         let code = currentCode
         Task { try? await GatewayMarketClient.putPosition(code: code, position: note) }
     }
 
-    func updateStrategy(above: Double, below: Double, drawdownPct: Double, coolDownMin: Int = 30, linkStopToBelow: Bool = true) {
+    func updateStrategy(above: Double, below: Double, drawdownPct: Double, coolDownMin: Int = 30,
+                        linkStopToBelow: Bool = true, linkTakeToAbove: Bool = true) {
         strategies[currentCode] = StrategyNote(
             above: above, below: below, drawdownPct: drawdownPct,
-            coolDownMin: coolDownMin, linkStopToBelow: linkStopToBelow
+            coolDownMin: coolDownMin, linkStopToBelow: linkStopToBelow, linkTakeToAbove: linkTakeToAbove
         )
         save()
     }

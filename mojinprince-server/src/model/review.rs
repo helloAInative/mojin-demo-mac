@@ -49,6 +49,12 @@ pub struct TicketSummary {
     pub status: String,
     #[serde(default)]
     pub note: Option<String>,
+    /// buy / sell；服务端用它做止损止盈执行对照（旧客户端不传则跳过）
+    #[serde(default)]
+    pub side: Option<String>,
+    /// 委托价；对照偏差用它
+    #[serde(default)]
+    pub price: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]

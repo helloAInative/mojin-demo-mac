@@ -177,6 +177,9 @@ struct ContentView: View {
         case "orderTicket":
             tab = .trade
             store.syncTicketFromMarket(forcePrice: true)
+        case "stopTake":
+            // AppDelegate 已按 side 预填止损/止盈委托草稿，这里只切页
+            tab = .trade
         case "review":
             // 收盘复盘通知：切到复盘页（onAppear 会自动拉历史）
             tab = .review
@@ -243,6 +246,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 8) {
                 boardIndexStrip
                 positionRow
+                stopTakeAdviceRow
                 ohlc
                 minutePanel
                 indicatorPanel
@@ -1011,6 +1015,100 @@ struct ContentView: View {
         NSPasteboard.general.clearContents()
         if NSPasteboard.general.setString(summary, forType: .string) {
             copiedPositionSummary = summary
+        }
+    }
+
+    /// 智能止损 / 止盈建议卡：三锚点推导 + 盈亏比门槛，点击价位直接预填对应委托草稿。
+    /// 不自动下单——「应用」只写持仓止损止盈并联动到价提醒，决策权留给用户。
+    @ViewBuilder private var stopTakeAdviceRow: some View {
+        if let advice = store.stopTakeAdvice, advice.stop > 0 || advice.take > 0 {
+            let pos = settings.position
+            let stopManual = pos.stopLoss > 0 && abs(pos.stopLoss - advice.stop) > 0.01
+            let takeManual = pos.takeProfit > 0 && abs(pos.takeProfit - advice.take) > 0.01
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Text("智能止损/止盈")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.secondary)
+                    if advice.stop > 0 && advice.take > 0 {
+                        Text(String(format: "盈亏比 %.2f", advice.ratio))
+                            .font(.system(size: 9, weight: .semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(advice.actionable ? Color.accentColor : .orange)
+                    }
+                    Spacer()
+                    Button {
+                        store.applyStopTakeAdvice()
+                    } label: {
+                        Text("应用到持仓")
+                    }
+                    .controlSize(.mini)
+                    .disabled(!advice.actionable)
+                    .help(advice.actionable ? "写入止损/止盈价并联动到价提醒（本地 + 网关同步）" : "盈亏比或止损距离未达标，暂不提供一键应用")
+                }
+
+                HStack(spacing: 6) {
+                    if advice.stop > 0 {
+                        Button {
+                            tab = .trade
+                            store.fillTicketFromLevel("stop")
+                        } label: {
+                            HStack(spacing: 3) {
+                                Text("止损")
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundStyle(trendUp)
+                                Text(String(format: "%.2f", advice.stop))
+                                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                                    .monospacedDigit()
+                                Text(String(format: "−%.1f%%", advice.stopDistPct))
+                                    .font(.system(size: 8))
+                                    .foregroundStyle(.secondary)
+                                if stopManual {
+                                    Image(systemName: "hand.raised")
+                                        .font(.system(size: 8))
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help((advice.stopAnchors.joined(separator: "\n")) + "\n点击预填止损卖单草稿" + (stopManual ? "\n当前持仓为止损价为手动设置" : ""))
+                    }
+                    if advice.take > 0 {
+                        Button {
+                            tab = .trade
+                            store.fillTicketFromLevel("take")
+                        } label: {
+                            HStack(spacing: 3) {
+                                Text("止盈")
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundStyle(trendDown)
+                                Text(String(format: "%.2f", advice.take))
+                                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                                    .monospacedDigit()
+                                Text(String(format: "+%.1f%%", (advice.take - store.quote.price) / store.quote.price * 100))
+                                    .font(.system(size: 8))
+                                    .foregroundStyle(.secondary)
+                                if takeManual {
+                                    Image(systemName: "hand.raised")
+                                        .font(.system(size: 8))
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help((advice.takeAnchors.joined(separator: "\n")) + "\n点击预填止盈卖单草稿（可分批）" + (takeManual ? "\n当前持仓止盈价为手动设置" : ""))
+                    }
+                    Spacer(minLength: 0)
+                }
+
+                if !advice.warning.isEmpty {
+                    Text(advice.warning)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.orange)
+                }
+            }
+            .padding(8)
+            .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
         }
     }
 
@@ -2122,6 +2220,7 @@ struct SettingsView: View {
     @State private var costText = ""
     @State private var sharesText = ""
     @State private var stopText = ""
+    @State private var takeText = ""
     @State private var posPctText = ""
     @State private var aboveText = ""
     @State private var belowText = ""
@@ -2330,9 +2429,10 @@ struct SettingsView: View {
                 }
                 HStack {
                     field("止损价", $stopText)
+                    field("止盈价", $takeText)
                     field("仓位%", $posPctText)
                 }
-                Text("止损可联动「到价下」；仓位%仅作笔记。")
+                Text("止损/止盈可联动「到价下/上」；盯盘页有 ATR+结构锚的智能建议。仓位%仅作笔记。")
                     .font(.caption2).foregroundStyle(.secondary)
             }.padding(6)
         }
@@ -2351,7 +2451,19 @@ struct SettingsView: View {
                             var st = settings.strategy
                             settings.updateStrategy(
                                 above: st.above, below: st.below, drawdownPct: st.drawdownPct,
-                                coolDownMin: st.coolDownMin, linkStopToBelow: on
+                                coolDownMin: st.coolDownMin, linkStopToBelow: on,
+                                linkTakeToAbove: st.linkTakeToAbove
+                            )
+                        }
+                    ))
+                    Toggle("止盈→到价上", isOn: Binding(
+                        get: { settings.strategy.linkTakeToAbove },
+                        set: { on in
+                            var st = settings.strategy
+                            settings.updateStrategy(
+                                above: st.above, below: st.below, drawdownPct: st.drawdownPct,
+                                coolDownMin: st.coolDownMin, linkStopToBelow: st.linkStopToBelow,
+                                linkTakeToAbove: on
                             )
                         }
                     ))
@@ -2538,6 +2650,7 @@ struct SettingsView: View {
             cost: Double(costText) ?? 0,
             shares: Double(sharesText) ?? 0,
             stopLoss: Double(stopText) ?? 0,
+            takeProfit: Double(takeText) ?? 0,
             positionPct: Double(posPctText) ?? 0
         )
         settings.updateStrategy(
@@ -2545,7 +2658,8 @@ struct SettingsView: View {
             below: Double(belowText) ?? 0,
             drawdownPct: Double(ddText) ?? 0,
             coolDownMin: Int(coolText) ?? 30,
-            linkStopToBelow: settings.strategy.linkStopToBelow
+            linkStopToBelow: settings.strategy.linkStopToBelow,
+            linkTakeToAbove: settings.strategy.linkTakeToAbove
         )
         var c = settings.notifyConfig
         c.cooldownSec = Int(cooldownText) ?? 300
@@ -2587,6 +2701,7 @@ struct SettingsView: View {
         costText = p.cost > 0 ? String(format: "%.3f", p.cost) : ""
         sharesText = p.shares > 0 ? String(format: "%.0f", p.shares) : ""
         stopText = p.stopLoss > 0 ? String(format: "%.2f", p.stopLoss) : ""
+        takeText = p.takeProfit > 0 ? String(format: "%.2f", p.takeProfit) : ""
         posPctText = p.positionPct > 0 ? String(format: "%.0f", p.positionPct) : ""
         let st = settings.strategy
         aboveText = st.above > 0 ? String(format: "%.2f", st.above) : ""

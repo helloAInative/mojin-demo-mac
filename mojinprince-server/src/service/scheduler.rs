@@ -6,7 +6,7 @@
 //! 行情轮询 + 复盘生成放在同一文件只是为了方便集中理解；后续可拆目录。
 
 use crate::error::AppError;
-use crate::model::{Quote, ReviewContext, ScheduledReport};
+use crate::model::{Quote, ReviewContext, ScheduledReport, TicketSummary};
 use crate::service::ingest;
 use crate::state::AppState;
 use chrono::{Datelike, FixedOffset, NaiveDate, Timelike, Utc, Weekday};
@@ -378,6 +378,63 @@ async fn build_report(
             ));
         }
         body.push('\n');
+    }
+
+    // 止损止盈执行对照（ROI #2）：已成交卖出 vs 持仓止损/止盈价，复盘"该割没割 / 该止盈没止盈"
+    let filled_sells: Vec<&TicketSummary> = context
+        .tickets
+        .iter()
+        .filter(|t| t.status == "filled" && t.side.as_deref() == Some("sell"))
+        .filter(|t| t.price.map(|p| p > 0.0).unwrap_or(false))
+        .collect();
+    if !filled_sells.is_empty() {
+        let positions: Vec<(String, f64, f64)> = sqlx::query_as(
+            "SELECT code, stop_loss, take_profit FROM position WHERE stop_loss > 0 OR take_profit > 0",
+        )
+        .fetch_all(&state.db)
+        .await?;
+        let mut lines: Vec<String> = Vec::new();
+        for t in &filled_sells {
+            let price = t.price.unwrap_or_default();
+            let at_str = t
+                .at
+                .with_timezone(&FixedOffset::east_opt(CN_OFFSET_SECS).unwrap())
+                .format("%m-%d %H:%M")
+                .to_string();
+            let pos = positions.iter().find(|(c, _, _)| *c == t.code);
+            let (stop, take) = match pos {
+                Some((_, stop, take)) => (*stop, *take),
+                None => (0.0, 0.0),
+            };
+            let mut parts: Vec<String> = Vec::new();
+            if stop > 0.0 {
+                parts.push(format!("止损 {:.2}（{:+.2}，{:+.1}%）", stop, price - stop, (price - stop) / stop * 100.0));
+            }
+            if take > 0.0 {
+                parts.push(format!("止盈 {:.2}（{:+.2}，{:+.1}%）", take, price - take, (price - take) / take * 100.0));
+            }
+            if parts.is_empty() {
+                lines.push(format!(
+                    "- {at_str} {} 卖出成交 {:.2} · 未设止损/止盈，纪律不完整",
+                    t.code, price
+                ));
+            } else {
+                lines.push(format!(
+                    "- {at_str} {} 卖出成交 {:.2} vs {}",
+                    t.code,
+                    price,
+                    parts.join("；")
+                ));
+            }
+        }
+        if !lines.is_empty() {
+            body.push_str("## 止损止盈执行对照\n");
+            for line in lines {
+                body.push_str(&line);
+                body.push('\n');
+            }
+            body.push('\n');
+        }
     }
 
     // 客户端信号时间线（如果传了）

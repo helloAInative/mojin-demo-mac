@@ -185,7 +185,7 @@ http://127.0.0.1:8732/api-docs/openapi.json
 - `POST /api/v1/reviews/run?kind=daily|weekly`：生成一份报告。可选 JSON body `{tickets, diary, signals, focusCodes}` 补全 Swift 端内存数据。按 `(kind, period_key)` UPSERT 幂等——重复调用刷新同一条记录（`created_at` 仅首次写入）。`period_key`：daily 为 `YYYY-MM-DD`，weekly 为 `YYYY-Www`（ISO 周，周一为周首日）。
 - `GET /api/v1/reviews?kind=daily|weekly&limit=N`：按 `created_at` 倒序列出已落库报告。
 
-报告 body 汇总后端落库的信号事件、level 命中率、AI 调用成功 / 总数与 token / 成本，并拼接客户端传入的日记、委托与信号时间线，落 `scheduled_report` 表。
+报告 body 汇总后端落库的信号事件、level 命中率、AI 调用成功 / 总数与 token / 成本，并拼接客户端传入的日记、委托与信号时间线，落 `scheduled_report` 表。委托带 `side` / `price` 时（ROI #2），正文还会把「已成交卖出」与 `position` 表的止损 / 止盈价做执行对照（偏差金额与百分比），未设价位的给出纪律提示。
 
 Swift 复盘页通过 `ReportClient` 调用这两个接口：手动生成日报 / 周报 + 拉取历史列表。
 

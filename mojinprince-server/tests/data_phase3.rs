@@ -119,12 +119,13 @@ async fn position_and_watchlist_are_upserted() {
         &app,
         test::TestRequest::put()
             .uri("/api/v1/positions/300623")
-            .set_json(json!({"cost": 28.5, "shares": 1000, "stopLoss": 26.0, "positionPct": 30}))
+            .set_json(json!({"cost": 28.5, "shares": 1000, "stopLoss": 26.0, "takeProfit": 31.5, "positionPct": 30}))
             .to_request(),
     )
     .await;
     assert_eq!(position["code"], "sz300623");
     assert_eq!(position["stopLoss"], 26.0);
+    assert_eq!(position["takeProfit"], 31.5);
 
     let item: Value = test::call_and_read_body_json(
         &app,

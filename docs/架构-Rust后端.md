@@ -345,6 +345,7 @@ CREATE INDEX idx_sector_board_code ON sector_board(code);
 - 报告正文包含两部分：
   - **后端摘要**（服务端拼）：signal_event 时间线、AI 用量、level 命中
   - **客户端上下文**（Swift 主动 POST）：日记 / 委托 / 信号 — 后端原样落到 `payload.context`
+  - **止损止盈执行对照**（ROI #2，2026-09-21）：委托 context 带 `side` / `price` 后，服务端把「已成交卖出」与 `position` 表的止损 / 止盈价对比，正文输出偏差金额与百分比（`+0.10（+0.3%）`），未设价位的持仓给出纪律提示；买入与草稿不参与
 - 自动调度：`spawn_report_scheduler` 60s 心跳；工作日 15:05 后补日报，周五 / 周末补周报，**只补缺失的基线版**（已存在的跳过）；Swift 端"生成今日 / 生成本周"按钮相当于在已存在的记录上覆盖正文（含客户端 context），不会改 `created_at`
 
 ---
@@ -576,6 +577,9 @@ WantedBy=multi-user.target
 - [x] `Sources/SignalTimeline.swift`：`kindLabel` 加 `report → 机构研报`，服务端信号经既有同步通道直接展示
 - [x] Swift 盯盘页「资讯 · 研报 · 板块」面板：`GatewayMarketClient` 新增 `news/reports/sector` 三个拉取方法（snake_case CodingKeys + iso8601），`MarketStore.ensureCodeInfo` 切换自选自动加载（同标的只拉一次、失败降级为提示），板块涨跌色块（主营优先）、研报评级行 / 新闻流点击打开东财原文
 - [x] 收盘复盘通知（ROI #6）：`MarketStore.pollReviewNotify` 工作日 15:05 后独立轮询当日日报（`GET /reviews?kind=daily&limit=1`，`periodKey == 今日` 即通知，`lastReviewNotifyDay` 本地去重），`flashAndNotify` 透传 userInfo，通知默认点击 `kind=review → review` 动作跳复盘页
+- [x] 智能止损 / 止盈（ROI #2，2026-09-21）：`Sources/StopTakeAdvisor.swift` ATR14 + 近 20 日结构高低 + 成本回撤 / 阻力三锚点（止损取保守、止盈取先到），盈亏比 < 1.5 / 止损过近自动降级提示；盯盘页建议卡（锚点 tooltip + 手动覆盖标记）一键应用 + 止损/止盈委托草稿预填
+- [x] 持仓止盈链路：`PositionNote.takeProfit` 建模 + `PUT /positions` 同步 + `linkTakeToAbove` 对称联动；跌破止损 / 触达止盈专属提醒（`kind=stopTake`，同价时抑制通用到价提醒，通知点击按 side 预填委托草稿）
+- [x] `scheduler.rs::build_report` 止损止盈执行对照：`TicketSummary` 加 `side` / `price`（`#[serde(default)]` 兼容旧客户端），已成交卖出 vs `position` 止损 / 止盈价输出偏差；`tests/review_phase4.rs` +1、`tests/data_phase3.rs` 补 takeProfit 断言
 - [ ] 目标设备 / 局域网端到端联调报告
 
 ---

@@ -398,7 +398,8 @@ enum GatewayMarketClient {
         try await sendData(
             "positions/\(code)", method: "PUT",
             body: Body(cost: position.cost, shares: position.shares,
-                       stopLoss: position.stopLoss, positionPct: position.positionPct)
+                       stopLoss: position.stopLoss, takeProfit: position.takeProfit,
+                       positionPct: position.positionPct)
         )
     }
 

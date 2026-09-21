@@ -48,6 +48,7 @@ final class NotificationClickHandler: NSObject, UNUserNotificationCenterDelegate
         switch payload["kind"] {
         case "level": return "openLevel"
         case "review": return "review"
+        case "stopTake": return "stopTake"
         default: return "open"
         }
     }
@@ -140,6 +141,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             store.settings.appendDiaryNote(day: day, note: "策略备注：\(why.replacingOccurrences(of: "\n", with: " / "))")
         case "orderTicket":
             store.syncTicketFromMarket(forcePrice: store.ticketPrice <= 0)
+        case "stopTake":
+            // 止损/止盈通知：按通知里的 side 预填对应委托草稿，切 tab 由 ContentView 消费
+            store.fillTicketFromLevel(payload["side"] == "take" ? "take" : "stop")
         case "openLevel":
             // 由 ContentView.onChange(pendingUIAction) 切到 trade tab 时统一消费
             break
