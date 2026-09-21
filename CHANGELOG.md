@@ -23,6 +23,7 @@
 - `spawn_ingest_scheduler`：工作日 16:00 后为自选股（≤60 只，300ms 间隔）增量刷新新闻 / 研报 / 板块，同日只跑一次
 - 评级信号化（§F.4）：每日刷新研报时把近 7 天且评级明确的研报写成 `kind=report` 的 `signal_event`（机构看多 / 看空），id 由 `(code, info_code)` 派生幂等不重复，经既有 signals 同步自动到 Swift（`kindLabel`「机构研报」）
 - Swift 盯盘页「资讯 · 研报 · 板块」面板（§F.3–F.4）：`GatewayMarketClient` 新增 `news / reports / sector` 拉取，切换自选自动加载；板块涨跌色块（主营优先）、研报评级行与近 72h 新闻流，点击打开东财原文；网关不可用降级为提示并支持手动重试
+- 收盘复盘通知（ROI #6）：工作日 15:05 后轮询当日日报，生成即发 macOS 通知（当日去重），点击跳复盘页
 
 ### Fixed
 

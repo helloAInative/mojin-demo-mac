@@ -210,6 +210,8 @@ final class AppSettings: ObservableObject {
     @Published var indicator: IndicatorKind
     @Published var lastOpenBriefDay: String
     @Published var lastCloseBriefDay: String
+    /// 收盘复盘通知当日去重（本地设备级，不参与网关同步）
+    @Published var lastReviewNotifyDay: String
     @Published var notifyConfig: NotifyGovernor.Config
     @Published var seenChangelogVersion: String
     @Published var aiConfig: AIConfig
@@ -240,6 +242,7 @@ final class AppSettings: ObservableObject {
         static let ind = "mojin.indicator"
         static let openDay = "mojin.lastOpenBriefDay"
         static let closeDay = "mojin.lastCloseBriefDay"
+        static let reviewNotifyDay = "mojin.lastReviewNotifyDay"
         static let notify = "mojin.notifyConfig"
         static let changelog = "mojin.seenChangelog"
         static let ai = "mojin.aiConfig"
@@ -307,6 +310,7 @@ final class AppSettings: ObservableObject {
         indicator = IndicatorKind(rawValue: defaults.string(forKey: Key.ind) ?? "") ?? .macd
         lastOpenBriefDay = defaults.string(forKey: Key.openDay) ?? ""
         lastCloseBriefDay = defaults.string(forKey: Key.closeDay) ?? ""
+        lastReviewNotifyDay = defaults.string(forKey: Key.reviewNotifyDay) ?? ""
         notifyConfig = Self.decode(Key.notify, defaults) ?? NotifyGovernor.Config()
         seenChangelogVersion = defaults.string(forKey: Key.changelog) ?? ""
         aiConfig = Self.decode(Key.ai, defaults) ?? AIConfig()
@@ -347,6 +351,7 @@ final class AppSettings: ObservableObject {
         defaults.set(indicator.rawValue, forKey: Key.ind)
         defaults.set(lastOpenBriefDay, forKey: Key.openDay)
         defaults.set(lastCloseBriefDay, forKey: Key.closeDay)
+        defaults.set(lastReviewNotifyDay, forKey: Key.reviewNotifyDay)
         defaults.set(seenChangelogVersion, forKey: Key.changelog)
         defaults.set(boardShowHS300, forKey: Key.boardHS300)
         defaults.set(boardShowBJ50, forKey: Key.boardBJ50)
@@ -764,6 +769,13 @@ enum TradingSession {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
         return cal.component(.hour, from: now) * 60 + cal.component(.minute, from: now)
+    }
+
+    static func isShanghaiWeekday(_ now: Date = Date()) -> Bool {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
+        let wd = cal.component(.weekday, from: now)
+        return wd != 1 && wd != 7
     }
 
     var quoteInterval: UInt64 {

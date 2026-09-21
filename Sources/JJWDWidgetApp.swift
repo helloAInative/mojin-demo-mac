@@ -33,15 +33,23 @@ final class NotificationClickHandler: NSObject, UNUserNotificationCenterDelegate
             action = "open"
         case UNNotificationDefaultActionIdentifier:
             // 默认点击：level 预警通知直接走「跳到价位+草稿委托」，
-            // 其它通知仍按原行为（打开标的）。
-            action = payload["kind"] == "level" ? "openLevel" : "open"
+            // 复盘通知跳复盘页，其它通知仍按原行为（打开标的）。
+            action = Self.routeDefaultClick(payload)
         default:
-            action = payload["kind"] == "level" ? "openLevel" : "open"
+            action = Self.routeDefaultClick(payload)
         }
         if !code.isEmpty || action != "open" {
             DispatchQueue.main.async { self.onAction?(code, action, payload) }
         }
         completionHandler()
+    }
+
+    private static func routeDefaultClick(_ payload: [String: String]) -> String {
+        switch payload["kind"] {
+        case "level": return "openLevel"
+        case "review": return "review"
+        default: return "open"
+        }
     }
 }
 

@@ -31,6 +31,7 @@ struct SignalEvent: Codable, Identifiable, Equatable {
         case "level": return "价位预警"
         case "posAlert": return "持仓预警"
         case "report": return "机构研报"
+        case "review": return "复盘"
         default: return "预警"
         }
     }

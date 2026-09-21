@@ -177,6 +177,9 @@ struct ContentView: View {
         case "orderTicket":
             tab = .trade
             store.syncTicketFromMarket(forcePrice: true)
+        case "review":
+            // 收盘复盘通知：切到复盘页（onAppear 会自动拉历史）
+            tab = .review
         case "openLevel":
             // 通知点击价位：appDelegate 已经把 payload 推到 store.pendingLevelPayload
             // 这里切到交易 tab，让用户看到草稿委托。

@@ -28,7 +28,7 @@ final class MarketStore: ObservableObject {
     @Published var quoteSourceDetail = ""
     @Published var lastStrategyWhy = ""
     @Published var lastBacktest: BacktestResult?
-    @Published var pendingUIAction: String? // reanalyze | diary | stratNote | open | openLevel
+    @Published var pendingUIAction: String? // reanalyze | diary | stratNote | open | openLevel | orderTicket | review
     /// 价位预警通知点击后载荷：{ levelKey, tier, price, code }
     @Published var pendingLevelPayload: [String: String] = [:]
     @Published var collapsedGroups: Set<String> = []
@@ -109,6 +109,8 @@ final class MarketStore: ObservableObject {
     private var indexTask: Task<Void, Never>?
     private var retryTask: Task<Void, Never>?
     private var aiTask: Task<Void, Never>?
+    /// 收盘复盘通知轮询（独立于行情 loop：行情 15:05 后降频停摆，复盘 15:05 后才生成）
+    private var reviewNotifyTask: Task<Void, Never>?
     private var started = false
     private var quoteStreamConnected = false
     private var pendingRetry = 0
@@ -237,6 +239,9 @@ final class MarketStore: ObservableObject {
         syncTicketFromMarket(forcePrice: true)
         restartLoops()
         Task { await prefetchWatchlistDaily() }
+        reviewNotifyTask = Task { [weak self] in
+            await self?.pollReviewNotify()
+        }
         Task { [weak self] in
             let previousCode = self?.settings.currentCode
             await self?.settings.syncGatewayData()
@@ -1042,6 +1047,41 @@ final class MarketStore: ObservableObject {
         }
     }
 
+    /// 收盘复盘通知：工作日 15:05 后盯服务端日报生成（60s 心跳，生成即通知一次）。
+    /// 行情 loop 收盘后停摆，所以独立成任务；点击通知跳复盘页。
+    private func pollReviewNotify() async {
+        while !Task.isCancelled {
+            var sleepSec: UInt64 = 600_000_000_000
+            if settings.marketGatewayEnabled, settings.alertsEnabled,
+               TradingSession.isShanghaiWeekday(),
+               TradingSession.shanghaiMinutes() >= 15 * 60 + 5 {
+                await checkDailyReviewReady()
+                // 15:05–16:05 是服务端刚生成的窗口，盯紧一点；之后每 10 分钟兜底（覆盖晚间才开 App）
+                sleepSec = TradingSession.shanghaiMinutes() <= 16 * 60 + 5
+                    ? 60_000_000_000 : 600_000_000_000
+            }
+            try? await Task.sleep(nanoseconds: sleepSec)
+        }
+    }
+
+    private func checkDailyReviewReady() async {
+        let today = Self.todayString()
+        guard settings.lastReviewNotifyDay != today else { return }
+        guard let url = URL(string: settings.marketServerURL) else { return }
+        guard let latest = try? await ReportClient(baseURL: url).list(kind: .daily, limit: 1).first
+        else { return }
+        guard latest.periodKey == today else { return }
+        settings.lastReviewNotifyDay = today
+        settings.save()
+        flashAndNotify(
+            title: "收盘复盘已生成",
+            body: "\(latest.title) · 点击查看复盘",
+            id: "review-ready",
+            kind: "review",
+            why: "服务端收盘后自动生成当日日报，已落库"
+        )
+    }
+
     private func evaluateComboStrategies() {
         guard settings.alertsEnabled else { return }
         let now = Date()
@@ -1809,11 +1849,14 @@ final class MarketStore: ObservableObject {
         id: String,
         code: String? = nil,
         kind: String = "alert",
-        why: String = ""
+        why: String = "",
+        userInfo: [String: String] = [:]
     ) {
         menuFlash = true
         let c = code ?? settings.currentCode
-        AlertService.notify(title: "摸金小王子 · \(title)", body: body, id: id, code: c)
+        var payload = userInfo
+        if !kind.isEmpty { payload["kind"] = kind }
+        AlertService.notify(title: "摸金小王子 · \(title)", body: body, id: id, code: c, userInfo: payload)
         logSignal(kind: kind, title: title, body: body, why: why.isEmpty ? body : why, code: c)
         refreshNotifyQuota()
         Task {

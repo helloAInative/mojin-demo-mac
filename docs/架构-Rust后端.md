@@ -382,7 +382,7 @@ CREATE INDEX idx_sector_board_code ON sector_board(code);
 - 后端 scheduler 跑收盘复盘 / 周报导出。
 - 接新闻 / 研报 / 板块数据（§F.3–F.4）。
 - 至此 §F 数据接入全部走 Rust，前端只剩 UI。
-- **代码状态（2026-09-20；09-21 补评级信号化 + Swift 展示）**：`/api/v1/ws/quote`、广播 Hub、自选股交易时段轮询调度和 Swift 断线重连 / HTTP 回退已完成；收盘复盘 / 周报生成按需 API（`POST /api/v1/reviews/run` + `GET /api/v1/reviews`，按 `(kind, period_key)` UPSERT 幂等，落 `scheduled_report` 表，7 项集成测试）与**自动触发**（`spawn_report_scheduler` 60s 心跳：工作日 15:05 后补日报，周五 15:05 后与周末补周报，仅补缺失的基线版，2 项集成测试）均已落地，Swift 端 `ReportClient` 已接入复盘历史与手动生成；**新闻 / 研报 / 板块数据（§F.3–F.4）已完成**：三个只读端点按需拉东财并 UPSERT 落 `news_item` / `research_report` / `sector_board` 三张缓存表，`POST /api/v1/ai/analyze` 新增 `include_news` 可把近 24h 新闻拼进 prompt，`spawn_ingest_scheduler` 工作日 16:00 后为自选股（≤60 只）增量刷新一次（9 项集成测试 + 3 项 live 测试 `#[ignore]`）；**评级信号化**：刷新研报时把近 7 天且评级明确的写成 `kind=report` 的 `signal_event`（买入 / 增持 → 机构看多，卖出 / 减持 → 机构看空；id 由 `(code, info_code)` 派生 + `INSERT OR IGNORE` 幂等），经既有 signals 同步通道自动到 Swift；**Swift 盯盘页**已加「资讯 · 研报 · 板块」面板（板块涨跌色块、研报评级行、近 72h 新闻流，点击打开东财原文，切换自选自动加载）。
+- **代码状态（2026-09-20；09-21 补评级信号化 + Swift 展示）**：`/api/v1/ws/quote`、广播 Hub、自选股交易时段轮询调度和 Swift 断线重连 / HTTP 回退已完成；收盘复盘 / 周报生成按需 API（`POST /api/v1/reviews/run` + `GET /api/v1/reviews`，按 `(kind, period_key)` UPSERT 幂等，落 `scheduled_report` 表，7 项集成测试）与**自动触发**（`spawn_report_scheduler` 60s 心跳：工作日 15:05 后补日报，周五 15:05 后与周末补周报，仅补缺失的基线版，2 项集成测试）均已落地，Swift 端 `ReportClient` 已接入复盘历史与手动生成；**新闻 / 研报 / 板块数据（§F.3–F.4）已完成**：三个只读端点按需拉东财并 UPSERT 落 `news_item` / `research_report` / `sector_board` 三张缓存表，`POST /api/v1/ai/analyze` 新增 `include_news` 可把近 24h 新闻拼进 prompt，`spawn_ingest_scheduler` 工作日 16:00 后为自选股（≤60 只）增量刷新一次（9 项集成测试 + 3 项 live 测试 `#[ignore]`）；**评级信号化**：刷新研报时把近 7 天且评级明确的写成 `kind=report` 的 `signal_event`（买入 / 增持 → 机构看多，卖出 / 减持 → 机构看空；id 由 `(code, info_code)` 派生 + `INSERT OR IGNORE` 幂等），经既有 signals 同步通道自动到 Swift；**Swift 盯盘页**已加「资讯 · 研报 · 板块」面板（板块涨跌色块、研报评级行、近 72h 新闻流，点击打开东财原文，切换自选自动加载）；**收盘复盘通知**（ROI #6）：工作日 15:05 后独立轮询（60s，生成窗口后降为 10 分钟兜底）当日日报，生成即发 macOS 通知一次（按 `lastReviewNotifyDay` 当日去重），点击跳复盘页。
 
 ### 阶段 5（可选）：跨设备
 
@@ -575,6 +575,7 @@ WantedBy=multi-user.target
 - [x] `service/ingest.rs::persist_report_signals`：评级信号化 —— 刷新研报时把近 7 天且评级明确的写成 `kind=report` 的 `signal_event`（看多 / 看空 / 新覆盖 / 上调 / 下调标题；id 由 `(code, info_code)` 派生为 UUID 形态 + `INSERT OR IGNORE` 幂等；`meta` 携带 reportId / 机构 / 评级，`at` 取发布日北京 0 点）
 - [x] `Sources/SignalTimeline.swift`：`kindLabel` 加 `report → 机构研报`，服务端信号经既有同步通道直接展示
 - [x] Swift 盯盘页「资讯 · 研报 · 板块」面板：`GatewayMarketClient` 新增 `news/reports/sector` 三个拉取方法（snake_case CodingKeys + iso8601），`MarketStore.ensureCodeInfo` 切换自选自动加载（同标的只拉一次、失败降级为提示），板块涨跌色块（主营优先）、研报评级行 / 新闻流点击打开东财原文
+- [x] 收盘复盘通知（ROI #6）：`MarketStore.pollReviewNotify` 工作日 15:05 后独立轮询当日日报（`GET /reviews?kind=daily&limit=1`，`periodKey == 今日` 即通知，`lastReviewNotifyDay` 本地去重），`flashAndNotify` 透传 userInfo，通知默认点击 `kind=review → review` 动作跳复盘页
 - [ ] 目标设备 / 局域网端到端联调报告
 
 ---
