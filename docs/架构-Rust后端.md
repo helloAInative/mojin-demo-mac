@@ -382,7 +382,7 @@ CREATE INDEX idx_sector_board_code ON sector_board(code);
 - 后端 scheduler 跑收盘复盘 / 周报导出。
 - 接新闻 / 研报 / 板块数据（§F.3–F.4）。
 - 至此 §F 数据接入全部走 Rust，前端只剩 UI。
-- **代码状态（2026-09-20）**：`/api/v1/ws/quote`、广播 Hub、自选股交易时段轮询调度和 Swift 断线重连 / HTTP 回退已完成；收盘复盘 / 周报生成按需 API（`POST /api/v1/reviews/run` + `GET /api/v1/reviews`，按 `(kind, period_key)` UPSERT 幂等，落 `scheduled_report` 表，7 项集成测试）与**自动触发**（`spawn_report_scheduler` 60s 心跳：工作日 15:05 后补日报，周五 15:05 后与周末补周报，仅补缺失的基线版，2 项集成测试）均已落地，Swift 端 `ReportClient` 已接入复盘历史与手动生成；**新闻 / 研报 / 板块数据（§F.3–F.4）已完成**：三个只读端点按需拉东财并 UPSERT 落 `news_item` / `research_report` / `sector_board` 三张缓存表，`POST /api/v1/ai/analyze` 新增 `include_news` 可把近 24h 新闻拼进 prompt，`spawn_ingest_scheduler` 工作日 16:00 后为自选股（≤60 只）增量刷新一次（8 项集成测试 + 3 项 live 测试 `#[ignore]`）。
+- **代码状态（2026-09-20；09-21 补评级信号化）**：`/api/v1/ws/quote`、广播 Hub、自选股交易时段轮询调度和 Swift 断线重连 / HTTP 回退已完成；收盘复盘 / 周报生成按需 API（`POST /api/v1/reviews/run` + `GET /api/v1/reviews`，按 `(kind, period_key)` UPSERT 幂等，落 `scheduled_report` 表，7 项集成测试）与**自动触发**（`spawn_report_scheduler` 60s 心跳：工作日 15:05 后补日报，周五 15:05 后与周末补周报，仅补缺失的基线版，2 项集成测试）均已落地，Swift 端 `ReportClient` 已接入复盘历史与手动生成；**新闻 / 研报 / 板块数据（§F.3–F.4）已完成**：三个只读端点按需拉东财并 UPSERT 落 `news_item` / `research_report` / `sector_board` 三张缓存表，`POST /api/v1/ai/analyze` 新增 `include_news` 可把近 24h 新闻拼进 prompt，`spawn_ingest_scheduler` 工作日 16:00 后为自选股（≤60 只）增量刷新一次（9 项集成测试 + 3 项 live 测试 `#[ignore]`）；**评级信号化**：刷新研报时把近 7 天且评级明确的写成 `kind=report` 的 `signal_event`（买入 / 增持 → 机构看多，卖出 / 减持 → 机构看空；id 由 `(code, info_code)` 派生 + `INSERT OR IGNORE` 幂等），经既有 signals 同步通道自动到 Swift。
 
 ### 阶段 5（可选）：跨设备
 
@@ -569,9 +569,11 @@ WantedBy=multi-user.target
 - [x] `migrations/20250918000006_ingest.sql`：`news_item` / `research_report` / `sector_board` 三张缓存表（按 `(code,url)` / `(code,info_code)` / `(code,board_code)` 主键 UPSERT）
 - [x] `service/ingest.rs`：东财新闻（全文搜索）/ 研报（研报库）/ 板块（成分 + 批量行情）三个 provider，北京时间统一转 UTC
 - [x] `api/ingest.rs`：`GET /api/v1/news/{code}`（?limit=&hours=）、`GET /api/v1/reports/{code}`（?limit=&days=）、`GET /api/v1/sector/{code}` + OpenAPI
-- [x] `tests/ingest_integration.rs`：8 项（新闻解析 / 时间窗 / 重复拉取幂等、研报字段与详情页 URL、板块成分与行情合并、非法代码 400 不打上游、上游 5xx → 502、analyze 注入近 24h 新闻、默认不注入）+ 3 项 live 测试（`#[ignore]`，直连东财）
+- [x] `tests/ingest_integration.rs`：9 项（新闻解析 / 时间窗 / 重复拉取幂等、研报字段与详情页 URL、板块成分与行情合并、非法代码 400 不打上游、上游 5xx → 502、analyze 注入近 24h 新闻、默认不注入、评级信号化幂等）+ 3 项 live 测试（`#[ignore]`，直连东财）
 - [x] `api/ai.rs`：`POST /api/v1/ai/analyze` 新增 `include_news`（默认 false），命中近 24h 新闻（≤5 条）拼进 prompt 并顺带落库；拉取失败只 warn 不阻断分析
 - [x] `service/scheduler.rs`：`spawn_ingest_scheduler` 工作日 16:00 后为自选股（≤60 只，300ms 间隔）增量刷新新闻 / 研报 / 板块，同日只跑一次
+- [x] `service/ingest.rs::persist_report_signals`：评级信号化 —— 刷新研报时把近 7 天且评级明确的写成 `kind=report` 的 `signal_event`（看多 / 看空 / 新覆盖 / 上调 / 下调标题；id 由 `(code, info_code)` 派生为 UUID 形态 + `INSERT OR IGNORE` 幂等；`meta` 携带 reportId / 机构 / 评级，`at` 取发布日北京 0 点）
+- [x] `Sources/SignalTimeline.swift`：`kindLabel` 加 `report → 机构研报`，服务端信号经既有同步通道直接展示
 - [ ] 目标设备 / 局域网端到端联调报告
 
 ---

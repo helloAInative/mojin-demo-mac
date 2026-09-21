@@ -21,6 +21,7 @@
 - 新闻 / 研报 / 概念板块数据接入（§F.3–F.4）：`GET /api/v1/news/{code}`、`/api/v1/reports/{code}`、`/api/v1/sector/{code}` 按需拉取东财并 UPSERT 落 `news_item` / `research_report` / `sector_board` 缓存表
 - `POST /api/v1/ai/analyze` 新增 `include_news`：开启后把近 24h 新闻（≤5 条）拼进 prompt，拉取失败只告警不阻断分析
 - `spawn_ingest_scheduler`：工作日 16:00 后为自选股（≤60 只，300ms 间隔）增量刷新新闻 / 研报 / 板块，同日只跑一次
+- 评级信号化（§F.4）：每日刷新研报时把近 7 天且评级明确的研报写成 `kind=report` 的 `signal_event`（机构看多 / 看空），id 由 `(code, info_code)` 派生幂等不重复，经既有 signals 同步自动到 Swift（`kindLabel`「机构研报」）
 
 ### Fixed
 

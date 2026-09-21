@@ -5,7 +5,7 @@
 use super::quote::{normalize_code, QuoteError};
 use crate::error::AppError;
 use crate::model::{NewsItem, ResearchReport, SectorBoard};
-use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use thiserror::Error;
@@ -303,7 +303,9 @@ impl EastMoneyReports {
 }
 
 fn parse_price(raw: Option<&str>) -> Option<f64> {
-    raw.map(str::trim).filter(|s| !s.is_empty()).and_then(|s| s.parse().ok())
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
 }
 
 // ---------- 概念板块 ----------
@@ -485,17 +487,10 @@ pub async fn persist_news(db: &SqlitePool, items: &[NewsItem]) -> Result<(), sql
     Ok(())
 }
 
-pub async fn persist_reports(
-    db: &SqlitePool,
-    items: &[ResearchReport],
-) -> Result<(), sqlx::Error> {
+pub async fn persist_reports(db: &SqlitePool, items: &[ResearchReport]) -> Result<(), sqlx::Error> {
     let mut tx = db.begin().await?;
     for item in items {
-        let info_code = item
-            .url
-            .trim_start_matches("https://data.eastmoney.com/report/info/")
-            .trim_end_matches(".html")
-            .to_string();
+        let info_code = info_code_from_url(&item.url).to_string();
         sqlx::query(
             "INSERT OR REPLACE INTO research_report(code,info_code,title,org,publish_date,rating,\
              last_rating,rating_change,researcher,industry,aim_price_high,aim_price_low,url,fetched_at) \
@@ -520,6 +515,117 @@ pub async fn persist_reports(
     }
     tx.commit().await?;
     Ok(())
+}
+
+// ---------- 评级信号化（F.4：研报 → 机构看多 / 看空 signal_event）----------
+
+/// 从研报详情页 URL 还原东财 info_code（fetch 阶段只把它拼进了 url）。
+fn info_code_from_url(url: &str) -> &str {
+    url.trim_start_matches("https://data.eastmoney.com/report/info/")
+        .trim_end_matches(".html")
+}
+
+/// 评级立场：看多 / 看空 / 中性（None 不出信号，持有 / 中性等不下结论的评级不刷屏）。
+fn rating_stance(rating: &str) -> Option<bool> {
+    match rating.trim() {
+        "买入" | "增持" | "强买" | "推荐" | "强烈推荐" => Some(true),
+        "卖出" | "减持" | "回避" => Some(false),
+        _ => None,
+    }
+}
+
+/// 由种子生成稳定的 UUID 形态 id（前端 SignalEvent.id 按 UUID 解码，普通哈希串过不了解码）。
+fn stable_uuid(seed: &str) -> String {
+    // 两轮 FNV 凑 128 bit；不加密学安全，幂等去重够用。
+    let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h2: u64 = 0x9e37_79b9_7f4a_7c15;
+    for byte in seed.as_bytes() {
+        h1 ^= *byte as u64;
+        h1 = h1.wrapping_mul(0x1_0000_0001_b3);
+        h2 = (h2 ^ h1).wrapping_mul(0x1_0000_0001_b3).rotate_left(29);
+    }
+    let hex = format!("{h1:016x}{h2:016x}");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// 每日刷新研报后，把「近 7 天发布且评级明确」的研报转成 signal_event（kind=report）。
+///
+/// - id 由 (code, info_code) 派生 + INSERT OR IGNORE：同一研报永远只出一条信号；
+///   注意用户在客户端删除后，7 天窗口内仍会被刷新补回（有界复活，接受）。
+/// - `at` 取研报发布日的北京时间 0 点，时间线上按发布日归位。
+/// - 首次部署回补同样受 7 天窗口约束，不会把 90 天的研报一次性全刷出来。
+pub async fn persist_report_signals(
+    db: &SqlitePool,
+    code: &str,
+    reports: &[ResearchReport],
+) -> Result<usize, sqlx::Error> {
+    let today = Utc::now().with_timezone(&cn_offset()).date_naive();
+    let mut inserted = 0usize;
+    for report in reports {
+        let Ok(published) = NaiveDate::parse_from_str(&report.publish_date, "%Y-%m-%d") else {
+            continue;
+        };
+        if (today - published).num_days() > 7 {
+            continue;
+        }
+        let Some(bullish) = rating_stance(&report.rating) else {
+            continue;
+        };
+        let at = cn_offset()
+            .from_local_datetime(&published.and_time(NaiveTime::MIN))
+            .single()
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+        let stance = if bullish {
+            "机构看多"
+        } else {
+            "机构看空"
+        };
+        let action = match report.rating_change {
+            Some(1) => format!("上调至{}", report.rating),
+            Some(2) => format!("下调至{}", report.rating),
+            _ if report.last_rating.trim().is_empty() => format!("新覆盖：{}", report.rating),
+            _ => format!("维持{}", report.rating),
+        };
+        let mut body = format!("《{}》{}", report.title, report.researcher);
+        if !report.industry.is_empty() {
+            body.push_str(&format!("（{}）", report.industry));
+        }
+        if let (Some(low), Some(high)) = (report.aim_price_low, report.aim_price_high) {
+            body.push_str(&format!("，目标价 {low:.2}-{high:.2} 元"));
+        }
+        let meta = serde_json::json!({
+            "reportId": info_code_from_url(&report.url),
+            "org": report.org,
+            "rating": report.rating,
+            "lastRating": report.last_rating,
+        });
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO signal_event(id,at,kind,code,title,body,price,source,evidence,why,meta) \
+             VALUES(?,?,?,?,?,?,0.0,?,?,?,?)",
+        )
+        .bind(stable_uuid(&format!("report-signal:{code}:{}", info_code_from_url(&report.url))))
+        .bind(at.timestamp_millis())
+        .bind("report")
+        .bind(code)
+        .bind(format!("{stance}：{}{}", report.org, action))
+        .bind(body)
+        .bind("eastmoney")
+        .bind(&report.url)
+        .bind(format!("{} → {}", report.last_rating, report.rating))
+        .bind(meta.to_string())
+        .execute(db)
+        .await?;
+        inserted += result.rows_affected() as usize;
+    }
+    Ok(inserted)
 }
 
 pub async fn persist_sector_boards(
@@ -554,7 +660,10 @@ mod tests {
     #[test]
     fn parse_cn_datetime_shifts_to_utc() {
         let dt = parse_cn_datetime(Some("2026-09-18 16:35:00"));
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-09-18 08:35:00");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-09-18 08:35:00"
+        );
     }
 
     #[test]
@@ -572,5 +681,38 @@ mod tests {
         assert_eq!(json_i64(Some(&serde_json::json!("2"))), Some(2));
         assert_eq!(json_i64(Some(&serde_json::json!("-"))), None);
         assert_eq!(json_i64(None), None);
+    }
+
+    #[test]
+    fn stable_uuid_is_deterministic_and_uuid_shaped() {
+        let a = stable_uuid("report-signal:sh600460:AP202609181234");
+        let b = stable_uuid("report-signal:sh600460:AP202609181234");
+        assert_eq!(a, b);
+        assert_ne!(a, stable_uuid("report-signal:sh600460:AP202609181235"));
+        assert_eq!(a.len(), 36);
+        let parts: Vec<&str> = a.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+    }
+
+    #[test]
+    fn rating_stance_classifies_ratings() {
+        assert_eq!(rating_stance("买入"), Some(true));
+        assert_eq!(rating_stance(" 增持 "), Some(true));
+        assert_eq!(rating_stance("卖出"), Some(false));
+        assert_eq!(rating_stance("减持"), Some(false));
+        assert_eq!(rating_stance("持有"), None);
+        assert_eq!(rating_stance(""), None);
+    }
+
+    #[test]
+    fn info_code_from_url_strips_host_and_suffix() {
+        assert_eq!(
+            info_code_from_url("https://data.eastmoney.com/report/info/AP202609181234.html"),
+            "AP202609181234"
+        );
     }
 }

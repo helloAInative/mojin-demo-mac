@@ -592,7 +592,20 @@ pub async fn refresh_watchlist_ingest(state: &AppState) -> anyhow::Result<usize>
             }
         }
         match state.reports.fetch(&state.http, code, 20, 90).await {
-            Ok(items) => ingest::persist_reports(&state.db, &items).await?,
+            Ok(items) => {
+                ingest::persist_reports(&state.db, &items).await?;
+                // §F.4 信号化：近 7 天且评级明确的研报 → kind=report 信号（幂等）。
+                match ingest::persist_report_signals(&state.db, code, &items).await {
+                    Ok(signals) if signals > 0 => {
+                        tracing::info!(%code, signals, "report signals emitted")
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        ok = false;
+                        tracing::warn!(%code, %error, "persist report signals failed")
+                    }
+                }
+            }
             Err(error) => {
                 ok = false;
                 tracing::warn!(%code, %error, "scheduled report refresh failed");

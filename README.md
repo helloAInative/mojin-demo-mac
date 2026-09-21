@@ -128,7 +128,7 @@ build.sh                  macOS App 构建脚本
 - 阶段 1：行情网关与 Swift 接入已完成，本机服务支持登录自启
 - 阶段 2：AI 网关与 Swift 接入已完成
 - 阶段 3：信号 / 持仓 / 自选 / 设置 API 与 Swift 双向同步已完成；断网保留 UserDefaults / 本地 JSON 缓存
-- 阶段 4：WebSocket 行情推送、自选股交易时段调度、收盘复盘 / 周报生成（按需 API + 收盘 / 周末自动触发，按 `(kind, period_key)` 幂等）与 Swift 端复盘历史 / 手动生成（`ReportClient`）已完成；新闻 / 研报 / 板块数据接入（`/api/v1/news|reports|sector/{code}` + 每日收盘后增量刷新）已完成，Swift 端展示待接
+- 阶段 4：WebSocket 行情推送、自选股交易时段调度、收盘复盘 / 周报生成（按需 API + 收盘 / 周末自动触发，按 `(kind, period_key)` 幂等）与 Swift 端复盘历史 / 手动生成（`ReportClient`）已完成；新闻 / 研报 / 板块数据接入（`/api/v1/news|reports|sector/{code}` + 每日收盘后增量刷新）已完成，研报评级自动出「机构看多 / 看空」信号并同步到 Swift；新闻 / 研报 / 板块的 Swift 展示页待接
 
 路线图见 [未来演进方向](docs/未来演进方向.md) 和 [ROI 排序](docs/按ROI排序.md)。
 

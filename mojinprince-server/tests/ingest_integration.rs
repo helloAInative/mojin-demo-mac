@@ -6,6 +6,7 @@
 //! 3. `GET /api/v1/sector/{code}` 合并成分列表与批量行情。
 //! 4. 非法代码 → 400 `bad_request`；上游 5xx → 502 `upstream_exhausted`。
 //! 5. `POST /api/v1/ai/analyze` 带 `include_news=true` 时把近 24h 新闻拼进 prompt。
+//! 6. 每日刷新研报后评级信号化：近 7 天明确评级 → kind=report 信号，幂等不重复。
 //!
 //! 另有 `#[ignore]` 的 live 测试直连东财，需手动 `cargo test -- --ignored` 执行。
 use actix_web::{test, web, App};
@@ -52,8 +53,8 @@ async fn fresh_state() -> AppState {
 /// 北京时间 → 用于构造"刚刚发布"的新闻时间戳。
 fn cn_time(days_ago: i64, hour: u32, minute: u32) -> String {
     let offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-    let day = chrono::Utc::now().with_timezone(&offset).date_naive()
-        - chrono::Duration::days(days_ago);
+    let day =
+        chrono::Utc::now().with_timezone(&offset).date_naive() - chrono::Duration::days(days_ago);
     format!("{} {:02}:{:02}:00", day.format("%Y-%m-%d"), hour, minute)
 }
 
@@ -308,10 +309,11 @@ async fn sector_endpoint_merges_membership_and_quotes() {
     membership.assert();
     quotes.assert();
 
-    let persisted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sector_board WHERE code='sh600460'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
+    let persisted: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sector_board WHERE code='sh600460'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
     assert_eq!(persisted, 2);
 }
 
@@ -320,7 +322,8 @@ async fn bad_code_returns_400_before_hitting_upstream() {
     let upstream = MockServer::start();
     let mock = upstream.mock(|when, then| {
         when.method(GET).path("/search/jsonp");
-        then.status(200).json_body(json!({"code": 0, "result": {"cmsArticleWebOld": []}}));
+        then.status(200)
+            .json_body(json!({"code": 0, "result": {"cmsArticleWebOld": []}}));
     });
     let mut state = fresh_state().await;
     state.news.base_url = upstream.base_url();
@@ -395,13 +398,11 @@ async fn analyze_injects_recent_news_when_requested() {
     let mut state = fresh_state().await;
     state.news.base_url = upstream.base_url();
     let app = test::init_service(
-        App::new()
-            .app_data(web::Data::new(state))
-            .service(
-                web::scope("/api/v1")
-                    .configure(api::ingest::configure)
-                    .configure(api::ai::configure),
-            ),
+        App::new().app_data(web::Data::new(state)).service(
+            web::scope("/api/v1")
+                .configure(api::ingest::configure)
+                .configure(api::ai::configure),
+        ),
     )
     .await;
 
@@ -432,7 +433,8 @@ async fn analyze_skips_news_by_default() {
     let upstream = MockServer::start();
     let news = upstream.mock(|when, then| {
         when.method(GET).path("/search/jsonp");
-        then.status(200).json_body(json!({"code": 0, "result": {"cmsArticleWebOld": []}}));
+        then.status(200)
+            .json_body(json!({"code": 0, "result": {"cmsArticleWebOld": []}}));
     });
     let chat = upstream.mock(|when, then| {
         when.method(POST).path("/v1/chat/completions");
@@ -444,13 +446,11 @@ async fn analyze_skips_news_by_default() {
     let mut state = fresh_state().await;
     state.news.base_url = upstream.base_url();
     let app = test::init_service(
-        App::new()
-            .app_data(web::Data::new(state))
-            .service(
-                web::scope("/api/v1")
-                    .configure(api::ingest::configure)
-                    .configure(api::ai::configure),
-            ),
+        App::new().app_data(web::Data::new(state)).service(
+            web::scope("/api/v1")
+                .configure(api::ingest::configure)
+                .configure(api::ai::configure),
+        ),
     )
     .await;
 
@@ -468,6 +468,94 @@ async fn analyze_skips_news_by_default() {
     let _: Value = test::call_and_read_body_json(&app, request).await;
     assert_eq!(news.hits(), 0, "默认不拉新闻");
     chat.assert();
+}
+
+#[actix_web::test]
+async fn scheduled_refresh_emits_report_signals_once() {
+    let upstream = MockServer::start();
+    let offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    let today = chrono::Utc::now().with_timezone(&offset).date_naive();
+    let yesterday = (today - chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let old = (today - chrono::Duration::days(20))
+        .format("%Y-%m-%d")
+        .to_string();
+    upstream.mock(|when, then| {
+        when.method(GET).path("/report/list");
+        then.status(200).json_body(json!({
+            "data": [
+                {
+                    "title": "业绩超预期，维持高增长",
+                    "orgSName": "中信证券",
+                    "publishDate": format!("{yesterday} 00:00:00"),
+                    "infoCode": "AP202609201111",
+                    "indvInduName": "半导体",
+                    "emRatingName": "买入",
+                    "lastEmRatingName": "增持",
+                    "ratingChange": 1,
+                    "researcher": "张三",
+                    "indvAimPriceT": "55.00",
+                    "indvAimPriceL": "45.00"
+                },
+                {
+                    "title": "中性评级的研报不应出信号",
+                    "orgSName": "某机构",
+                    "publishDate": format!("{yesterday} 00:00:00"),
+                    "infoCode": "AP202609201112",
+                    "emRatingName": "持有",
+                    "ratingChange": 3
+                },
+                {
+                    "title": "超出 7 天窗口的看多研报不应出信号",
+                    "orgSName": "某机构",
+                    "publishDate": format!("{old} 00:00:00"),
+                    "infoCode": "AP202609001113",
+                    "emRatingName": "买入",
+                    "ratingChange": 3
+                }
+            ]
+        }));
+    });
+
+    let mut state = fresh_state().await;
+    // 三个 provider 都指向 mock：新闻 / 板块未注册 mock 会 404，warn 跳过不影响研报路径。
+    state.news.base_url = upstream.base_url();
+    state.reports.base_url = upstream.base_url();
+    state.sector.board_url = upstream.base_url();
+    state.sector.quote_url = upstream.base_url();
+    sqlx::query("INSERT INTO watchlist(code, added_at, updated_at) VALUES('sh600460', 0, 0)")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    use mojinprince_server::service::scheduler;
+    let refreshed = scheduler::refresh_watchlist_ingest(&state).await.unwrap();
+    assert_eq!(refreshed, 0, "新闻 / 板块 404，本标的整体不算刷新成功");
+
+    let signal: (String, String, String, String) =
+        sqlx::query_as("SELECT kind, title, body, meta FROM signal_event WHERE code='sh600460'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(signal.0, "report");
+    assert_eq!(signal.1, "机构看多：中信证券上调至买入");
+    assert!(
+        signal.2.contains("目标价 45.00-55.00 元"),
+        "body 含目标价：{}",
+        signal.2
+    );
+    let meta: Value = serde_json::from_str(&signal.3).unwrap();
+    assert_eq!(meta["reportId"], "AP202609201111");
+    assert_eq!(meta["org"], "中信证券");
+
+    // 同一份研报再刷一次 → INSERT OR IGNORE，仍然只有一条信号。
+    scheduler::refresh_watchlist_ingest(&state).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM signal_event")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "同一研报幂等，不重复出信号");
 }
 
 // ---- live 测试：直连东财，网络可达时手动执行 `cargo test -- --ignored` ----

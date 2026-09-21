@@ -3,7 +3,7 @@ import Foundation
 struct SignalEvent: Codable, Identifiable, Equatable {
     var id: UUID
     var at: Date
-    var kind: String      // alert | ai | strategy | diverge | level | posAlert
+    var kind: String      // alert | ai | strategy | diverge | level | posAlert | report
     var title: String
     var body: String
     var code: String
@@ -30,6 +30,7 @@ struct SignalEvent: Codable, Identifiable, Equatable {
         case "diverge": return "分歧"
         case "level": return "价位预警"
         case "posAlert": return "持仓预警"
+        case "report": return "机构研报"
         default: return "预警"
         }
     }
