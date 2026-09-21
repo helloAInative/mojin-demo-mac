@@ -162,6 +162,81 @@ struct GatewaySectorBoard: Codable, Equatable, Identifiable {
     }
 }
 
+/// A 股池智能推荐：单条（服务端 daily_pick 行）。
+struct GatewayPick: Codable, Equatable, Identifiable {
+    var date: String
+    var code: String
+    var name: String
+    var rank: Int
+    var score: Double
+    /// 量化 / 消息面标签
+    var reasons: [String]
+    /// AI 一句话理由（纯量化版为空）
+    var aiNote: String
+    var meta: Meta
+
+    var id: String { "\(date)-\(code)" }
+
+    struct Meta: Codable, Equatable {
+        var close: Double?
+        var pct: Double?
+        var industry: String?
+        var outcome: Outcome?
+    }
+
+    struct Outcome: Codable, Equatable {
+        var t1Pct: Double?
+        var t5Pct: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case t1Pct = "t1_pct"
+            case t5Pct = "t5_pct"
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case date, code, name, rank, score, reasons, meta
+        case aiNote = "ai_note"
+    }
+}
+
+/// 推荐文档：当日清单 + 近 30 天 T+5 回测统计。
+struct GatewayPicksDocument: Decodable, Equatable {
+    var date: String
+    var picks: [GatewayPick]
+    var samples: Int
+    var t5WinRate: Double
+    var avgT5Pct: Double
+
+    private enum StatsKeys: String, CodingKey {
+        case samples
+        case t5WinRate = "t5_win_rate"
+        case avgT5Pct = "avg_t5_pct"
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case date, picks, stats
+    }
+
+    init(date: String, picks: [GatewayPick], samples: Int, t5WinRate: Double, avgT5Pct: Double) {
+        self.date = date
+        self.picks = picks
+        self.samples = samples
+        self.t5WinRate = t5WinRate
+        self.avgT5Pct = avgT5Pct
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        date = try c.decode(String.self, forKey: .date)
+        picks = try c.decode([GatewayPick].self, forKey: .picks)
+        let stats = try c.nestedContainer(keyedBy: StatsKeys.self, forKey: .stats)
+        samples = (try? stats.decodeIfPresent(Int.self, forKey: .samples)) ?? 0
+        t5WinRate = (try? stats.decodeIfPresent(Double.self, forKey: .t5WinRate)) ?? 0
+        avgT5Pct = (try? stats.decodeIfPresent(Double.self, forKey: .avgT5Pct)) ?? 0
+    }
+}
+
 /// Rust 行情网关的 Swift DTO 适配层。这里不访问第三方行情源。
 enum GatewayMarketClient {
     private static let session: URLSession = {
@@ -357,6 +432,39 @@ enum GatewayMarketClient {
     /// §F.4：所属概念 / 行业板块（板块指数 + 涨跌幅）。
     static func sector(code: String) async throws -> [GatewaySectorBoard] {
         try await getData("sector/\(code)")
+    }
+
+    /// A 股池智能推荐：最近一份（含 T+5 回测统计）。
+    static func picks() async throws -> GatewayPicksDocument {
+        try await getData("picks")
+    }
+
+    /// 重新生成当日推荐；`ai` 透传本机 AI 配置做精排（密钥只在请求内使用）。
+    static func runPicks(ai: AiRankConfig?) async throws -> GatewayPicksDocument {
+        struct Body: Encodable {
+            var ai: AiRankConfig?
+        }
+        var request = try await dataRequest(path: "picks/run", method: "POST")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(ai: ai))
+        let (data, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse,
+              (200..<300).contains(response.statusCode) else { throw GatewayError.badResponse }
+        return try JSONDecoder().decode(GatewayPicksDocument.self, from: data)
+    }
+
+    /// POST /picks/run 的 AI 精排配置（snake_case 对齐服务端 serde）。
+    struct AiRankConfig: Codable, Equatable {
+        var provider: String
+        var baseURL: String
+        var apiKey: String
+        var model: String
+
+        enum CodingKeys: String, CodingKey {
+            case provider, model
+            case baseURL = "base_url"
+            case apiKey = "api_key"
+        }
     }
 
     /// 本地先写、服务端后写；网络错误不会影响盯盘主流程。

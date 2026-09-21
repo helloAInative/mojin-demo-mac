@@ -1918,6 +1918,137 @@ struct ContentView: View {
         .frame(minHeight: 280, alignment: .top)
     }
 
+    /// A 股池智能推荐（复盘页）：四层漏斗产出 + T+5 胜率统计；点击行加自选并跳盯盘。
+    private var picksCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("智能推荐 · A 股池")
+                        .font(.system(size: 10, weight: .bold))
+                    if let doc = store.picksDoc, !doc.picks.isEmpty {
+                        Text(doc.date)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Spacer()
+                    if store.picksBusy {
+                        ProgressView().controlSize(.mini)
+                    }
+                    Button("AI 精排") {
+                        Task { await store.runPicks() }
+                    }
+                    .controlSize(.mini)
+                    .disabled(store.picksBusy)
+                    .help("重新生成当日推荐：涨幅榜 → 量化 → 研报/新闻 → AI 精排（AI 未配置则纯量化）")
+                    Button("刷新") {
+                        Task { await store.loadPicks() }
+                    }
+                    .controlSize(.mini)
+                    .disabled(store.picksBusy)
+                }
+                if let doc = store.picksDoc {
+                    if doc.picks.isEmpty {
+                        Text("暂无推荐。工作日 15:30 后服务端自动生成，或点「AI 精排」立即跑一次。")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                    } else {
+                        if doc.samples > 0 {
+                            Text(String(format: "近30天 T+5 胜率 %.0f%%（%d 样本 · 平均 %+.1f%%）",
+                                        doc.t5WinRate * 100, doc.samples, doc.avgT5Pct))
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(doc.t5WinRate >= 0.5 ? .green : .orange)
+                                .help("推荐日收盘 vs 5 个交易日后收盘的回测口径")
+                        } else {
+                            Text("回测样本积累中（推荐 7 天后自动回写 T+5 对照）")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.tertiary)
+                        }
+                        ForEach(doc.picks) { pick in
+                            pickRow(pick)
+                        }
+                    }
+                } else if !store.picksHint.isEmpty {
+                    Text(store.picksHint)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                } else {
+                    Text("点「AI 精排」生成，或等收盘后自动产出")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+                if !store.picksHint.isEmpty, store.picksDoc?.picks.isEmpty == false {
+                    Text(store.picksHint)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(4)
+        }
+    }
+
+    private func pickRow(_ pick: GatewayPick) -> some View {
+        Button {
+            if !settings.symbols.contains(where: { $0.code == pick.code }) {
+                _ = settings.addSymbol(code: pick.code, name: pick.name, group: "观察")
+            }
+            store.switchSymbol(pick.code)
+            tab = .watch
+        } label: {
+            HStack(alignment: .top, spacing: 8) {
+                Text("#\(pick.rank)")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 20, alignment: .leading)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        Text(pick.name)
+                            .font(.system(size: 10, weight: .semibold))
+                            .lineLimit(1)
+                        if let industry = pick.meta.industry, !industry.isEmpty {
+                            Text(industry)
+                                .font(.system(size: 8))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                        if let pct = pick.meta.pct {
+                            Text(String(format: "%@%.1f%%", pct >= 0 ? "+" : "", pct))
+                                .font(.system(size: 10, weight: .semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(pct >= 0 ? trendUp : trendDown)
+                        }
+                    }
+                    HStack(spacing: 4) {
+                        ForEach(pick.reasons.prefix(3), id: \.self) { tag in
+                            Text(tag)
+                                .font(.system(size: 8))
+                                .foregroundStyle(Color.accentColor.opacity(0.9))
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(Color.accentColor.opacity(0.1), in: Capsule())
+                        }
+                        if let t5 = pick.meta.outcome?.t5Pct {
+                            Text(String(format: "T+5 %+.1f%%", t5))
+                                .font(.system(size: 8))
+                                .monospacedDigit()
+                                .foregroundStyle(t5 >= 0 ? trendUp : trendDown)
+                        }
+                        Spacer(minLength: 0)
+                        Text(String(format: "%.0f分", pick.score))
+                            .font(.system(size: 8))
+                            .monospacedDigit()
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("\(pick.name) \(pick.code) · 基准日 \(pick.date)\n\(pick.reasons.joined(separator: " / ")) · 量化分 \(Int(pick.score))\(pick.aiNote.isEmpty ? "" : "\nAI：\(pick.aiNote)")\n点击加入自选并去盯盘（仅关注建议，不构成投资建议）")
+    }
+
     private var reviewTab: some View {
         let day = MarketStore.todayString()
         let hits = settings.searchDiaries(code: nil, query: diaryQuery, limit: 8)
@@ -2000,6 +2131,9 @@ struct ContentView: View {
                 .padding(4)
             }
 
+            // A 股池智能推荐（复盘页）
+            picksCard
+
             // 复盘历史（从后端拉，按 kind 过滤）
             GroupBox {
                 VStack(alignment: .leading, spacing: 6) {
@@ -2063,7 +2197,10 @@ struct ContentView: View {
                 }
                 .padding(4)
             }
-            .onAppear { Task { await refreshReviewHistory() } }
+            .onAppear {
+                Task { await refreshReviewHistory() }
+                Task { await store.loadPicks() }
+            }
 
             TextField("检索复盘（标的/日期/关键词）", text: $diaryQuery)
                 .textFieldStyle(.roundedBorder)

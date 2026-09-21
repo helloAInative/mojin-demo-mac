@@ -82,6 +82,49 @@ final class MarketStore: ObservableObject {
     /// 智能止损 / 止盈建议（refreshDaily / 持仓变更时重算，不逐 tick）
     @Published var stopTakeAdvice: StopTakeAdvisor.Advice?
 
+    /// A 股池智能推荐（复盘页）：文档 + 加载/生成状态
+    @Published var picksDoc: GatewayPicksDocument?
+    @Published var picksBusy = false
+    @Published var picksHint = ""
+
+    func loadPicks() async {
+        do {
+            picksDoc = try await GatewayMarketClient.picks()
+            if picksDoc?.picks.isEmpty != false { picksHint = "暂无推荐，点「AI 精排」生成" }
+            else { picksHint = "" }
+        } catch {
+            picksHint = "拉取推荐失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// 生成 / 刷新当日推荐。AI 可用时透传本机配置做精排（密钥只在请求内使用，不落库）。
+    func runPicks() async {
+        guard !picksBusy else { return }
+        picksBusy = true
+        defer { picksBusy = false }
+        let cfg = settings.aiConfig
+        let ai: GatewayMarketClient.AiRankConfig?
+        if cfg.enabled, !settings.aiAPIKey.trimmingCharacters(in: .whitespaces).isEmpty,
+           TokenPlanCatalog.isChat(cfg.model) {
+            ai = GatewayMarketClient.AiRankConfig(
+                provider: cfg.providerId,
+                baseURL: cfg.baseURL,
+                apiKey: settings.aiAPIKey,
+                model: cfg.model
+            )
+            picksHint = ai == nil ? "AI 生成中…" : "AI 精排中…"
+        } else {
+            ai = nil
+            picksHint = "量化生成中（未配置 AI，跳过精排）"
+        }
+        do {
+            picksDoc = try await GatewayMarketClient.runPicks(ai: ai)
+            picksHint = "已生成 · \(picksDoc?.date ?? "") · \(picksDoc?.picks.count ?? 0) 只"
+        } catch {
+            picksHint = "生成失败：\(error.localizedDescription)"
+        }
+    }
+
     /// AI 智能降级熔断（ROI #7）：自动分析短路、手动放行、成功清零
     let aiDegrade = AIDegradeGovernor()
 

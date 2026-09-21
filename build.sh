@@ -8,6 +8,10 @@ APP_NAME="摸金小王子"
 APP="$OUT/${APP_NAME}.app"
 BIN_NAME="JJWDWidget"
 SDK="${SDK_PATH:-$(xcrun --show-sdk-path)}"
+# 2026-09-21：系统自动更新 CLT 27.0 后默认 SDK 缺 SwiftUIMacros 宏插件（@State 编译报
+# "plugin for module 'SwiftUIMacros' not found"）。临时解法：
+#   SDK_PATH=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk ./build.sh
+# （重启让 dyld 缓存重建后可能恢复默认 SDK 可用。）
 TARGET="arm64-apple-macosx14.0"
 
 mkdir -p "$OUT"
