@@ -2,6 +2,7 @@
 use crate::config::Config;
 use crate::model::Quote;
 use crate::service::ingest::{EastMoneyNews, EastMoneyReports, EastMoneySector};
+use crate::service::pick::{DayKSource, EastMoneyRanking};
 use crate::service::quote::failover::QuoteFailover;
 use sqlx::SqlitePool;
 use std::str::FromStr;
@@ -52,6 +53,10 @@ pub struct AppState {
     pub reports: EastMoneyReports,
     /// 概念板块（成分 + 行情）
     pub sector: EastMoneySector,
+    /// 智能推荐：东财涨幅榜候选源
+    pub pick_ranking: EastMoneyRanking,
+    /// 智能推荐：腾讯日 K 源
+    pub day_k: DayKSource,
 }
 
 impl AppState {
@@ -107,6 +112,8 @@ impl AppState {
             news: EastMoneyNews::default(),
             reports: EastMoneyReports::default(),
             sector: EastMoneySector::default(),
+            pick_ranking: EastMoneyRanking::default(),
+            day_k: DayKSource::default(),
         })
     }
 }

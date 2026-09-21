@@ -5,6 +5,7 @@ use super::ai;
 use super::data;
 use super::health;
 use super::ingest;
+use super::pick;
 use super::quote;
 use super::review;
 
@@ -45,6 +46,8 @@ use super::review;
         ingest::get_news,
         ingest::get_reports,
         ingest::get_sector,
+        pick::list,
+        pick::run,
     ),
     components(
         schemas(
@@ -70,6 +73,10 @@ use super::review;
             crate::model::NewsItem,
             crate::model::ResearchReport,
             crate::model::SectorBoard,
+            crate::model::DailyPick,
+            crate::model::PicksDocument,
+            crate::model::PickStats,
+            crate::model::PicksRunRequest,
             crate::state::QuotePushEvent,
             crate::error::AppErrorBody,
         )
@@ -81,6 +88,7 @@ use super::review;
         (name = "data", description = "信号 / 持仓 / 自选 / 设置"),
         (name = "review", description = "收盘复盘 / 周报（按日期幂等）"),
         (name = "ingest", description = "新闻 / 研报 / 概念板块（东财按需拉取 + 落库）"),
+        (name = "pick", description = "A 股池智能推荐（涨幅榜 → 量化 → 消息面 → AI 精排）"),
         (name = "realtime", description = "WebSocket 实时行情：/api/v1/ws/quote")
     )
 )]

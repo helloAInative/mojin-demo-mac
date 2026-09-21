@@ -111,7 +111,7 @@ fn parse_minutes(json: &Value, code: &str) -> Result<Vec<MinuteBar>, QuoteError>
     Ok(bars)
 }
 
-fn parse_days(json: &Value, code: &str) -> Result<Vec<DayBar>, QuoteError> {
+pub(crate) fn parse_days(json: &Value, code: &str) -> Result<Vec<DayBar>, QuoteError> {
     let stock = &json["data"][code];
     let rows = stock["qfqday"]
         .as_array()

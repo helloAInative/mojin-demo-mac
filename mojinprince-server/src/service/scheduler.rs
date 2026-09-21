@@ -150,6 +150,8 @@ pub fn spawn_report_scheduler(state: AppState) -> tokio::task::JoinHandle<()> {
             if let Err(error) = maybe_dump_daily_archive(&state, now).await {
                 tracing::warn!(%error, "daily archive dump failed");
             }
+            // 智能推荐：收盘后自动生成纯量化版 + 回测回写（幂等）
+            maybe_generate_picks(&state).await;
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
     })
@@ -650,7 +652,6 @@ fn cn_date_end_ms(date: NaiveDate) -> i64 {
 
 #[derive(Debug, Clone)]
 struct LevelSignalInfo {
-    id: String,
     code: String,
     at_ms: i64,
     level_key: String,
@@ -791,8 +792,8 @@ async fn build_level_attribution(
             .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()))
             .or_else(|| meta.get("levelPrice").and_then(|v| v.as_f64()))
             .unwrap_or(0.0);
+        let _ = &id;
         infos.push(LevelSignalInfo {
-            id: id.clone(),
             code: code.clone(),
             at_ms: *at_ms,
             level_key: meta
@@ -954,7 +955,7 @@ fn archives_dir(state: &AppState) -> std::path::PathBuf {
 
 /// 最近**已收盘**的交易日：工作日 15:10 后是今天；否则回退到上一个工作日
 /// （周末 / 节前不拦，覆盖"周五晚间没开机"的补归档；无节假日感知）。
-fn last_closed_trading_day(now: chrono::DateTime<FixedOffset>) -> NaiveDate {
+pub fn last_closed_trading_day(now: chrono::DateTime<FixedOffset>) -> NaiveDate {
     let after_close = now.hour() * 60 + now.minute() >= 15 * 60 + 10;
     let mut day = now.date_naive();
     let today_is_trading = !matches!(day.weekday(), Weekday::Sat | Weekday::Sun);
@@ -1096,6 +1097,60 @@ async fn build_day_archive(
         "signals": signals,
         "codes": codes,
     }))
+}
+
+// ============================================================================
+// 智能推荐调度：收盘后自动生成纯量化版 + 回测回写
+// ============================================================================
+
+/// 推荐基准日：工作日盘中（09:35 后）或收盘后为今天（当日榜单成立）；
+/// 其余（开盘前 / 周末）为最近已收盘交易日（此时上游榜单即该日终盘）。
+pub fn pick_target_date(now: chrono::DateTime<FixedOffset>) -> NaiveDate {
+    let today = now.date_naive();
+    let after_open = now.hour() * 60 + now.minute() >= 9 * 60 + 35;
+    let is_weekday = !matches!(today.weekday(), Weekday::Sat | Weekday::Sun);
+    if is_weekday && after_open {
+        today
+    } else {
+        last_closed_trading_day(now)
+    }
+}
+
+/// 工作日 15:30 后（榜单已定型）生成当日纯量化推荐；周末 / 节前自动补上一
+/// 交易日。已存在则跳过。随后顺带回写 T+5 回测。
+async fn maybe_generate_picks(state: &AppState) {
+    let offset = FixedOffset::east_opt(CN_OFFSET_SECS).expect("valid UTC+8 offset");
+    let now = Utc::now().with_timezone(&offset);
+    let date = pick_target_date(now);
+    let today_final = date == now.date_naive() && now.hour() * 60 + now.minute() >= 15 * 60 + 30;
+    let catch_up = date != now.date_naive();
+    if today_final || catch_up {
+        let date_key = date.format("%Y-%m-%d").to_string();
+        let exists: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM daily_pick WHERE date = ? LIMIT 1")
+                .bind(&date_key)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
+        if exists.is_none() {
+            match crate::service::pick::generate_picks(state, date, None).await {
+                Ok(doc) => tracing::info!(
+                    date = %date_key,
+                    count = doc.picks.len(),
+                    "daily picks generated (quant)"
+                ),
+                Err(error) => tracing::warn!(%error, "daily picks generation failed"),
+            }
+        }
+    }
+    match crate::service::pick::backfill_outcomes(state).await {
+        Ok(updated) if updated > 0 => {
+            tracing::info!(updated, "pick outcomes backfilled")
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "pick outcome backfill failed"),
+    }
 }
 
 // ============================================================================
@@ -1244,7 +1299,6 @@ mod review_tests {
         let now_ms = now.timestamp_millis();
         let today = now.date_naive();
         let base = LevelSignalInfo {
-            id: "1".into(),
             code: "sh600460".into(),
             at_ms: now_ms - 3 * 86400 * 1000, // 周二发射
             level_key: "support".into(),
