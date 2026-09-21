@@ -25,6 +25,7 @@ swiftc -parse-as-library \
   "$SRC"/Models.swift \
   "$SRC"/MACD.swift \
   "$SRC"/AIService.swift \
+  "$SRC"/AIDegradeGovernor.swift \
   "$SRC"/AppSettings.swift \
   "$SRC"/MarketService.swift \
   "$SRC"/GatewayMarketClient.swift \

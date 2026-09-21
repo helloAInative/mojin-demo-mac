@@ -82,6 +82,9 @@ final class MarketStore: ObservableObject {
     /// 智能止损 / 止盈建议（refreshDaily / 持仓变更时重算，不逐 tick）
     @Published var stopTakeAdvice: StopTakeAdvisor.Advice?
 
+    /// AI 智能降级熔断（ROI #7）：自动分析短路、手动放行、成功清零
+    let aiDegrade = AIDegradeGovernor()
+
     /// 命中率时序（ROI #5）：近 30 个日历日按日聚合 level 事件 + 7 日滚动命中率。
     var accuracyTimeline: [AccuracyTimeline.Day] {
         AccuracyTimeline.build(events: signalEvents)
@@ -1336,6 +1339,16 @@ final class MarketStore: ObservableObject {
             aiStatus = "当前模型是\(TokenPlanCatalog.all.first(where: { $0.modelID == cfg.model })?.capability ?? "生成类")，请换对话模型再分析"
             return
         }
+        // 智能降级（ROI #7）：熔断期内自动分析直接走规则摘要，不再白等满超时。
+        // 手动 force 永远放行 —— 点「立即分析」即半开试探，成功即恢复。
+        if !force, let hold = aiDegrade.circuitHoldText() {
+            aiText = ruleBasedSummary()
+            aiUsedFallback = true
+            aiAnalyzing = false
+            let reason = aiDegrade.lastKind?.label ?? "连续失败"
+            aiStatus = "熔断中 · 剩 \(hold) · 连败 \(aiDegrade.failStreak) 次（\(reason)）· 自动分析暂走本地，点「立即分析」试探"
+            return
+        }
         if aiAnalyzing { return }
         if !force, let last = lastAIAt {
             let gap = Date().timeIntervalSince(last)
@@ -1365,6 +1378,7 @@ final class MarketStore: ObservableObject {
                 let ms = Int(Date().timeIntervalSince(t0) * 1000)
                 await MainActor.run {
                     guard let self else { return }
+                    self.aiDegrade.recordSuccess()
                     let parsed = Self.parseAISignal(from: text)
                     let formatted = Self.formatAIText(parsed: parsed, raw: text)
                     self.aiText = formatted
@@ -1409,8 +1423,10 @@ final class MarketStore: ObservableObject {
             } catch {
                 guard !Task.isCancelled else { return }
                 let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                let kind = AIDegradeGovernor.classify(error)
                 await MainActor.run {
                     guard let self else { return }
+                    self.aiDegrade.recordFailure(kind: kind)
                     let fallback = self.ruleBasedSummary()
                     self.aiText = fallback
                     self.aiUsedFallback = true
@@ -1424,6 +1440,11 @@ final class MarketStore: ObservableObject {
                        self.settings.aiConfig.lastGoodModel != model {
                         self.aiStatus += " · 可切 \(self.settings.aiConfig.lastGoodModel)"
                     }
+                    if let hold = self.aiDegrade.circuitHoldText() {
+                        self.aiStatus += " · 已熔断 \(hold)（\(kind.label)，自动分析暂走本地）"
+                    } else {
+                        self.aiStatus += " · 连败 \(self.aiDegrade.failStreak)/\(self.aiDegrade.streakThreshold)"
+                    }
                     AIUsageLedger.append(
                         model: model, ok: false, fallback: true, elapsedMs: ms,
                         outputChars: fallback.count, note: msg
@@ -1434,7 +1455,7 @@ final class MarketStore: ObservableObject {
                         title: "AI 降级 · 规则摘要",
                         body: String(fallback.prefix(160)),
                         evidence: evidence,
-                        why: "模型失败：\(error.localizedDescription) · \(ms)ms"
+                        why: "模型失败（\(kind.label)）：\(error.localizedDescription) · \(ms)ms"
                     )
                 }
             }
