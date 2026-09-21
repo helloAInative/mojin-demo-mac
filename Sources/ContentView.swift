@@ -1954,16 +1954,43 @@ struct ContentView: View {
                             .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
                     } else {
-                        if doc.samples > 0 {
-                            Text(String(format: "近30天 T+5 胜率 %.0f%%（%d 样本 · 平均 %+.1f%%）",
-                                        doc.t5WinRate * 100, doc.samples, doc.avgT5Pct))
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundStyle(doc.t5WinRate >= 0.5 ? .green : .orange)
-                                .help("推荐日收盘 vs 5 个交易日后收盘的回测口径")
-                        } else {
-                            Text("回测样本积累中（推荐 7 天后自动回写 T+5 对照）")
-                                .font(.system(size: 9))
-                                .foregroundStyle(.tertiary)
+                        HStack(spacing: 8) {
+                            if doc.samples > 0 {
+                                Text(String(format: "近30天 T+5 胜率 %.0f%%（%d 样本 · 平均 %+.1f%%）",
+                                            doc.t5WinRate * 100, doc.samples, doc.avgT5Pct))
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundStyle(doc.t5WinRate >= 0.5 ? .green : .orange)
+                                    .help("推荐日收盘 vs 5 个交易日后收盘的回测口径")
+                            } else {
+                                Text("回测样本积累中（推荐 7 天后自动回写 T+5 对照）")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            if let ixic = doc.market?.ixic {
+                                Text(String(format: "隔夜纳指 %+.1f%%", ixic))
+                                    .font(.system(size: 9))
+                                    .monospacedDigit()
+                                    .foregroundStyle(ixic >= 0 ? trendUp : trendDown)
+                                    .help("隔夜美股情绪（道指/纳指），影响当日推荐的全局分")
+                            }
+                        }
+                        // 标签级回测：哪个因子真的有效
+                        if !doc.tags.isEmpty {
+                            HStack(spacing: 4) {
+                                ForEach(doc.tags.prefix(5)) { t in
+                                    Text(String(format: "%@ %.0f%%", t.tag, t.winRate * 100))
+                                        .font(.system(size: 8))
+                                        .monospacedDigit()
+                                        .foregroundStyle(t.winRate >= 0.5 ? .green : .orange)
+                                        .padding(.horizontal, 4)
+                                        .padding(.vertical, 1)
+                                        .background(
+                                            (t.winRate >= 0.5 ? Color.green : Color.orange)
+                                                .opacity(0.1), in: Capsule())
+                                        .help("该标签近 30 天 T+5 胜率 · \(t.samples) 样本")
+                                }
+                                Spacer(minLength: 0)
+                            }
                         }
                         ForEach(doc.picks) { pick in
                             pickRow(pick)

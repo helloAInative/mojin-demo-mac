@@ -29,6 +29,9 @@ pub struct PicksDocument {
     pub picks: Vec<DailyPick>,
     /// 有 outcome 的样本统计；无样本时各值为 0
     pub stats: PickStats,
+    /// 生成时的市场环境（隔夜美股涨跌等）；缺省 {}
+    #[serde(default)]
+    pub market: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -37,6 +40,17 @@ pub struct PickStats {
     /// T+5 收盘价高于推荐日收盘的比例（0..1）
     pub t5_win_rate: f64,
     pub avg_t5_pct: f64,
+    /// 标签级回测：哪个因子真的有效（按样本数降序，最多 6 条）
+    #[serde(default)]
+    pub tags: Vec<PickTagStat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PickTagStat {
+    pub tag: String,
+    pub samples: i64,
+    /// 该标签下 T+5 为正的比例（0..1）
+    pub win_rate: f64,
 }
 
 /// `POST /api/v1/picks/run` 可选 body：客户端透传 AI 配置做精排。

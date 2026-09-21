@@ -212,18 +212,44 @@ struct GatewayPicksDocument: Decodable, Equatable {
         case samples
         case t5WinRate = "t5_win_rate"
         case avgT5Pct = "avg_t5_pct"
+        case tags
     }
 
     private enum CodingKeys: String, CodingKey {
-        case date, picks, stats
+        case date, picks, stats, market
     }
 
-    init(date: String, picks: [GatewayPick], samples: Int, t5WinRate: Double, avgT5Pct: Double) {
+    /// 标签级回测（哪个因子真的有效，按样本数降序 ≤6）
+    var tags: [TagStat]
+    /// 隔夜美股（djia / ixic 涨跌 %）
+    var market: MarketInfo?
+
+    struct TagStat: Decodable, Equatable, Identifiable {
+        var tag: String
+        var samples: Int
+        var winRate: Double
+        var id: String { tag }
+
+        enum CodingKeys: String, CodingKey {
+            case tag, samples
+            case winRate = "win_rate"
+        }
+    }
+
+    struct MarketInfo: Decodable, Equatable {
+        var djia: Double?
+        var ixic: Double?
+    }
+
+    init(date: String, picks: [GatewayPick], samples: Int, t5WinRate: Double, avgT5Pct: Double,
+         tags: [TagStat] = [], market: MarketInfo? = nil) {
         self.date = date
         self.picks = picks
         self.samples = samples
         self.t5WinRate = t5WinRate
         self.avgT5Pct = avgT5Pct
+        self.tags = tags
+        self.market = market
     }
 
     init(from decoder: Decoder) throws {
@@ -234,6 +260,8 @@ struct GatewayPicksDocument: Decodable, Equatable {
         samples = (try? stats.decodeIfPresent(Int.self, forKey: .samples)) ?? 0
         t5WinRate = (try? stats.decodeIfPresent(Double.self, forKey: .t5WinRate)) ?? 0
         avgT5Pct = (try? stats.decodeIfPresent(Double.self, forKey: .avgT5Pct)) ?? 0
+        tags = (try? stats.decodeIfPresent([TagStat].self, forKey: .tags)) ?? []
+        market = try? c.decodeIfPresent(MarketInfo.self, forKey: .market)
     }
 }
 

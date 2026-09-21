@@ -90,6 +90,27 @@ async fn picks_run_with_ai_ranks_and_persists() {
             }
         }));
     });
+    // 隔夜美股 mock：两指数 +2%（偏多情绪 +10）
+    upstream.mock(|when, then| {
+        when.method(GET).path("/q=usDJI,usIXIC");
+        then.status(200).body(
+            "v_usDJI=\"200~DJI~.DJI~102.0~100.0~102.5~1\";\nv_usIXIC=\"200~IXIC~.IXIC~102.0~100.0~102.5~1\"",
+        );
+    });
+    // 新闻 mock：一条利好（中标 → +5「利好新闻」）
+    upstream.mock(|when, then| {
+        when.method(GET).path("/search/jsonp");
+        then.status(200).json_body(json!({
+            "code": 0,
+            "result": {"cmsArticleWebOld": [{
+                "date": "2026-09-22 10:30:00",
+                "title": "公司中标3.2亿元大订单",
+                "content": "利好落地",
+                "mediaName": "证券时报",
+                "url": "https://news.example.com/1"
+            }]}
+        }));
+    });
     // AI 精排 mock：只推 300623
     upstream.mock(|when, then| {
         when.method(POST).path("/v1/chat/completions");
@@ -103,6 +124,8 @@ async fn picks_run_with_ai_ranks_and_persists() {
     let mut state = fresh_state().await;
     state.pick_ranking.base_url = upstream.base_url();
     state.day_k.base_url = upstream.base_url();
+    state.us_index.base_url = upstream.base_url();
+    state.news.base_url = upstream.base_url();
     let db = state.db.clone();
     let app = test::init_service(
         App::new()
@@ -136,6 +159,25 @@ async fn picks_run_with_ai_ranks_and_persists() {
             .any(|t| t == "放量"),
         "量化标签保留：{doc}"
     );
+    // v2 因子：强势行业（两行业均值 ≥2%）+ 隔夜美股偏多 + 利好新闻
+    let reasons = picks[0]["reasons"].as_array().unwrap();
+    assert!(
+        reasons.iter().any(|t| t == "强势行业"),
+        "行业动量标签：{doc}"
+    );
+    assert!(
+        reasons.iter().any(|t| t == "隔夜美股偏多"),
+        "美股情绪标签：{doc}"
+    );
+    assert!(
+        reasons.iter().any(|t| t == "利好新闻"),
+        "新闻关键词标签：{doc}"
+    );
+    assert_eq!(
+        picks[0]["meta"]["us"]["djia"], 2.0,
+        "meta 记录隔夜美股：{doc}"
+    );
+    assert_eq!(doc["market"]["djia"], 2.0, "文档级 market：{doc}");
     assert!(!doc["date"].as_str().unwrap().is_empty());
 
     // GET：默认最近一天，同一份
@@ -177,6 +219,8 @@ async fn picks_run_without_ai_uses_quant_order() {
     let mut state = fresh_state().await;
     state.pick_ranking.base_url = upstream.base_url();
     state.day_k.base_url = upstream.base_url();
+    state.us_index.base_url = upstream.base_url();
+    state.news.base_url = upstream.base_url();
     let db = state.db.clone();
     let app = test::init_service(
         App::new()

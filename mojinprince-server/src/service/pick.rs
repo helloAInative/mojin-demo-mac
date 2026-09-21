@@ -6,7 +6,7 @@
 //! 落库 `daily_pick`，按 (date, code) 主键；T+1/T+5 收盘对照回写
 //! `meta.outcome` 形成命中率闭环。
 use crate::error::AppError;
-use crate::model::pick::{AiRankConfig, DailyPick, PickStats, PicksDocument};
+use crate::model::pick::{AiRankConfig, DailyPick, PickStats, PickTagStat, PicksDocument};
 use crate::model::DayBar;
 use crate::service::ai::{self, ChatMessage};
 use crate::state::AppState;
@@ -156,6 +156,189 @@ fn market_prefix(raw: &str) -> &'static str {
     }
 }
 
+// ============================================================================
+// 隔夜美股情绪（腾讯，与行情网关同源）
+// ============================================================================
+
+/// 腾讯美股指数：`/q=usDJI,usIXIC`（GBK 文本，字段 3=现价 4=昨收）。
+#[derive(Debug, Clone)]
+pub struct TencentUsIndex {
+    /// 测试可覆写（默认 `http://qt.gtimg.cn`）
+    pub base_url: String,
+}
+
+impl Default for TencentUsIndex {
+    fn default() -> Self {
+        Self {
+            base_url: "http://qt.gtimg.cn".into(),
+        }
+    }
+}
+
+/// 道指 / 纳指涨跌（%，美股闭市时即昨日收盘）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UsSentiment {
+    pub djia_pct: Option<f64>,
+    pub ixic_pct: Option<f64>,
+}
+
+impl UsSentiment {
+    /// 全局情绪分：两指数均值 ≥1 → +10「隔夜美股偏多」；≤−1 → −10「隔夜美股偏空」。
+    pub fn mood_score(&self) -> (f64, Option<String>) {
+        let values: Vec<f64> = [self.djia_pct, self.ixic_pct]
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        if values.is_empty() {
+            return (0.0, None);
+        }
+        let avg = values.iter().sum::<f64>() / values.len() as f64;
+        if avg >= 1.0 {
+            (10.0, Some("隔夜美股偏多".into()))
+        } else if avg <= -1.0 {
+            (-10.0, Some("隔夜美股偏空".into()))
+        } else {
+            (0.0, None)
+        }
+    }
+
+    /// 纳指跌超 1%：半导体 / 电子类行业候选额外惩罚（隔夜联动）。
+    pub fn semis_drag(&self) -> bool {
+        self.ixic_pct.map(|p| p <= -1.0).unwrap_or(false)
+    }
+}
+
+impl TencentUsIndex {
+    pub async fn fetch(&self, http: &reqwest::Client) -> Result<UsSentiment, PickError> {
+        let response = http
+            .get(format!("{}/q=usDJI,usIXIC", self.base_url))
+            .send()
+            .await
+            .map_err(|e| PickError::Network(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(PickError::Network(format!("status {}", response.status())));
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|e| PickError::Network(e.to_string()))?;
+        // 数字字段对编码不敏感（与 tencent.rs 同款兜底）
+        let (decoded, _, _) = encoding_rs::GBK.decode(body.as_bytes());
+        Ok(parse_us_index(&decoded))
+    }
+}
+
+/// 解析 `v_usDJI="200~道琼斯~.DJI~现价~昨收~…"` 两条行。
+fn parse_us_index(body: &str) -> UsSentiment {
+    let mut out = UsSentiment::default();
+    for line in body.lines() {
+        let (Some(start), Some(end)) = (line.find('"'), line.rfind('"')) else {
+            continue;
+        };
+        if end <= start {
+            continue;
+        }
+        let fields: Vec<&str> = line[start + 1..end].split('~').collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        let pct = fields[3]
+            .parse::<f64>()
+            .ok()
+            .zip(fields[4].parse::<f64>().ok())
+            .and_then(|(price, prev)| {
+                if prev > 0.0 {
+                    Some((price - prev) / prev * 100.0)
+                } else {
+                    None
+                }
+            });
+        match fields[2] {
+            ".DJI" => out.djia_pct = pct,
+            ".IXIC" => out.ixic_pct = pct,
+            _ => {}
+        }
+    }
+    out
+}
+
+// ============================================================================
+// 板块动量（候选池行业聚合，零新增请求）与新闻关键词
+// ============================================================================
+
+/// 候选池按 f100 行业聚合平均涨幅。返回（行业 → 均值, 强势行业集合）：
+/// 强势 = 均值 ≥2% 且进入 Top5；调用方对均值 ≤0 的行业减分。
+fn industry_momentum(
+    candidates: &[Candidate],
+) -> (std::collections::HashMap<String, f64>, Vec<String>) {
+    let mut bucket: std::collections::HashMap<String, (f64, usize)> =
+        std::collections::HashMap::new();
+    for candidate in candidates {
+        if candidate.industry.is_empty() {
+            continue;
+        }
+        let entry = bucket.entry(candidate.industry.clone()).or_insert((0.0, 0));
+        entry.0 += candidate.pct;
+        entry.1 += 1;
+    }
+    let mut avgs: Vec<(String, f64)> = bucket
+        .iter()
+        .map(|(industry, (sum, count))| (industry.clone(), sum / *count as f64))
+        .collect();
+    avgs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let strong: Vec<String> = avgs
+        .iter()
+        .take(5)
+        .filter(|(_, avg)| *avg >= 2.0)
+        .map(|(industry, _)| industry.clone())
+        .collect();
+    let map = avgs.into_iter().collect();
+    (map, strong)
+}
+
+/// 半导体 / 电子类行业（纳指隔夜联动惩罚范围）。
+fn is_tech_industry(industry: &str) -> bool {
+    industry.contains("半导体")
+        || industry.contains("电子")
+        || industry.contains("芯片")
+        || industry.contains("元件")
+        || industry.contains("光学")
+}
+
+/// 新闻关键词扫描：利好 +5 / 利空 −8 每条命中，净分 ±25 封顶。
+fn news_keyword_score(items: &[crate::model::NewsItem]) -> (f64, Option<String>) {
+    const POSITIVE: [&str; 9] = [
+        "中标", "订单", "回购", "增持", "预增", "突破", "签约", "上调", "涨停",
+    ];
+    const NEGATIVE: [&str; 8] = [
+        "减持", "质押", "诉讼", "问询", "处罚", "立案", "退市", "终止",
+    ];
+    let mut hits = 0.0_f64;
+    for item in items {
+        let text = format!("{}{}", item.title, item.summary);
+        for word in POSITIVE {
+            if text.contains(word) {
+                hits += 5.0;
+            }
+        }
+        for word in NEGATIVE {
+            if text.contains(word) {
+                hits -= 8.0;
+            }
+        }
+    }
+    let score = hits.clamp(-25.0, 25.0);
+    let tag = if hits > 0.0 {
+        Some("利好新闻".to_string())
+    } else if hits < 0.0 {
+        Some("利空新闻".to_string())
+    } else {
+        None
+    };
+    (score, tag)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PickError {
     #[error("network: {0}")]
@@ -245,7 +428,7 @@ fn ma_last(values: &[f64], period: usize) -> Option<f64> {
     Some(values[values.len() - period..].iter().sum::<f64>() / period as f64)
 }
 
-/// 技术面打分（0..90）。`None` = 硬性淘汰（数据不足 / 一字板 / 超买）。
+/// 技术面打分（0..110，含超买 / 超涨负分）。`None` = 硬性淘汰（数据不足 / 一字板 / RSI 超买）。
 /// bars: (date, open, close, high, low, volume) 中的 (date, close, high, low, volume)。
 pub fn score_bars(
     closes: &[f64],
@@ -335,7 +518,91 @@ pub fn score_bars(
         }
     }
 
+    // MACD 零上金叉：趋势内的回踩再启动（比零下金叉胜率高）
+    if golden && dif[len - 1] > 0.0 {
+        score += 5.0;
+        tags.push("零上金叉".into());
+    }
+
+    // KDJ（9 日）：近 3 根 K 上穿 D 金叉；J > 100 超买惩罚
+    let (k_series, d_series) = kdj_series(highs, lows, closes);
+    if k_series.len() >= 4 {
+        let mut kdj_golden = false;
+        for i in k_series.len().saturating_sub(3)..k_series.len() {
+            if i == 0 {
+                continue;
+            }
+            if k_series[i - 1] <= d_series[i - 1] && k_series[i] > d_series[i] {
+                kdj_golden = true;
+                break;
+            }
+        }
+        if kdj_golden {
+            score += 10.0;
+            tags.push("KDJ金叉".into());
+        }
+        let j = 3.0 * k_series[k_series.len() - 1] - 2.0 * d_series[k_series.len() - 1];
+        if j > 100.0 {
+            score -= 10.0;
+            tags.push("KDJ超买".into());
+        }
+    }
+
+    // BOLL(20,2)：中轨上方 / 突破上轨（非涨停式突破才算）
+    if n >= 20 {
+        let mid: f64 = closes[n - 20..].iter().sum::<f64>() / 20.0;
+        let variance: f64 = closes[n - 20..]
+            .iter()
+            .map(|c| (c - mid).powi(2))
+            .sum::<f64>()
+            / 20.0;
+        let upper = mid + 2.0 * variance.sqrt();
+        if close > mid {
+            score += 5.0;
+            tags.push("中轨上方".into());
+        }
+        if close > upper && pct < 7.0 {
+            score += 8.0;
+            tags.push("突破上轨".into());
+        }
+    }
+
+    // BIAS5 短期超涨惩罚（乖离 >8% 有回归压力）
+    if let Some(ma5) = ma_last(closes, 5) {
+        if ma5 > 0.0 {
+            let bias = (close - ma5) / ma5 * 100.0;
+            if bias > 8.0 {
+                score -= 8.0;
+                tags.push("短期超涨".into());
+            }
+        }
+    }
+
     Some(TechScore { score, tags })
+}
+
+/// KDJ（9 日 RSV，K/D 平滑系数 1/3）。返回 K / D 序列。
+fn kdj_series(highs: &[f64], lows: &[f64], closes: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let n = closes.len();
+    let mut k = Vec::with_capacity(n);
+    let mut d = Vec::with_capacity(n);
+    let (mut pk, mut pd) = (50.0_f64, 50.0_f64);
+    for i in 0..n {
+        if i >= 8 {
+            let hi = highs[i - 8..=i].iter().cloned().fold(f64::MIN, f64::max);
+            let lo = lows[i - 8..=i].iter().cloned().fold(f64::MAX, f64::min);
+            let rsv = if hi > lo {
+                (closes[i] - lo) / (hi - lo) * 100.0
+            } else {
+                50.0
+            };
+            pk = 2.0 / 3.0 * pk + rsv / 3.0;
+            pd = 2.0 / 3.0 * pd + pk / 3.0;
+        }
+        k.push(pk);
+        d.push(pd);
+    }
+    (k, d)
 }
 
 // ============================================================================
@@ -353,6 +620,18 @@ pub async fn generate_picks(
     if candidates.is_empty() {
         return Err(PickError::Parse("涨幅榜为空".into()));
     }
+
+    // 板块动量（候选池行业聚合）+ 隔夜美股情绪（拉取失败只降级跳过）
+    let (industry_avg, strong_industries) = industry_momentum(&candidates);
+    let us_sentiment: Option<UsSentiment> = state.us_index.fetch(&state.http).await.ok();
+    let (us_mood, us_tag) = us_sentiment
+        .as_ref()
+        .map(|s| s.mood_score())
+        .unwrap_or((0.0, None));
+    let semis_drag = us_sentiment
+        .as_ref()
+        .map(|s| s.semis_drag())
+        .unwrap_or(false);
 
     // ② 逐候选拉日 K（顺带落库 day_bar，给回测与复盘复用），300ms 间隔防限流
     let mut scored: Vec<(Candidate, TechScore)> = Vec::new();
@@ -398,6 +677,30 @@ pub async fn generate_picks(
     for (candidate, tech) in &scored {
         let mut score = tech.score;
         let mut tags = tech.tags.clone();
+
+        // 板块动量：强势行业 +15；行业均值 ≤0 减 10
+        if strong_industries.contains(&candidate.industry) {
+            score += 15.0;
+            tags.push("强势行业".into());
+        } else if industry_avg
+            .get(&candidate.industry)
+            .map(|avg| *avg <= 0.0)
+            .unwrap_or(false)
+        {
+            score -= 10.0;
+        }
+
+        // 隔夜美股：全局情绪 ±10；纳指跌超 1% 时半导体 / 电子类额外 −15
+        score += us_mood;
+        if let Some(tag) = &us_tag {
+            tags.push(tag.clone());
+        }
+        if semis_drag && is_tech_industry(&candidate.industry) {
+            score -= 15.0;
+            tags.push("隔夜纳指拖累".into());
+        }
+
+        // 研报评级（近 7 天）
         let report_rows: Vec<(i64, String, String)> = sqlx::query_as(
             "SELECT rating_change, rating, last_rating FROM research_report \
              WHERE code = ? AND publish_date >= ?",
@@ -418,20 +721,32 @@ pub async fn generate_picks(
         if downgraded {
             score -= 20.0;
         }
-        let news_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM news_item WHERE code = ? AND published_at >= ?",
-        )
-        .bind(&candidate.code)
-        .bind(since_news_ms - Duration::days(3).num_milliseconds())
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0);
-        if news_count >= 3 {
-            tags.push("新闻活跃".into());
+
+        // 新闻：当日拉取（落库复用）+ 关键词扫描 + 热度加分
+        match state.news.fetch(&state.http, &candidate.code, 10).await {
+            Ok(items) => {
+                if let Err(error) = crate::service::ingest::persist_news(&state.db, &items).await {
+                    tracing::warn!(code = %candidate.code, %error, "pick news persist failed");
+                }
+                let (news_score, news_tag) = news_keyword_score(&items);
+                score += news_score;
+                if let Some(tag) = news_tag {
+                    tags.push(tag);
+                }
+                if items.len() >= 3 {
+                    tags.push("新闻活跃".into());
+                }
+                score += (items.len().min(5)) as f64 * 2.0;
+            }
+            Err(error) => {
+                tracing::debug!(code = %candidate.code, %error, "pick news fetch failed");
+            }
         }
-        score += (news_count.min(5)) as f64 * 2.0;
         boosted.push((candidate.clone(), score, tags));
+        tokio::time::sleep(StdDuration::from_millis(300)).await;
     }
+    // 高胜率门槛：综合分 <60 不入选（宁缺毋滥，不足 5 只就少推）
+    boosted.retain(|(_, score, _)| *score >= 60.0);
     boosted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     boosted.truncate(10);
 
@@ -481,6 +796,11 @@ pub async fn generate_picks(
             "close": candidate.price,
             "pct": candidate.pct,
             "industry": candidate.industry,
+            "industry_avg": industry_avg.get(&candidate.industry),
+            "us": {
+                "djia": us_sentiment.as_ref().and_then(|s| s.djia_pct),
+                "ixic": us_sentiment.as_ref().and_then(|s| s.ixic_pct),
+            },
         });
         sqlx::query(
             "INSERT INTO daily_pick(date, code, name, rank, score, reasons, ai_note, meta, created_at) \
@@ -639,7 +959,9 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
                 samples: 0,
                 t5_win_rate: 0.0,
                 avg_t5_pct: 0.0,
+                tags: Vec::new(),
             },
+            market: serde_json::Value::Null,
         });
     }
     let rows: Vec<(String, String, String, i64, f64, String, String, String)> = sqlx::query_as(
@@ -649,7 +971,7 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     .bind(&date_key)
     .fetch_all(db)
     .await?;
-    let picks = rows
+    let picks: Vec<DailyPick> = rows
         .into_iter()
         .map(
             |(date, code, name, rank, score, reasons, ai_note, meta)| DailyPick {
@@ -688,6 +1010,51 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
             }
         }
     }
+    // 标签级回测：近 30 天有 outcome 的行，按 reasons 标签聚合 T+5 胜率
+    let tag_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT reasons, meta FROM daily_pick \
+         WHERE date >= ? AND json_extract(meta,'$.outcome.t5_pct') IS NOT NULL",
+    )
+    .bind(&since)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut tag_bucket: std::collections::HashMap<String, (i64, i64)> =
+        std::collections::HashMap::new();
+    for (reasons, meta) in &tag_rows {
+        let t5: Option<f64> = serde_json::from_str::<Value>(meta)
+            .ok()
+            .and_then(|m| m["outcome"]["t5_pct"].as_f64());
+        let Some(t5) = t5 else { continue };
+        let tags: Vec<String> = serde_json::from_str(reasons).unwrap_or_default();
+        for tag in tags {
+            let entry = tag_bucket.entry(tag).or_insert((0, 0));
+            entry.0 += 1;
+            if t5 > 0.0 {
+                entry.1 += 1;
+            }
+        }
+    }
+    let mut tag_stats: Vec<PickTagStat> = tag_bucket
+        .into_iter()
+        .map(|(tag, (samples, wins))| PickTagStat {
+            tag,
+            samples,
+            win_rate: if samples > 0 {
+                wins as f64 / samples as f64
+            } else {
+                0.0
+            },
+        })
+        .collect();
+    tag_stats.sort_by(|a, b| b.samples.cmp(&a.samples));
+    tag_stats.truncate(6);
+
+    // market 取首条 meta.us（生成时统一写入）
+    let market = picks
+        .first()
+        .and_then(|p| p.meta.get("us").cloned())
+        .unwrap_or(serde_json::Value::Null);
     Ok(PicksDocument {
         date: date_key,
         picks,
@@ -703,7 +1070,9 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
             } else {
                 0.0
             },
+            tags: tag_stats,
         },
+        market,
     })
 }
 
@@ -829,6 +1198,128 @@ mod tests {
         let codes = parse_ai_picks(text).unwrap();
         assert_eq!(codes, vec!["sh600519".to_string(), "sz300623".to_string()]);
         assert!(parse_ai_picks("没有 JSON").is_err());
+    }
+
+    #[test]
+    fn us_index_parse_and_mood() {
+        let body = r#"v_usDJI="200~DJI~.DJI~51682.64~51778.04~51826.78~858494006~0~0~51589.80~";
+v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
+        let us = parse_us_index(body);
+        assert!((us.djia_pct.unwrap() + 0.184).abs() < 0.01);
+        assert!((us.ixic_pct.unwrap() - 0.395).abs() < 0.01);
+        // 均值 ~0.1 → 无情绪标签
+        assert_eq!(us.mood_score().1, None);
+
+        let bear = UsSentiment {
+            djia_pct: Some(-1.5),
+            ixic_pct: Some(-2.0),
+        };
+        let (score, tag) = bear.mood_score();
+        assert_eq!(score, -10.0);
+        assert_eq!(tag.as_deref(), Some("隔夜美股偏空"));
+        assert!(bear.semis_drag());
+
+        let bull = UsSentiment {
+            djia_pct: Some(2.0),
+            ixic_pct: None,
+        };
+        assert_eq!(bull.mood_score().0, 10.0);
+        assert!(!bull.semis_drag());
+        assert_eq!(UsSentiment::default().mood_score().0, 0.0);
+    }
+
+    #[test]
+    fn industry_momentum_marks_strong_and_weak() {
+        let candidates: Vec<Candidate> = ["半导体", "半导体", "白酒", "银行"]
+            .iter()
+            .enumerate()
+            .flat_map(|(i, industry)| {
+                [
+                    Candidate {
+                        code: format!("sz30000{i}"),
+                        name: "甲".into(),
+                        price: 10.0,
+                        pct: if *industry == "半导体" { 5.0 } else { -1.0 },
+                        industry: industry.to_string(),
+                    },
+                    Candidate {
+                        code: format!("sz30001{i}"),
+                        name: "乙".into(),
+                        price: 10.0,
+                        pct: if *industry == "半导体" { 3.0 } else { 0.5 },
+                        industry: industry.to_string(),
+                    },
+                ]
+            })
+            .collect();
+        let (avg, strong) = industry_momentum(&candidates);
+        assert_eq!(avg.get("半导体").copied(), Some(4.0));
+        assert!(
+            strong.contains(&"半导体".to_string()),
+            "强势 = Top5 且均值 ≥2"
+        );
+        assert_eq!(strong.len(), 1, "白酒 0.5 / 银行 -0.25 不入强势");
+        assert!(
+            avg.get("银行").copied().unwrap_or(0.0) < 0.0,
+            "银行均值 ≤0 减分候选"
+        );
+    }
+
+    #[test]
+    fn news_keywords_score_positive_and_negative() {
+        let items = vec![
+            crate::model::NewsItem {
+                code: "sz300623".into(),
+                title: "公司中标 3.2 亿元订单".into(),
+                summary: "".into(),
+                media: "证券时报".into(),
+                url: "https://x".into(),
+                published_at: Utc::now(),
+            },
+            crate::model::NewsItem {
+                code: "sz300623".into(),
+                title: "股东减持计划".into(),
+                summary: "拟减持不超过 2%".into(),
+                media: "公告".into(),
+                url: "https://y".into(),
+                published_at: Utc::now(),
+            },
+        ];
+        // 中标 + 订单 = +10；减持 −8 → 净 +2
+        let (score, tag) = news_keyword_score(&items);
+        assert_eq!(score, 2.0);
+        assert_eq!(tag.as_deref(), Some("利好新闻"));
+        // 纯利空封顶
+        let bad: Vec<crate::model::NewsItem> = (0..5).map(|_| items[1].clone()).collect();
+        let (score2, tag2) = news_keyword_score(&bad);
+        assert_eq!(score2, -25.0, "负分封顶 -25");
+        assert_eq!(tag2.as_deref(), Some("利空新闻"));
+        // 无命中
+        let empty = vec![crate::model::NewsItem {
+            code: "x".into(),
+            title: "例行公告".into(),
+            summary: "".into(),
+            media: "".into(),
+            url: "".into(),
+            published_at: Utc::now(),
+        }];
+        assert_eq!(news_keyword_score(&empty).0, 0.0);
+    }
+
+    #[test]
+    fn kdj_and_boll_extend_tags() {
+        let (closes, highs, lows, volumes) = closes_up();
+        let tech = score_bars(&closes, &highs, &lows, &volumes).expect("上行序列应可评分");
+        assert!(
+            tech.tags.contains(&"中轨上方".to_string()),
+            "上行序列应在 BOLL 中轨上方：{:?}",
+            tech.tags
+        );
+        // KDJ 序列长度与取值范围（交替回调末端 K/D 关系不保证，只验边界）
+        let (k, d) = kdj_series(&highs, &lows, &closes);
+        assert_eq!(k.len(), closes.len());
+        assert!((0.0..=100.0).contains(k.last().unwrap()));
+        assert!((0.0..=100.0).contains(d.last().unwrap()));
     }
 
     #[test]
