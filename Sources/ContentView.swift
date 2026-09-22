@@ -440,6 +440,20 @@ struct ContentView: View {
                         .background(Color.primary.opacity(0.06), in: Capsule())
                         .help("个股涨跌与大盘多数方向对比")
                 }
+                // B.5：vs 主营板块（板块涨个股弱 → 橙提示；逆板块走强 → 蓝紫）
+                if let sector = store.primarySector, let boardPct = sector.changePct,
+                   store.quote.price > 0, boardPct != 0 {
+                    let verdict = SectorAlignment.judge(stockPct: store.quote.pct, boardPct: boardPct)
+                    if !verdict.text.isEmpty {
+                        Text("\(sector.name) \(String(format: "%+.1f", boardPct))% · \(verdict.text)")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(verdict.weak ? Color.orange : Color(red: 0.39, green: 0.82, blue: 1))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.primary.opacity(0.06), in: Capsule())
+                            .help("主营板块（\(sector.isPrecise ? "主营相关" : "概念")）当日涨跌 vs 个股；数据来自每日板块刷新")
+                    }
+                }
             }
 
             if store.boardIndices.isEmpty {

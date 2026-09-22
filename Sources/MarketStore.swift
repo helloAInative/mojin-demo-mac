@@ -82,6 +82,15 @@ final class MarketStore: ObservableObject {
     /// 智能止损 / 止盈建议（refreshDaily / 持仓变更时重算，不逐 tick）
     @Published var stopTakeAdvice: StopTakeAdvisor.Advice?
 
+    /// B.5：当前标的主营板块（is_precise 优先）。
+    var primarySector: GatewaySectorBoard? {
+        let boards = sectorBoards.sorted {
+            if $0.isPrecise != $1.isPrecise { return $0.isPrecise }
+            return ($0.changePct ?? -99) > ($1.changePct ?? -99)
+        }
+        return boards.first
+    }
+
     /// B.1：当日当前标的的 level 事件（分时图右侧栏）。
     var levelMarks: [LevelMark] {
         let stampFormatter = DateFormatter()
@@ -1860,6 +1869,16 @@ final class MarketStore: ObservableObject {
         if pos.takeProfit > 0 {
             lines.append(String(format: "止盈价：%.2f", pos.takeProfit))
         }
+        // B.5 板块联动证据：主营板块 vs 个股当日涨跌
+        if let sector = primarySector, let boardPct = sector.changePct, quote.pct != 0 {
+            let verdict = SectorAlignment.judge(stockPct: quote.pct, boardPct: boardPct)
+            lines.append(String(format: "主营板块：%@ 当日 %+.2f%%，个股 %+.2f%%（相对板块 %+.2f%%）",
+                                sector.name, boardPct, quote.pct, quote.pct - boardPct))
+            if !verdict.text.isEmpty {
+                lines.append("板块联动判定：\(verdict.text)。请评估该背离 / 跟随的持续性。")
+            }
+        }
+
         // 智能止损/止盈建议交给 AI 点评（数值由锚点公式决定，AI 只负责叙事复核）
         if let advice = stopTakeAdvice, advice.stop > 0 || advice.take > 0 {
             lines.append(String(format: "智能止损止盈建议：止损 %.2f（距现价 %.1f%%）止盈 %.2f 盈亏比 %.2f",

@@ -47,6 +47,27 @@ struct WatchHeatCell: Identifiable, Equatable {
     var id: String { code }
 }
 
+/// B.5 板块联动：主营板块 vs 个股当日涨跌的对比判定。
+enum SectorAlignment {
+    /// boardPct == nil 表示无板块数据（不打扰）。
+    static func judge(stockPct: Double, boardPct: Double?) -> (text: String, weak: Bool) {
+        guard let board = boardPct else { return ("", false) }
+        if board >= 0.5 && stockPct < 0 {
+            return ("板块涨个股弱", true)
+        }
+        if board <= -0.5 && stockPct > 0 {
+            return ("逆板块走强", false)
+        }
+        if stockPct <= board - 2 {
+            return ("明显弱于板块", true)
+        }
+        if stockPct >= board + 2 {
+            return ("强于板块", false)
+        }
+        return ("", false)
+    }
+}
+
 enum MarketError: Error {
     case badData
 }
