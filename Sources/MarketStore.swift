@@ -104,6 +104,59 @@ final class MarketStore: ObservableObject {
         }
     }
 
+    /// C.1 / C.4 共用的轻量 AI 建议状态（独立于完整 analyze，prompt 极短）。
+    @Published var quickAdviceText = ""
+    @Published var quickAdviceBusy = false
+    @Published var quickAdviceTitle = ""
+
+    /// 轻量建议：短 prompt（更保守的系统词），失败静默降级为空。
+    /// mode: "reverse"（C.1 撤单/加仓/不动）或 "trim"（C.4 减仓 0-100%）。
+    func quickAdvice(mode: String) async {
+        let cfg = settings.aiConfig
+        guard cfg.enabled,
+              cfg.providerId == "ollama" || !settings.aiAPIKey.trimmingCharacters(in: .whitespaces).isEmpty,
+              TokenPlanCatalog.isChat(cfg.model) else {
+            quickAdviceText = "AI 未配置，跳过建议（本地口径仅供参考）"
+            return
+        }
+        guard quote.price > 0 else { return }
+        guard !quickAdviceBusy else { return }
+        quickAdviceBusy = true
+        defer { quickAdviceBusy = false }
+        let pos = settings.position
+        let lines: [String]
+        if mode == "reverse" {
+            quickAdviceTitle = "反向校验（买单刚复制）"
+            lines = [
+                String(format: "现价 %.2f（今日 %+.2f%%）· MACD %@ · RSI %.0f",
+                        quote.price, quote.pct, signalText.title, lastRSI ?? 50),
+                String(format: "用户刚复制买单草稿：%.2f × %d 股；成本 %.3f、持仓 %.0f 股",
+                        ticketPrice, ticketQty, pos.cost, pos.shares),
+                "请给一句话结论：撤单 / 加仓 / 不动，三选一，附 15 字内理由。只输出这一句。",
+            ]
+        } else {
+            quickAdviceTitle = "AI 减仓建议"
+            lines = [
+                String(format: "现价 %.2f · 成本 %.3f · 浮盈 %+.1f%% · 持仓 %.0f 股（止损 %.2f / 止盈 %.2f）",
+                        quote.price, pos.cost, pnl?.pct ?? 0, pos.shares, pos.stopLoss, pos.takeProfit),
+                String(format: "今日 %+.2f%% · MACD %@ · 量比 %.1f",
+                        quote.pct, signalText.title, volRatio ?? 1.0),
+                "建议减仓 0-100% 的整数比例 + 15 字内理由，仅一句。保守优先，不确定就给低比例。",
+            ]
+        }
+        let prompt = lines.joined(separator: "\n")
+        do {
+            let provider = ProviderRegistry.resolve(
+                id: cfg.providerId, config: cfg, apiKey: settings.aiAPIKey)
+            let text = try await provider.chat(
+                system: "你是保守的 A 股风控助手，只输出一句结论，不给具体买卖指令措辞。",
+                user: prompt)
+            quickAdviceText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            quickAdviceText = "建议获取失败：\(error.localizedDescription)"
+        }
+    }
+
     /// B.5：当前标的主营板块（is_precise 优先）。
     var primarySector: GatewaySectorBoard? {
         let boards = sectorBoards.sorted {

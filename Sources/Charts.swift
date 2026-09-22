@@ -23,6 +23,8 @@ struct MinuteChart: View {
     var support: Double
     var resistance: Double
     var aiSignal: AILatestSignal? = nil
+    /// 放大模式展示 AI 事件文字；常规模式只保留三角提示。
+    var detailed: Bool = false
     /// 关键价位预警阈值（%），来自 settings.notifyConfig
     var levelLightPct: Double = 0.30
     var levelDeepPct: Double = 0.15
@@ -32,9 +34,12 @@ struct MinuteChart: View {
     var costLightPct: Double = 1.0
     /// B.1：当日 level 事件右侧栏（按时间戳竖列，颜色分 hit / 失效 / 等待中）
     var levelMarks: [LevelMark] = []
+    /// 单击图表时打开详细视图；详细视图本身不传入，避免重复弹出。
+    var onOpenDetail: (() -> Void)? = nil
 
     @State private var hoverIndex: Int? = nil
     @State private var hoverPoint: CGPoint = .zero
+    @Environment(\.displayScale) private var displayScale
 
     static let session: [String] = {
         var out: [String] = []
@@ -70,8 +75,12 @@ struct MinuteChart: View {
                             .onChanged { value in
                                 updateHover(at: value.location, in: geo.size)
                             }
-                            .onEnded { _ in
+                            .onEnded { value in
                                 hoverIndex = nil
+                                if abs(value.translation.width) < 3,
+                                   abs(value.translation.height) < 3 {
+                                    onOpenDetail?()
+                                }
                             }
                     )
 
@@ -128,10 +137,10 @@ struct MinuteChart: View {
 
     private func updateHover(at point: CGPoint, in size: CGSize) {
         guard !bars.isEmpty else { return }
-        let padL: CGFloat = 2
-        let padR: CGFloat = 2
+        let padL: CGFloat = 4
+        let padR: CGFloat = min(92, max(76, size.width * 0.14))
         let slots = CGFloat(max(Self.session.count - 1, 1))
-        let ratio = (point.x - padL) / max(size.width - padL - padR, 1)
+        let ratio = min(max((point.x - padL) / max(size.width - padL - padR, 1), 0), 1)
         let idx = Int(round(ratio * slots))
         hoverIndex = max(0, min(bars.count - 1, idx))
         hoverPoint = point
@@ -151,18 +160,27 @@ struct MinuteChart: View {
         minP -= pad
         maxP += pad
 
-        let padL: CGFloat = 2
-        let padR: CGFloat = 2
+        // 为右侧价格轴保留独立栏，避免价签覆盖走势图和 AI 标记。
+        let padL: CGFloat = 4
+        let padR: CGFloat = min(92, max(76, size.width * 0.14))
         let padT: CGFloat = 6
-        let padB: CGFloat = 4
+        let padB: CGFloat = 16
         let slots = CGFloat(max(Self.session.count - 1, 1))
 
+        func snap(_ value: CGFloat) -> CGFloat {
+            (value * displayScale).rounded() / max(displayScale, 1)
+        }
+
         func x(_ i: Int) -> CGFloat {
-            padL + CGFloat(i) / slots * (size.width - padL - padR)
+            snap(padL + CGFloat(i) / slots * (size.width - padL - padR))
         }
         func y(_ v: Double) -> CGFloat {
-            padT + (1 - (v - minP) / (maxP - minP)) * (size.height - padT - padB)
+            snap(padT + (1 - (v - minP) / (maxP - minP)) * (size.height - padT - padB))
         }
+
+        drawGrid(context: context,
+                 xLeft: padL, xRight: size.width - padR,
+                 yTop: padT, yBottom: size.height - padB)
 
         var prevLine = Path()
         prevLine.move(to: CGPoint(x: padL, y: y(prev)))
@@ -247,16 +265,19 @@ struct MinuteChart: View {
                          chartW: size.width - padL - padR,
                          padL: padL, padR: padR,
                          y: y, yMin: padT, yMax: size.height - padB,
-                         prev: prev)
+                         prev: prev,
+                         showLabels: detailed)
         }
 
         // Y 轴价格刻度（右贴文本，关键价位都用不同颜色）
         drawYAxisTicks(context: context,
                        y: y,
-                       xRight: size.width - padR,
+                       plotRight: size.width - padR,
+                       canvasRight: size.width - 4,
                        yMin: padT,
                        yMax: size.height - padB,
                        bars: bars,
+                       lastPrice: lastPrice,
                        prev: prev,
                        base: base,
                        support: support,
@@ -287,6 +308,27 @@ struct MinuteChart: View {
                        totalW: size.width - padL - padR)
     }
 
+    /// 轻量网格只帮助判断时间和价位，不与关键价位线抢视觉层级。
+    private func drawGrid(
+        context: GraphicsContext,
+        xLeft: CGFloat, xRight: CGFloat,
+        yTop: CGFloat, yBottom: CGFloat
+    ) {
+        for step in 1...3 {
+            let py = yTop + CGFloat(step) / 4 * (yBottom - yTop)
+            var line = Path()
+            line.move(to: CGPoint(x: xLeft, y: py))
+            line.addLine(to: CGPoint(x: xRight, y: py))
+            context.stroke(line, with: .color(.white.opacity(0.055)), lineWidth: 0.5)
+        }
+        let middle = (xLeft + xRight) / 2
+        var divider = Path()
+        divider.move(to: CGPoint(x: middle, y: yTop))
+        divider.addLine(to: CGPoint(x: middle, y: yBottom))
+        context.stroke(divider, with: .color(.white.opacity(0.09)),
+                       style: StrokeStyle(lineWidth: 0.6, dash: [2, 3]))
+    }
+
     /// 右侧栏：宽 ~20pt 竖列，每个事件按时间戳落位；hit=绿✓、失效=红×、等待=灰•。
     private func drawLevelRail(
         context: GraphicsContext,
@@ -301,14 +343,29 @@ struct MinuteChart: View {
         rail.move(to: CGPoint(x: railX - railW / 2, y: yTop))
         rail.addLine(to: CGPoint(x: railX - railW / 2, y: yBottom))
         context.stroke(rail, with: .color(.white.opacity(0.12)), lineWidth: 1)
-        // 交易时段映射：09:30-15:00（含午休折叠——用 session slot 而非线性时间）
+        // 交易时段映射：09:30-15:00（含午休折叠——用 session slot 而非线性时间）。
+        // 同一分钟先合并，相邻像素位置再聚类，避免密集事件叠成绿色长条和白字团。
         let slots = CGFloat(max(Self.session.count - 1, 1))
-        for mark in levelMarks {
-            guard mark.minute.count == 4,
-                  let h = Int(mark.minute.prefix(2)),
-                  let m = Int(mark.minute.suffix(2)) else { continue }
+        struct RailItem {
+            var y: CGFloat
+            var state: LevelMark.State
+            var leadSec: Int?
+            var count: Int
+        }
+        func statePriority(_ state: LevelMark.State) -> Int {
+            switch state {
+            case .hit: return 3
+            case .missed: return 2
+            case .waiting: return 1
+            }
+        }
+        var items: [RailItem] = []
+        for (minute, marks) in Dictionary(grouping: levelMarks, by: \.minute) {
+            guard minute.count == 4,
+                  let h = Int(minute.prefix(2)),
+                  let m = Int(minute.suffix(2)) else { continue }
             let timeMinutes = h * 60 + m
-            let slot = Self.session.firstIndex(of: mark.minute)
+            let slot = Self.session.firstIndex(of: minute)
             let ratio: CGFloat
             if let slot {
                 ratio = CGFloat(slot) / slots
@@ -317,32 +374,78 @@ struct MinuteChart: View {
                 let open = 9 * 60 + 30, close = 15 * 60
                 ratio = CGFloat(max(min(timeMinutes, close), open) - open) / CGFloat(close - open)
             }
-            let py = yTop + ratio * (yBottom - yTop)
+            let strongest = marks.max {
+                statePriority($0.state) < statePriority($1.state)
+            }?.state ?? .waiting
+            let lead = marks.compactMap(\.leadSec).filter { $0 > 0 }.min()
+            items.append(RailItem(y: yTop + ratio * (yBottom - yTop),
+                                  state: strongest,
+                                  leadSec: lead,
+                                  count: marks.count))
+        }
+
+        // 相距不足 11pt 的事件簇合并为一个带数量的状态标记。
+        var clusters: [RailItem] = []
+        for item in items.sorted(by: { $0.y < $1.y }) {
+            if var last = clusters.last, item.y - last.y < 11 {
+                clusters.removeLast()
+                let combinedCount = last.count + item.count
+                last.y = (last.y * CGFloat(last.count) + item.y * CGFloat(item.count)) / CGFloat(combinedCount)
+                last.count = combinedCount
+                if statePriority(item.state) > statePriority(last.state) { last.state = item.state }
+                if let lead = item.leadSec {
+                    last.leadSec = min(last.leadSec ?? lead, lead)
+                }
+                clusters.append(last)
+            } else {
+                clusters.append(item)
+            }
+        }
+
+        for item in clusters {
+            let py = min(max(item.y, yTop + 6), yBottom - 6)
             let color: Color = {
-                switch mark.state {
+                switch item.state {
                 case .hit: return Color(red: 0.2, green: 0.84, blue: 0.29)
                 case .missed: return Color(red: 1, green: 0.35, blue: 0.3)
                 case .waiting: return .gray
                 }
             }()
-            context.fill(Path(ellipseIn: CGRect(x: railX - 3.5, y: py - 3.5, width: 7, height: 7)),
-                         with: .color(color))
             let glyph: String = {
-                switch mark.state {
+                switch item.state {
                 case .hit: return "✓"
                 case .missed: return "×"
                 case .waiting: return "…"
                 }
             }()
-            let label = Text(glyph)
-                .font(.system(size: 7, weight: .bold))
+            let badgeText = glyph + (item.count > 1 ? "\(item.count)" : "")
+            let label = Text(badgeText)
+                .font(.system(size: 7, weight: .heavy, design: .rounded))
                 .foregroundColor(color)
-            context.draw(label, at: CGPoint(x: railX + railW / 2 - 2, y: py))
-            if mark.state == .hit, let lead = mark.leadSec, lead > 0 {
+            let resolved = context.resolve(label)
+            let size = resolved.measure(in: CGSize(width: 22, height: 10))
+            let badgeRect = CGRect(x: railX - size.width / 2,
+                                   y: py - size.height / 2,
+                                   width: size.width,
+                                   height: size.height)
+            let badge = Path(roundedRect: badgeRect.insetBy(dx: -3, dy: -1), cornerRadius: 4)
+            context.fill(badge, with: .color(.black.opacity(0.82)))
+            context.stroke(badge, with: .color(color.opacity(0.7)), lineWidth: 0.7)
+            context.draw(label, at: CGPoint(x: badgeRect.midX, y: badgeRect.midY))
+
+            if case .hit = item.state, let lead = item.leadSec, lead > 0 {
                 let leadText = Text(lead >= 60 ? "\(lead / 60)m" : "\(lead)s")
-                    .font(.system(size: 6))
-                    .foregroundColor(.secondary)
-                context.draw(leadText, at: CGPoint(x: railX - railW / 2 - 6, y: py))
+                    .font(.system(size: 7, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.82))
+                let leadResolved = context.resolve(leadText)
+                let leadSize = leadResolved.measure(in: CGSize(width: 24, height: 10))
+                let leadRect = CGRect(x: railX - railW / 2 - leadSize.width - 4,
+                                      y: py - leadSize.height / 2,
+                                      width: leadSize.width,
+                                      height: leadSize.height)
+                let leadBG = Path(roundedRect: leadRect.insetBy(dx: -2, dy: -1), cornerRadius: 3)
+                context.fill(leadBG, with: .color(.black.opacity(0.78)))
+                context.draw(leadText, at: CGPoint(x: leadRect.midX, y: leadRect.midY))
             }
         }
     }
@@ -355,11 +458,12 @@ struct MinuteChart: View {
         padL: CGFloat, padR: CGFloat,
         y: (Double) -> CGFloat,
         yMin: CGFloat, yMax: CGFloat,
-        prev: Double
+        prev: Double,
+        showLabels: Bool
     ) {
         guard !events.isEmpty else { return }
         let slots = CGFloat(max(Self.session.count - 1, 1))
-        for ev in events.prefix(6) {
+        for ev in events.prefix(showLabels ? 10 : 6) {
             // minuteOffset ∈ [0, session.count-1]；越界夹紧
             let offset = CGFloat(min(max(ev.minuteOffset, 0), Int(slots)))
             let ratio = offset / slots
@@ -386,6 +490,8 @@ struct MinuteChart: View {
             tri.closeSubpath()
             context.fill(tri, with: .color(color))
             context.stroke(tri, with: .color(.black.opacity(0.4)), lineWidth: 0.5)
+
+            guard showLabels else { continue }
 
             // 标签贴在顶部/底部，并加短虚线接到价位
             let tagText = ev.label
@@ -415,9 +521,11 @@ struct MinuteChart: View {
     private func drawYAxisTicks(
         context: GraphicsContext,
         y: (Double) -> CGFloat,
-        xRight: CGFloat,
+        plotRight: CGFloat,
+        canvasRight: CGFloat,
         yMin: CGFloat, yMax: CGFloat,
         bars: [MinuteBar],
+        lastPrice: Double,
         prev: Double,
         base: Double, support: Double, resistance: Double
     ) {
@@ -426,6 +534,7 @@ struct MinuteChart: View {
 
         struct Tick { let value: Double; let label: String; let color: Color }
         var ticks: [Tick] = []
+        if lastPrice > 0  { ticks.append(.init(value: lastPrice, label: "现", color: .yellow)) }
         if prev > 0       { ticks.append(.init(value: prev, label: "昨", color: .white.opacity(0.85))) }
         if high > prev    { ticks.append(.init(value: high, label: "高", color: Color(red: 1, green: 0.45, blue: 0.3))) }
         if low > 0 && low != prev { ticks.append(.init(value: low, label: "低", color: Color(red: 0.45, green: 0.92, blue: 0.5))) }
@@ -444,27 +553,46 @@ struct MinuteChart: View {
             }
         }.sorted { $0.value < $1.value }
 
-        // 在右侧另起一列（与 AI 标签错开）
-        let colX = xRight - 64
-        for t in merged {
-            let yPos = min(max(y(t.value), yMin + 6), yMax - 8)
+        // 右侧独立价格轴。先按目标 y 排序，再上下两遍避让，确保标签不重叠。
+        let rowHeight: CGFloat = 13
+        let minCenter = yMin + rowHeight / 2
+        let maxCenter = yMax - rowHeight / 2
+        var laidOut = merged.map { tick in
+            (tick: tick, center: min(max(y(tick.value), minCenter), maxCenter))
+        }.sorted { $0.center < $1.center }
+        if laidOut.count > 1 {
+            for i in 1..<laidOut.count {
+                laidOut[i].center = max(laidOut[i].center, laidOut[i - 1].center + rowHeight)
+            }
+            laidOut[laidOut.count - 1].center = min(laidOut.last!.center, maxCenter)
+            for i in stride(from: laidOut.count - 2, through: 0, by: -1) {
+                laidOut[i].center = min(laidOut[i].center, laidOut[i + 1].center - rowHeight)
+            }
+        }
+        let colX = plotRight + 5
+        let maxLabelWidth = max(canvasRight - colX, 44)
+        for item in laidOut {
+            let t = item.tick
+            let yPos = item.center
             let text = String(format: "%@%.2f", t.label, t.value)
             let attr = Text(text)
-                .font(.system(size: 9, weight: .semibold))
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
                 .monospacedDigit()
                 .foregroundColor(t.color)
             let resolved = context.resolve(attr)
-            let size = resolved.measure(in: CGSize(width: 64, height: 12))
+            let size = resolved.measure(in: CGSize(width: maxLabelWidth, height: rowHeight))
             let rect = CGRect(x: colX, y: yPos - size.height / 2,
-                              width: size.width, height: size.height)
-            let bg = Path(roundedRect: rect.insetBy(dx: -2, dy: -1), cornerRadius: 2)
-            context.fill(bg, with: .color(.black.opacity(0.55)))
+                              width: min(size.width, maxLabelWidth), height: size.height)
+            let bg = Path(roundedRect: rect.insetBy(dx: -3, dy: -1), cornerRadius: 3)
+            context.fill(bg, with: .color(.black.opacity(0.84)))
+            context.stroke(bg, with: .color(t.color.opacity(0.22)), lineWidth: 0.5)
             context.draw(attr, at: CGPoint(x: rect.midX, y: rect.midY))
             // 价位横虚线接到左轴（仅在 base/support/resistance 时画，避免画面嘈杂）
             if t.label.contains("基") || t.label.contains("阻") || t.label.contains("支") {
                 var line = Path()
-                line.move(to: CGPoint(x: 0, y: yPos))
-                line.addLine(to: CGPoint(x: colX - 2, y: yPos))
+                let actualY = y(t.value)
+                line.move(to: CGPoint(x: 0, y: actualY))
+                line.addLine(to: CGPoint(x: plotRight, y: actualY))
                 context.stroke(line,
                                with: .color(t.color.opacity(0.25)),
                                style: StrokeStyle(lineWidth: 0.5, dash: [2, 3]))
@@ -472,23 +600,20 @@ struct MinuteChart: View {
         }
     }
 
-    /// X 轴底部时间刻度：9:30 / 11:30 / 13:00 / 15:00。
+    /// X 轴底部时间刻度。午休在分时轴上折叠，因此中点合并显示。
     private func drawXAxisTicks(
         context: GraphicsContext,
         padL: CGFloat, padR: CGFloat,
         yBottom: CGFloat,
         totalW: CGFloat
     ) {
-        let markers: [(label: String, slot: Int)] = [
+        let markers: [(label: String, ratio: CGFloat)] = [
             ("9:30", 0),
-            ("11:30", 120),
-            ("13:00", 210),   // session = 9:30..11:30 (120 min) + 13:00..15:00 (120 min) = 240
-            ("15:00", 240)
+            ("11:30/13:00", 0.5),
+            ("15:00", 1)
         ]
-        let slots = CGFloat(max(Self.session.count - 1, 1))
         for m in markers {
-            let ratio = CGFloat(m.slot) / slots
-            let x = padL + ratio * totalW
+            let x = padL + m.ratio * totalW
             // 短竖线
             var tick = Path()
             tick.move(to: CGPoint(x: x, y: yBottom))
@@ -500,7 +625,7 @@ struct MinuteChart: View {
                 .monospacedDigit()
                 .foregroundColor(.white.opacity(0.65))
             let resolved = context.resolve(attr)
-            let size = resolved.measure(in: CGSize(width: 36, height: 10))
+            let size = resolved.measure(in: CGSize(width: 72, height: 10))
             let labelX = min(max(x - size.width / 2, padL), padL + totalW - size.width)
             context.draw(attr, at: CGPoint(x: labelX + size.width / 2,
                                            y: yBottom + 12))
@@ -604,32 +729,8 @@ struct MinuteChart: View {
                     )
                 }
 
-                // 预警角标：在右侧贴「⚠/🔴 距 X.XX 价 0.10%」
-                let badgeIcon = isDeep ? "🔴" : "⚠"
-                let priceText = String(format: "%@ 距 %.2f %.2f%%",
-                                       badgeIcon, lv.value, dist)
-                let attr = Text(priceText)
-                    .font(.system(size: 9, weight: .heavy))
-                    .monospacedDigit()
-                    .foregroundColor(isDeep ? .red : lv.color)
-                let resolved = context.resolve(attr)
-                let sSize = resolved.measure(in: CGSize(width: 110, height: 12))
-                let badgeY = y(lv.value) - sSize.height - 2
-                let badgeRect = CGRect(
-                    x: xRight - sSize.width - 4,
-                    y: badgeY,
-                    width: sSize.width,
-                    height: sSize.height
-                )
-                let bg = Path(roundedRect: badgeRect.insetBy(dx: -3, dy: -1), cornerRadius: 3)
-                context.fill(bg, with: .color(.black.opacity(0.75)))
-                let borderColor: Color = isDeep
-                    ? .red.opacity(0.7 + 0.3 * flashPhaseDeep)
-                    : lv.color.opacity(0.9)
-                context.stroke(bg,
-                               with: .color(borderColor),
-                               style: StrokeStyle(lineWidth: isDeep ? 1.2 : 0.8))
-                context.draw(attr, at: CGPoint(x: badgeRect.midX, y: badgeRect.midY))
+                // 价位与距离已在右侧独立价格轴及上方状态区展示；图内不再重复贴
+                // 大块预警文字，避免小高度下覆盖行情线。
             } else {
                 context.stroke(
                     p,
@@ -687,8 +788,8 @@ struct MinuteChart: View {
         context.draw(resolved, at: CGPoint(x: bx + tw / 2, y: yC))
     }
 
-    /// 在走势图最右侧绘制 AI 价位标记（▲/▼ + 标签 + 价格）。
-    /// 标签贴近价位纵坐标；过近则下移；超出可视区则夹紧。
+    /// 在走势图最右侧绘制 AI 价位三角。具体价格由右侧价格轴统一展示，
+    /// 避免 AI 标签与支撑/阻力/高低价重复堆叠。
     private func drawAIMarkers(
         context: GraphicsContext,
         markers: [AIMarker],
@@ -697,48 +798,14 @@ struct MinuteChart: View {
         area: CGRect
     ) {
         guard !markers.isEmpty else { return }
-        let tagFont = Font.system(size: 9, weight: .semibold)
-        let rowH: CGFloat = 12
-        let topY = area.minY + 1
-        var usedRows: [CGRect] = []
-        for (idx, m) in markers.enumerated() {
+        for m in markers {
             let isAbove = m.side == .above
             let color: Color = isAbove
                 ? Color(red: 1, green: 0.55, blue: 0.18)   // 阻力/基 暖色
                 : Color(red: 0.36, green: 0.78, blue: 1)   // 支撑/止 冷色
-            let priceText = String(format: "%.2f", m.price)
-            let labelText = "\(isAbove ? "▲" : "▼") \(m.label) \(priceText)"
-            let attrText = Text(labelText).font(tagFont).foregroundColor(color)
-            let resolved = context.resolve(attrText)
-            let size = resolved.measure(in: CGSize(width: 120, height: rowH))
-
-            // 标签纵向：贴价位纵坐标 ± 6
-            let rawY = y(m.price) + (isAbove ? -6 : 6)
-            var yPos = rawY
-            yPos = min(max(yPos, topY), area.maxY - size.height)
-
-            // 简易防重叠：若与已用行重叠，下移
-            var attempt = 0
-            while usedRows.contains(where: { abs($0.midY - yPos) < rowH * 0.9 }) && attempt < 4 {
-                yPos += rowH
-                if yPos > area.maxY - size.height { yPos = rawY }
-                attempt += 1
-            }
-            let labelRect = CGRect(x: xRight - size.width - 4,
-                                   y: yPos,
-                                   width: size.width,
-                                   height: size.height)
-            usedRows.append(labelRect)
-
-            // 画一个半透明圆角背景，提升可读性
-            let bgRect = labelRect.insetBy(dx: -3, dy: -1)
-            let bg = Path(roundedRect: bgRect, cornerRadius: 3)
-            context.fill(bg, with: .color(.black.opacity(0.55)))
-            context.draw(attrText, at: CGPoint(x: labelRect.midX, y: labelRect.midY))
-
-            // 在价位对应的纵坐标画一个小三角作为指北针
+            // 在价位对应的纵坐标画一个清晰的小三角。
             let triX = xRight - 6
-            let triY = y(m.price)
+            let triY = min(max(y(m.price), area.minY + 5), area.maxY - 5)
             var tri = Path()
             if isAbove {
                 tri.move(to: CGPoint(x: triX, y: triY - 4))
@@ -751,14 +818,7 @@ struct MinuteChart: View {
             }
             tri.closeSubpath()
             context.fill(tri, with: .color(color))
-
-            // 画一条短虚线连接标签与价位
-            var line = Path()
-            line.move(to: CGPoint(x: labelRect.minX - 2, y: labelRect.midY))
-            line.addLine(to: CGPoint(x: triX + 4, y: triY))
-            context.stroke(line, with: .color(color.opacity(0.5)),
-                           style: StrokeStyle(lineWidth: 0.6, dash: [2, 2]))
-            _ = idx // 预留 hook，便于后续按 idx 决定是否画线
+            context.stroke(tri, with: .color(.black.opacity(0.7)), lineWidth: 0.5)
         }
     }
 }

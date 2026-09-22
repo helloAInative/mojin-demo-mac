@@ -5,6 +5,289 @@ import UniformTypeIdentifiers
 private let trendUp = Color(red: 1, green: 0.27, blue: 0.23)
 private let trendDown = Color(red: 0.2, green: 0.84, blue: 0.29)
 
+private struct MinuteDetailSheet: View {
+    let name: String
+    let code: String
+    let quote: Quote
+    let bars: [MinuteBar]
+    let base: Double
+    let support: Double
+    let resistance: Double
+    let aiSignal: AILatestSignal?
+    let levelLightPct: Double
+    let levelDeepPct: Double
+    let cost: Double
+    let costLightPct: Double
+    let levelMarks: [LevelMark]
+    let volRatio: Double?
+
+    @Environment(\.dismiss) private var dismiss
+
+    private var last: MinuteBar? { bars.last }
+    private var currentPrice: Double { last?.price ?? quote.price }
+    private var previous: Double { quote.prev }
+    private var changePct: Double {
+        previous > 0 && currentPrice > 0 ? (currentPrice - previous) / previous * 100 : quote.pct
+    }
+    private var amplitude: Double {
+        previous > 0 && quote.high > 0 && quote.low > 0
+            ? (quote.high - quote.low) / previous * 100 : 0
+    }
+    private var totalVolume: Double { bars.reduce(0) { $0 + $1.vol } }
+    private var changeColor: Color {
+        changePct > 0 ? trendUp : (changePct < 0 ? trendDown : .primary)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(name.isEmpty ? code : name) · \(code)")
+                        .font(.system(size: 18, weight: .bold))
+                    Text("详细分时 · \(bars.count) 个数据点 · \(quote.timeText)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if !quote.source.isEmpty {
+                    Label(quote.source, systemImage: "antenna.radiowaves.left.and.right")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                Button("完成") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 4), spacing: 6) {
+                detailMetric("现价", currentPrice > 0 ? String(format: "%.2f", currentPrice) : "--", changeColor)
+                detailMetric("涨跌幅", currentPrice > 0 ? String(format: "%+.2f%%", changePct) : "--", changeColor)
+                detailMetric("均价", (last?.avg ?? 0) > 0 ? String(format: "%.2f", last!.avg) : "--", .yellow)
+                detailMetric("振幅", amplitude > 0 ? String(format: "%.2f%%", amplitude) : "--", .primary)
+                detailMetric("今开", quote.open > 0 ? String(format: "%.2f", quote.open) : "--", .primary)
+                detailMetric("最高", quote.high > 0 ? String(format: "%.2f", quote.high) : "--", trendUp)
+                detailMetric("最低", quote.low > 0 ? String(format: "%.2f", quote.low) : "--", trendDown)
+                detailMetric("分时量", totalVolume > 0 ? String(format: "%.0f", totalVolume) : "--", .primary)
+            }
+
+            MinuteChart(
+                bars: bars,
+                prev: previous > 0 ? previous : (bars.first?.price ?? 0),
+                base: base,
+                support: support,
+                resistance: resistance,
+                aiSignal: aiSignal,
+                detailed: true,
+                levelLightPct: levelLightPct,
+                levelDeepPct: levelDeepPct,
+                cost: cost,
+                costLightPct: costLightPct,
+                levelMarks: levelMarks
+            )
+            .frame(height: 350)
+            .background(Color.black.opacity(0.34), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(alignment: .topLeading) {
+                Text("拖动图表查看每分钟价格、均价、成交量与 AI 事件")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.white.opacity(0.5))
+                    .padding(7)
+            }
+
+            HStack(alignment: .top, spacing: 10) {
+                detailSection(title: "关键价位", systemImage: "scope") {
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
+                        levelRow("阻力", resistance, .orange)
+                        levelRow("基准", base, .cyan)
+                        levelRow("支撑", support, .green)
+                        levelRow("持仓成本", cost, .purple)
+                    }
+                    Text(String(format: "价位预警 %.2f%% / %.2f%%  ·  到本 %.2f%%",
+                                levelLightPct, levelDeepPct, costLightPct))
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+
+                detailSection(title: "AI 盘中观察", systemImage: "sparkles") {
+                    if let signal = aiSignal {
+                        HStack(spacing: 6) {
+                            Text(verdictText(signal.verdict))
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(verdictColor(signal.verdict))
+                            Text(signal.summary.isEmpty ? "暂无摘要" : signal.summary)
+                                .font(.system(size: 10))
+                                .lineLimit(2)
+                        }
+                        if !signal.keyPoints.isEmpty {
+                            Text(signal.keyPoints.prefix(3).map { "• " + $0 }.joined(separator: "   "))
+                                .font(.system(size: 9))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                        if !signal.risk.isEmpty {
+                            Text("风险：\(signal.risk)")
+                                .font(.system(size: 9, weight: .medium))
+                                .foregroundStyle(.orange)
+                                .lineLimit(2)
+                        }
+                    } else {
+                        Text("暂无 AI 盘中分析")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(volRatio.map { String(format: "当前量比 %.2f", $0) } ?? "量比数据不足")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack(alignment: .top, spacing: 10) {
+                detailSection(title: "AI 事件时间线", systemImage: "bolt.fill") {
+                    if let events = aiSignal?.events, !events.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 6) {
+                                ForEach(Array(events.prefix(12).enumerated()), id: \.offset) { _, event in
+                                    eventCard(event)
+                                }
+                            }
+                        }
+                    } else {
+                        Text("暂无结构化事件")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                detailSection(title: "今日价位预警", systemImage: "bell.badge") {
+                    if levelMarks.isEmpty {
+                        Text("暂无触发记录")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        HStack(spacing: 5) {
+                            ForEach(Array(levelMarks.suffix(8))) { mark in
+                                levelMarkBadge(mark)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .frame(minWidth: 820, idealWidth: 900, minHeight: 700)
+    }
+
+    private func detailMetric(_ title: String, _ value: String, _ color: Color) -> some View {
+        HStack {
+            Text(title).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).fontWeight(.bold).monospacedDigit().foregroundStyle(color)
+        }
+        .font(.system(size: 11))
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 7))
+    }
+
+    private func detailSection<Content: View>(
+        title: String,
+        systemImage: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(title, systemImage: systemImage)
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(.secondary)
+            content()
+        }
+        .padding(9)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 9))
+    }
+
+    private func levelRow(_ title: String, _ value: Double, _ color: Color) -> some View {
+        HStack(spacing: 5) {
+            Circle().fill(color).frame(width: 6, height: 6)
+            Text(title).foregroundStyle(.secondary)
+            Spacer()
+            Text(value > 0 ? String(format: "%.2f", value) : "--")
+                .fontWeight(.semibold).monospacedDigit().foregroundStyle(color)
+        }
+        .font(.system(size: 10))
+    }
+
+    private func eventCard(_ event: AIEvent) -> some View {
+        let color = event.isUpArrow ? trendUp : trendDown
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text(eventTime(event.minuteOffset))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Text(eventTitle(event.kind))
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(color)
+            }
+            Text(event.price > 0 ? String(format: "%.2f", event.price) : "--")
+                .font(.system(size: 12, weight: .bold, design: .monospaced))
+            Text(event.note.isEmpty ? (event.isUpArrow ? "向上信号" : "向下信号") : event.note)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+        }
+        .padding(7)
+        .frame(width: 116, alignment: .leading)
+        .background(color.opacity(0.09), in: RoundedRectangle(cornerRadius: 7))
+    }
+
+    private func levelMarkBadge(_ mark: LevelMark) -> some View {
+        let style: (String, Color) = {
+            switch mark.state {
+            case .hit: return ("✓", .green)
+            case .missed: return ("×", .red)
+            case .waiting: return ("…", .gray)
+            }
+        }()
+        return VStack(spacing: 2) {
+            Text(style.0).fontWeight(.bold).foregroundStyle(style.1)
+            Text(mark.minute.count == 4 ? "\(mark.minute.prefix(2)):\(mark.minute.suffix(2))" : mark.minute)
+                .font(.system(size: 8, design: .monospaced))
+        }
+        .padding(5)
+        .background(style.1.opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
+        .help(mark.title)
+    }
+
+    private func eventTime(_ offset: Int) -> String {
+        let index = min(max(offset, 0), MinuteChart.session.count - 1)
+        let minute = MinuteChart.session[index]
+        return "\(minute.prefix(2)):\(minute.suffix(2))"
+    }
+
+    private func eventTitle(_ kind: AIEvent.Kind) -> String {
+        switch kind {
+        case .breakout: return "突破"
+        case .breakdown: return "跌破"
+        case .volSpike: return "放量"
+        case .fakeout: return "假突破"
+        case .reversal: return "反转"
+        }
+    }
+
+    private func verdictText(_ verdict: AILatestSignal.Verdict) -> String {
+        switch verdict {
+        case .bull: return "偏多"
+        case .bear: return "偏空"
+        case .range: return "震荡"
+        }
+    }
+
+    private func verdictColor(_ verdict: AILatestSignal.Verdict) -> Color {
+        switch verdict {
+        case .bull: return trendUp
+        case .bear: return trendDown
+        case .range: return .orange
+        }
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var store: MarketStore
     @ObservedObject var settings: AppSettings
@@ -42,6 +325,11 @@ struct ContentView: View {
     /// B.4：逐笔面板展开 + 下钻选中的分钟
     @State private var showTicks = false
     @State private var tickDrillMinute: String?
+    /// C.1：反向校验弹窗（买单复制后）
+    @State private var reverseCheckTicketID: UUID?
+    @State private var reverseCountdown = 0
+    @State private var minuteChartExpanded = false
+    @State private var showMinuteDetail = false
     var embeddedInMenu: Bool = false
 
     enum ReviewKindFilter: Hashable {
@@ -122,6 +410,24 @@ struct ContentView: View {
         .sheet(isPresented: $showHealth) {
             HealthSheet(store: store)
         }
+        .sheet(isPresented: $showMinuteDetail) {
+            MinuteDetailSheet(
+                name: store.quote.name.isEmpty ? settings.currentSymbol.name : store.quote.name,
+                code: settings.currentSymbol.bareCode,
+                quote: store.quote,
+                bars: store.minutes,
+                base: store.base,
+                support: store.support,
+                resistance: store.resistance,
+                aiSignal: store.aiSignal,
+                levelLightPct: settings.notifyConfig.levelLightPct,
+                levelDeepPct: settings.notifyConfig.levelDeepPct,
+                cost: settings.position.cost,
+                costLightPct: settings.notifyConfig.costLightPct,
+                levelMarks: store.levelMarks,
+                volRatio: store.volRatio
+            )
+        }
         .onAppear {
             if settings.needsChangelog { showChangelog = true }
             consumePendingAction()
@@ -130,6 +436,26 @@ struct ContentView: View {
         }
         .onChange(of: store.pendingUIAction) { _ in
             consumePendingAction()
+        }
+        .onChange(of: store.lastCopiedTicketID) { id in
+            // C.1：复制的是买单草稿 → 弹 AI 反向校验（30 秒倒计时默认不动）
+            guard let id, let ticket = store.ticketHistory.first(where: { $0.id == id }),
+                  ticket.side == .buy else { return }
+            reverseCheckTicketID = id
+            reverseCountdown = 30
+            Task { await store.quickAdvice(mode: "reverse") }
+        }
+        .sheet(isPresented: Binding(
+            get: { reverseCheckTicketID != nil },
+            set: { if !$0 { reverseCheckTicketID = nil } }
+        )) {
+            reverseCheckSheet
+        }
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            if reverseCountdown > 0 {
+                reverseCountdown -= 1
+                if reverseCountdown == 0 { reverseCheckTicketID = nil }
+            }
         }
     }
 
@@ -1009,6 +1335,60 @@ struct ContentView: View {
         }
     }
 
+    /// C.1：买单复制后的 AI 反向校验弹窗（30 秒无操作默认不动）。
+    private var reverseCheckSheet: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("AI 反向校验")
+                    .font(.system(size: 13, weight: .bold))
+                Spacer()
+                Text("\(reverseCountdown)s 后默认不动")
+                    .font(.system(size: 10))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            if let id = reverseCheckTicketID,
+               let ticket = store.ticketHistory.first(where: { $0.id == id }) {
+                Text("刚复制的买单：\(ticket.oneLine)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            if store.quickAdviceBusy {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("AI 快评中…").font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+            } else if !store.quickAdviceText.isEmpty {
+                Text(store.quickAdviceText)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            } else {
+                Text("AI 未配置时跳过——本地口径：\(store.stopTakeAdvice.map { String(format: "止损 %.2f · 盈亏比 %.1f", $0.stop, $0.ratio) } ?? "未计算")")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            HStack {
+                Button("撤单/改单（去委托条）") {
+                    reverseCheckTicketID = nil
+                    tab = .trade
+                }
+                .controlSize(.regular)
+                Spacer()
+                Button("不动，关掉") {
+                    reverseCheckTicketID = nil
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            Text("倒计时结束 = 默认不动（防骚扰）；AI 结论仅参考，不自动执行任何动作。")
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(16)
+        .frame(width: 360, alignment: .leading)
+    }
+
     private func positionDetails(p: PositionNote, pnl: (amount: Double, pct: Double)) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("当前\(positionResultLabel(pnl.amount))")
@@ -1037,6 +1417,23 @@ struct ContentView: View {
                       systemImage: "doc.on.doc")
             }
             .font(.system(size: 11))
+            // C.4：AI 减仓建议（短 prompt，仅展示不下单）
+            Button {
+                Task { await store.quickAdvice(mode: "trim") }
+            } label: {
+                Label(store.quickAdviceBusy && store.quickAdviceTitle == "AI 减仓建议"
+                      ? "思考中…" : "AI 减仓建议",
+                      systemImage: "brain.head.profile")
+            }
+            .font(.system(size: 11))
+            .disabled(store.quickAdviceBusy)
+            .help("短 prompt 让 AI 给 0-100% 减仓比例 + 一句理由；仅参考，不自动下单")
+            if store.quickAdviceTitle == "AI 减仓建议", !store.quickAdviceText.isEmpty {
+                Text(store.quickAdviceText)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.accentColor)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(12)
         .frame(width: 250, alignment: .leading)
@@ -1198,6 +1595,20 @@ struct ContentView: View {
                 }
                 .controlSize(.mini)
                 .help("B.4：分时下方逐笔分钟柱（净买红/净卖绿），点击柱下钻该分钟逐笔明细")
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        minuteChartExpanded.toggle()
+                    }
+                } label: {
+                    Label(minuteChartExpanded ? "收起" : "放大",
+                          systemImage: minuteChartExpanded
+                          ? "arrow.down.right.and.arrow.up.left"
+                          : "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 9, weight: .semibold))
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.mini)
+                .help(minuteChartExpanded ? "收起分时图" : "放大分时图")
                 if store.tickBusy { ProgressView().controlSize(.mini) }
             }
             if showTicks {
@@ -1223,6 +1634,7 @@ struct ContentView: View {
                     }
                 }
             }
+            minuteSnapshot
             MinuteChart(
                 bars: store.minutes,
                 prev: store.quote.prev > 0 ? store.quote.prev : (store.minutes.first?.price ?? 0),
@@ -1230,14 +1642,16 @@ struct ContentView: View {
                 support: store.support,
                 resistance: store.resistance,
                 aiSignal: store.aiSignal,
+                detailed: minuteChartExpanded,
                 levelLightPct: settings.notifyConfig.levelLightPct,
                 levelDeepPct: settings.notifyConfig.levelDeepPct,
                 cost: settings.position.cost,
                 costLightPct: settings.notifyConfig.costLightPct,
-                levelMarks: store.levelMarks
+                levelMarks: store.levelMarks,
+                onOpenDetail: { showMinuteDetail = true }
             )
-            .frame(height: 96)
-            .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .frame(height: minuteChartExpanded ? 240 : 132)
+            .background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
             // B.2：日 K 多周期（分时下方，K 线 + MA5/10/20 + 成交量）
             VStack(alignment: .leading, spacing: 4) {
@@ -1278,6 +1692,38 @@ struct ContentView: View {
         }
         .padding(8)
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private var minuteSnapshot: some View {
+        let last = store.minutes.last
+        let price = last?.price ?? store.quote.price
+        let average = last?.avg ?? 0
+        let previous = store.quote.prev
+        let pct = previous > 0 && price > 0 ? (price - previous) / previous * 100 : store.quote.pct
+        let amplitude = previous > 0 && store.quote.high > 0 && store.quote.low > 0
+            ? (store.quote.high - store.quote.low) / previous * 100
+            : 0
+        return HStack(spacing: 5) {
+            minuteStat("现价", value: price > 0 ? String(format: "%.2f", price) : "--", color: pctColor(pct))
+            minuteStat("涨幅", value: price > 0 ? String(format: "%+.2f%%", pct) : "--", color: pctColor(pct))
+            minuteStat("均价", value: average > 0 ? String(format: "%.2f", average) : "--", color: Color(red: 1, green: 0.84, blue: 0.04))
+            minuteStat("振幅", value: amplitude > 0 ? String(format: "%.2f%%", amplitude) : "--", color: .primary)
+        }
+    }
+
+    private func minuteStat(_ title: String, value: String, color: Color) -> some View {
+        HStack(spacing: 3) {
+            Text(title)
+                .foregroundStyle(.tertiary)
+            Text(value)
+                .fontWeight(.semibold)
+                .monospacedDigit()
+                .foregroundStyle(color)
+        }
+        .font(.system(size: 9))
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 4)
+        .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
     }
 
     private var indicatorPanel: some View {
