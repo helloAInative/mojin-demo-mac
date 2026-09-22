@@ -65,7 +65,6 @@ struct MinuteChart: View {
                           flashPhase: phase,
                           flashPhaseDeep: (sin(t * 2 * .pi) + 1) / 2)
                     }
-                    .drawingGroup()
                     .gesture(
                         DragGesture(minimumDistance: 0)
                             .onChanged { value in
