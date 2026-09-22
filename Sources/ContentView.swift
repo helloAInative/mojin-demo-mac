@@ -2791,12 +2791,12 @@ struct ContentView: View {
         .frame(minHeight: 280, alignment: .top)
     }
 
-    /// A 股池智能推荐（复盘页）：四层漏斗产出 + T+5 胜率统计；点击行加自选并跳盯盘。
+    /// A 股池尾盘智能推荐：14:45 产出，主目标 T+1 正收益。
     private var picksCard: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("智能推荐 · A 股池")
+                    Text("尾盘智能推荐 · 目标 T+1")
                         .font(.system(size: 10, weight: .bold))
                     if let doc = store.picksDoc, !doc.picks.isEmpty {
                         Text(doc.date)
@@ -2812,7 +2812,7 @@ struct ContentView: View {
                     }
                     .controlSize(.mini)
                     .disabled(store.picksBusy)
-                    .help("重新生成当日推荐：涨幅榜 → 量化 → 研报/新闻 → AI 精排（AI 未配置则纯量化）")
+                    .help("重新生成当日推荐：涨幅榜 → 量化 → 研报/新闻 → AI 精排；通常需要 30–120 秒（AI 未配置则纯量化）")
                     Button("刷新") {
                         Task { await store.loadPicks() }
                     }
@@ -2821,23 +2821,37 @@ struct ContentView: View {
                 }
                 if let doc = store.picksDoc {
                     if doc.picks.isEmpty {
-                        Text("暂无推荐。工作日 15:30 后服务端自动生成，或点「AI 精排」立即跑一次。")
+                        Text("暂无推荐。工作日 14:45 自动生成尾盘候选，或点「AI 精排」立即刷新。")
                             .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
                     } else {
                         HStack(spacing: 8) {
                             if doc.samples > 0 {
-                                Text(String(format: "近30天 T+5 胜率 %.0f%%（%d 样本 · 平均 %+.1f%%）",
-                                            doc.t5WinRate * 100, doc.samples, doc.avgT5Pct))
+                                Text(String(format: "T+1 胜率 %.0f%%（%d 样本 · 平均 %+.1f%%）",
+                                            doc.t1WinRate * 100, doc.samples, doc.avgT1Pct))
                                     .font(.system(size: 9, weight: .semibold))
-                                    .foregroundStyle(doc.t5WinRate >= 0.5 ? .green : .orange)
-                                    .help("推荐日收盘 vs 5 个交易日后收盘的回测口径")
+                                    .foregroundStyle(doc.t1WinRate >= 0.5 ? .green : .orange)
+                                    .help("尾盘推荐基准价 vs 下一交易日收盘；近 30 天口径")
+                                if doc.t5Samples > 0 {
+                                    Text(String(format: "T+5 %.0f%%", doc.t5WinRate * 100))
+                                        .font(.system(size: 8))
+                                        .foregroundStyle(.tertiary)
+                                        .help("T+5 中线参考 · \(doc.t5Samples) 样本")
+                                }
                             } else {
-                                Text("回测样本积累中（推荐 7 天后自动回写 T+5 对照）")
+                                Text("T+1 样本积累中（下一交易日收盘后回写）")
                                     .font(.system(size: 9))
                                     .foregroundStyle(.tertiary)
                             }
-                            if let ixic = doc.market?.ixic {
+                            if let hint = doc.executeHint, !hint.isEmpty {
+                        Text(hint)
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(Color.orange)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color.orange.opacity(0.12), in: Capsule())
+                            .help("推荐基于当日行情；涨停已过滤，确保有买入窗口")
+                    }
+                    if let ixic = doc.market?.ixic {
                                 Text(String(format: "隔夜纳指 %+.1f%%", ixic))
                                     .font(.system(size: 9))
                                     .monospacedDigit()
@@ -2858,10 +2872,16 @@ struct ContentView: View {
                                         .background(
                                             (t.winRate >= 0.5 ? Color.green : Color.orange)
                                                 .opacity(0.1), in: Capsule())
-                                        .help("该标签近 30 天 T+5 胜率 · \(t.samples) 样本")
+                                        .help("该标签近 30 天 T+1 胜率 · \(t.samples) 样本")
                                 }
                                 Spacer(minLength: 0)
                             }
+                        }
+                        if doc.picks.contains(where: { abs($0.meta.autoWeight?.adjustment ?? 0) >= 0.05 }) {
+                            Label("已启用复盘学习调权（近30天 · 单标签≥30样本）",
+                                  systemImage: "brain.head.profile")
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundStyle(.purple)
                         }
                         ForEach(doc.picks) { pick in
                             pickRow(pick)
@@ -2920,6 +2940,31 @@ struct ContentView: View {
                         }
                     }
                     HStack(spacing: 4) {
+                        let entry = pickEntryStatus(pick)
+                        Text(entry.text)
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(entry.color)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(entry.color.opacity(0.12), in: Capsule())
+                        let strategy = pick.meta.plan?.strategy ?? "短线"
+                        Text(strategy)
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(strategyColor(strategy))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(strategyColor(strategy).opacity(0.12), in: Capsule())
+                        Text(pickTargetLabel(pick))
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+                        if let window = pick.meta.plan?.entryWindow, entry.text.contains("尾盘") {
+                            Text(window)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    HStack(spacing: 4) {
                         ForEach(pick.reasons.prefix(3), id: \.self) { tag in
                             Text(tag)
                                 .font(.system(size: 8))
@@ -2928,11 +2973,25 @@ struct ContentView: View {
                                 .padding(.vertical, 1)
                                 .background(Color.accentColor.opacity(0.1), in: Capsule())
                         }
-                        if let t5 = pick.meta.outcome?.t5Pct {
-                            Text(String(format: "T+5 %+.1f%%", t5))
+                        if let t1 = pick.meta.outcome?.t1Pct {
+                            Text(String(format: "T+1 %+.1f%%", t1))
                                 .font(.system(size: 8))
                                 .monospacedDigit()
-                                .foregroundStyle(t5 >= 0 ? trendUp : trendDown)
+                                .foregroundStyle(t1 >= 0 ? trendUp : trendDown)
+                        }
+                        if let adjustment = pick.meta.autoWeight?.adjustment,
+                           abs(adjustment) >= 0.05 {
+                            Text(String(format: "学习 %@%.1f", adjustment >= 0 ? "+" : "", adjustment))
+                                .font(.system(size: 8, weight: .semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(adjustment >= 0 ? Color.purple : Color.orange)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(
+                                    (adjustment >= 0 ? Color.purple : Color.orange).opacity(0.1),
+                                    in: Capsule()
+                                )
+                                .help(autoWeightHelp(pick.meta.autoWeight))
                         }
                         Spacer(minLength: 0)
                         Text(String(format: "%.0f分", pick.score))
@@ -2946,7 +3005,70 @@ struct ContentView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("\(pick.name) \(pick.code) · 基准日 \(pick.date)\n\(pick.reasons.joined(separator: " / ")) · 量化分 \(Int(pick.score))\(pick.aiNote.isEmpty ? "" : "\nAI：\(pick.aiNote)")\n点击加入自选并去盯盘（仅关注建议，不构成投资建议）")
+        .help(pickHelp(pick))
+    }
+
+    private var todayCNDateKey: String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: Date())
+    }
+
+    private func pickEntryStatus(_ pick: GatewayPick) -> (text: String, color: Color) {
+        guard pick.date == todayCNDateKey else {
+            return ("上一交易日推荐", .secondary)
+        }
+        let calendar = Calendar(identifier: .gregorian)
+        let cn = TimeZone(identifier: "Asia/Shanghai") ?? .current
+        let parts = calendar.dateComponents(in: cn, from: Date())
+        let minute = (parts.hour ?? 0) * 60 + (parts.minute ?? 0)
+        if minute < 15 * 60 {
+            return ("今日尾盘", .green)
+        }
+        if pick.meta.plan?.entryTiming == "next_session_pullback" {
+            return ("明日回踩", .orange)
+        }
+        return ("今日已收盘", .orange)
+    }
+
+    private func strategyColor(_ strategy: String) -> Color {
+        switch strategy {
+        case "做T": return .purple
+        case "中线": return .blue
+        default: return .orange
+        }
+    }
+
+    private func pickTargetLabel(_ pick: GatewayPick) -> String {
+        if pick.date == todayCNDateKey { return "目标：下一交易日上涨" }
+        if pick.meta.outcome?.t1Pct != nil { return "T+1 已验证" }
+        return "目标：下一交易日 T+1"
+    }
+
+    private func pickHelp(_ pick: GatewayPick) -> String {
+        let plan = pick.meta.plan
+        let entry = pickEntryStatus(pick).text
+        let strategy = plan?.strategy ?? "短线"
+        let exit = plan?.exitRule ?? "T+1 观察，不承诺次日上涨"
+        return "\(pick.name) \(pick.code) · \(entry) · \(strategy)\n目标：T+1 收盘正收益（概率筛选，非保证）\n计划：\(exit)\n\(pick.reasons.joined(separator: " / ")) · 综合分 \(Int(pick.score))\(pick.aiNote.isEmpty ? "" : "\nAI：\(pick.aiNote)")\n\(autoWeightHelp(pick.meta.autoWeight))\n点击加入自选并去盯盘（仅关注建议，不构成投资建议）"
+    }
+
+    private func autoWeightHelp(_ weight: GatewayPick.AutoWeight?) -> String {
+        guard let weight,
+              let adjustment = weight.adjustment,
+              abs(adjustment) >= 0.05 else {
+            return "历史样本未达自动调权门槛"
+        }
+        let evidence = (weight.tags ?? []).map {
+            String(format: "%@ %d样本/胜率%.0f%%/%@%.1f分",
+                   $0.tag, $0.samples, $0.winRate * 100,
+                   $0.delta >= 0 ? "+" : "", $0.delta)
+        }.joined(separator: "；")
+        return String(format: "复盘学习调权 %@%.1f分\n%@",
+                      adjustment >= 0 ? "+" : "", adjustment,
+                      evidence.isEmpty ? "无可展示标签证据" : evidence)
     }
 
     /// 历史回放（ROI #12 M2）：选交易日 → 归档分时喂 MinuteChart + 当日信号；导出 .json。

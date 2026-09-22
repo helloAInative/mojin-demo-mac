@@ -9,7 +9,7 @@ use crate::error::AppError;
 use crate::model::{Quote, ReviewContext, ScheduledReport, TicketSummary};
 use crate::service::ingest;
 use crate::state::AppState;
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Timelike, Utc, Weekday};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, TimeZone, Timelike, Utc, Weekday};
 use std::time::Duration;
 
 pub fn spawn_quote_scheduler(state: AppState) -> tokio::task::JoinHandle<()> {
@@ -93,6 +93,17 @@ mod tests {
         assert!(is_trading_session_at(monday_open));
         assert!(!is_trading_session_at(monday_lunch));
         assert!(!is_trading_session_at(saturday));
+    }
+
+    #[test]
+    fn tail_pick_window_opens_before_close() {
+        let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+        let before = tz.with_ymd_and_hms(2026, 9, 21, 14, 44, 0).unwrap();
+        let ready = tz.with_ymd_and_hms(2026, 9, 21, 14, 45, 0).unwrap();
+        let after = tz.with_ymd_and_hms(2026, 9, 21, 15, 30, 0).unwrap();
+        assert!(!tail_pick_window_open(before));
+        assert!(tail_pick_window_open(ready));
+        assert!(tail_pick_window_open(after), "错过尾盘窗口后仍应补生成");
     }
 }
 
@@ -1116,24 +1127,40 @@ pub fn pick_target_date(now: chrono::DateTime<FixedOffset>) -> NaiveDate {
     }
 }
 
-/// 工作日 15:30 后（榜单已定型）生成当日纯量化推荐；周末 / 节前自动补上一
-/// 交易日。已存在则跳过。随后顺带回写 T+5 回测。
+/// 工作日 14:45 后生成尾盘推荐，留出实际决策时间；错过窗口或周末时
+/// 仍会补生成，但客户端会标成“下一交易日回踩”。随后顺带渐进回写 T+1/T+5。
+fn tail_pick_window_open(now: chrono::DateTime<FixedOffset>) -> bool {
+    !matches!(now.weekday(), Weekday::Sat | Weekday::Sun)
+        && now.hour() * 60 + now.minute() >= 14 * 60 + 45
+}
+
 async fn maybe_generate_picks(state: &AppState) {
     let offset = FixedOffset::east_opt(CN_OFFSET_SECS).expect("valid UTC+8 offset");
     let now = Utc::now().with_timezone(&offset);
     let date = pick_target_date(now);
-    let today_final = date == now.date_naive() && now.hour() * 60 + now.minute() >= 15 * 60 + 30;
+    let today_tail = date == now.date_naive() && tail_pick_window_open(now);
     let catch_up = date != now.date_naive();
-    if today_final || catch_up {
+    if today_tail || catch_up {
         let date_key = date.format("%Y-%m-%d").to_string();
-        let exists: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM daily_pick WHERE date = ? LIMIT 1")
+        let latest_created: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(created_at) FROM daily_pick WHERE date = ?")
                 .bind(&date_key)
-                .fetch_optional(&state.db)
+                .fetch_one(&state.db)
                 .await
                 .ok()
                 .flatten();
-        if exists.is_none() {
+        let tail_start_ms = now
+            .timezone()
+            .from_local_datetime(&date.and_hms_opt(14, 40, 0).unwrap())
+            .single()
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or_default();
+        let needs_generate = if date == now.date_naive() {
+            latest_created.map(|ts| ts < tail_start_ms).unwrap_or(true)
+        } else {
+            latest_created.is_none()
+        };
+        if needs_generate {
             match crate::service::pick::generate_picks(state, date, None).await {
                 Ok(doc) => tracing::info!(
                     date = %date_key,

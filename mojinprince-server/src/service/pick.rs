@@ -10,10 +10,11 @@ use crate::model::pick::{AiRankConfig, DailyPick, PickStats, PickTagStat, PicksD
 use crate::model::DayBar;
 use crate::service::ai::{self, ChatMessage};
 use crate::state::AppState;
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Timelike, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::time::Duration as StdDuration;
 
 /// 新浪 A 股涨幅榜（东财 push2 断连时候选池 fallback；同属既有三源）。
@@ -91,6 +92,10 @@ fn filter_sina_rows(rows: Vec<SinaRow>) -> Vec<Candidate> {
             let price = row.trade.as_deref().and_then(|p| p.parse::<f64>().ok())?;
             let pct = row.changepercent?;
             if price <= 0.0 || price > 2000.0 {
+                return None;
+            }
+            // 涨停过滤（同东财口径）
+            if is_limit_up(&row.symbol, pct) {
                 return None;
             }
             Some(Candidate {
@@ -223,8 +228,13 @@ impl EastMoneyRanking {
             if price <= 0.0 || price > 2000.0 {
                 continue;
             }
+            let full_code = format!("{}{}", market_prefix(code), code);
+            // 涨停过滤（买入不可能成交）：主板 10%、创业板/科创板 20%
+            if is_limit_up(&full_code, pct) {
+                continue;
+            }
             out.push(Candidate {
-                code: format!("{}{}", market_prefix(code), code),
+                code: full_code,
                 name: name.to_string(),
                 price,
                 pct,
@@ -233,6 +243,17 @@ impl EastMoneyRanking {
         }
         Ok(out)
     }
+}
+
+/// 涨停判定：按板块代码前缀取涨跌幅上限（留 0.5% 容差应对数据延迟）。
+/// 创业板 30/68 开头 20%、科创板 68 开头 20%、北交所（东财不含）30%、其余 10%。
+fn is_limit_up(code: &str, pct: f64) -> bool {
+    let limit = if code.starts_with("sz30") || code.starts_with("sh68") {
+        19.5
+    } else {
+        9.5
+    };
+    pct >= limit
 }
 
 /// 东财 f12 是 6 位裸码：6 开头沪、其余深。
@@ -425,6 +446,112 @@ fn news_keyword_score(items: &[crate::model::NewsItem]) -> (f64, Option<String>)
         None
     };
     (score, tag)
+}
+
+// ============================================================================
+// A.4 复盘学习：标签胜率自动调权
+// ============================================================================
+
+#[derive(Debug, Clone)]
+struct TagPerformance {
+    samples: i64,
+    win_rate: f64,
+}
+
+/// 单标签调整：少于 30 样本不介入；30..60 样本线性增加置信度。
+/// 胜率 50% 为中性，单标签最多 ±10 分，防止小样本把技术分整体推翻。
+fn learned_tag_delta(samples: i64, win_rate: f64) -> f64 {
+    if samples < 30 || !win_rate.is_finite() {
+        return 0.0;
+    }
+    let confidence = (samples as f64 / 60.0).clamp(0.5, 1.0);
+    ((win_rate.clamp(0.0, 1.0) - 0.5) * 40.0 * confidence).clamp(-10.0, 10.0)
+}
+
+/// 返回（总调整分，可解释证据 JSON）。总调整限制在 ±20 分。
+fn learned_score_adjustment(
+    tags: &[String],
+    performance: &HashMap<String, TagPerformance>,
+) -> (f64, Value) {
+    let mut total = 0.0;
+    let mut evidence = Vec::new();
+    for tag in tags {
+        let Some(stat) = performance.get(tag) else {
+            continue;
+        };
+        let delta = learned_tag_delta(stat.samples, stat.win_rate);
+        if delta.abs() < 0.01 {
+            continue;
+        }
+        total += delta;
+        evidence.push(serde_json::json!({
+            "tag": tag,
+            "samples": stat.samples,
+            "win_rate": stat.win_rate,
+            "delta": delta,
+        }));
+    }
+    let adjustment = total.clamp(-20.0, 20.0);
+    (
+        adjustment,
+        serde_json::json!({
+            "adjustment": adjustment,
+            "tags": evidence,
+            "minimum_samples": 30,
+            "lookback_days": 30,
+        }),
+    )
+}
+
+/// 只使用推荐日之前的 T+1 结果，对齐“尾盘买、明日涨”的主目标，
+/// 并杜绝重跑当日推荐时的未来数据泄漏。
+async fn load_tag_performance(
+    db: &SqlitePool,
+    as_of: NaiveDate,
+) -> Result<HashMap<String, TagPerformance>, PickError> {
+    let since = (as_of - Duration::days(30)).format("%Y-%m-%d").to_string();
+    let before = as_of.format("%Y-%m-%d").to_string();
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT reasons, meta FROM daily_pick \
+         WHERE date >= ? AND date < ? \
+         AND json_extract(meta,'$.outcome.t1_pct') IS NOT NULL",
+    )
+    .bind(&since)
+    .bind(&before)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut bucket: HashMap<String, (i64, i64)> = HashMap::new();
+    for (reasons, meta) in rows {
+        let t1 = serde_json::from_str::<Value>(&meta)
+            .ok()
+            .and_then(|m| m["outcome"]["t1_pct"].as_f64());
+        let Some(t1) = t1 else { continue };
+        let tags: Vec<String> = serde_json::from_str(&reasons).unwrap_or_default();
+        for tag in tags {
+            let entry = bucket.entry(tag).or_insert((0, 0));
+            entry.0 += 1;
+            if t1 > 0.0 {
+                entry.1 += 1;
+            }
+        }
+    }
+    Ok(bucket
+        .into_iter()
+        .map(|(tag, (samples, wins))| {
+            (
+                tag,
+                TagPerformance {
+                    samples,
+                    win_rate: if samples > 0 {
+                        wins as f64 / samples as f64
+                    } else {
+                        0.0
+                    },
+                },
+            )
+        })
+        .collect())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -697,6 +824,50 @@ fn kdj_series(highs: &[f64], lows: &[f64], closes: &[f64]) -> (Vec<f64>, Vec<f64
 // ③④ 生成主流程
 // ============================================================================
 
+fn build_trade_plan(
+    date: NaiveDate,
+    now_cn: DateTime<FixedOffset>,
+    tags: &[String],
+    has_position: bool,
+) -> Value {
+    let momentum = tags.iter().any(|tag| {
+        matches!(
+            tag.as_str(),
+            "MACD金叉" | "零上金叉" | "放量" | "近20日高" | "突破上轨" | "KDJ金叉"
+        )
+    });
+    let strategy = if has_position {
+        "做T"
+    } else if momentum {
+        "短线"
+    } else {
+        "中线"
+    };
+    let before_close = now_cn.hour() * 60 + now_cn.minute() < 15 * 60;
+    let today_signal = date == now_cn.date_naive();
+    let (entry_timing, entry_label, entry_window) = if today_signal && before_close {
+        ("today_close", "今日尾盘", "14:45-14:57")
+    } else {
+        ("next_session_pullback", "下一交易日回踩", "09:35-10:30")
+    };
+    let exit_rule = match strategy {
+        "做T" => "仅适合已有底仓；新增仓按 T+1，次日冲高再减",
+        "中线" => "T+1 先验证强弱，趋势未破可观察 3-10 个交易日",
+        _ => "T+1 为主；次日冲高或收盘转弱时评估退出",
+    };
+    serde_json::json!({
+        "signal_date": date.format("%Y-%m-%d").to_string(),
+        "target": "T+1",
+        "objective": "next_day_positive_close",
+        "entry_timing": entry_timing,
+        "entry_label": entry_label,
+        "entry_window": entry_window,
+        "strategy": strategy,
+        "has_base_position": has_position,
+        "exit_rule": exit_rule,
+    })
+}
+
 /// 生成某基准日推荐。`ai` 为客户端透传配置（None = 纯量化，调度器路径）。
 /// 幂等：同日重复生成 DELETE + INSERT 全量刷新。
 pub async fn generate_picks(
@@ -704,6 +875,8 @@ pub async fn generate_picks(
     date: NaiveDate,
     ai_config: Option<&AiRankConfig>,
 ) -> Result<PicksDocument, PickError> {
+    let learned_performance = load_tag_performance(&state.db, date).await?;
+    let mut learned_meta: HashMap<String, Value> = HashMap::new();
     // 候选池：东财 push2 断连时切新浪榜（板块动量因子因无行业字段自动降级）
     let candidates = match state.pick_ranking.fetch(&state.http, 100).await {
         Ok(rows) if !rows.is_empty() => rows,
@@ -838,6 +1011,9 @@ pub async fn generate_picks(
                 tracing::debug!(code = %candidate.code, %error, "pick news fetch failed");
             }
         }
+        let (learned_adjustment, evidence) = learned_score_adjustment(&tags, &learned_performance);
+        score += learned_adjustment;
+        learned_meta.insert(candidate.code.clone(), evidence);
         boosted.push((candidate.clone(), score, tags));
         tokio::time::sleep(StdDuration::from_millis(300)).await;
     }
@@ -881,6 +1057,12 @@ pub async fn generate_picks(
 
     // 落库（同日全量刷新）
     let date_key = date.format("%Y-%m-%d").to_string();
+    let position_codes: Vec<String> =
+        sqlx::query_scalar("SELECT code FROM position WHERE shares > 0")
+            .fetch_all(&state.db)
+            .await
+            .unwrap_or_default();
+    let now_cn = Utc::now().with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap());
     let mut tx = state.db.begin().await?;
     sqlx::query("DELETE FROM daily_pick WHERE date = ?")
         .bind(&date_key)
@@ -888,6 +1070,7 @@ pub async fn generate_picks(
         .await?;
     let now_ms = Utc::now().timestamp_millis();
     for (rank, (candidate, score, tags)) in picks.iter().enumerate() {
+        let has_position = position_codes.iter().any(|code| code == &candidate.code);
         let meta = serde_json::json!({
             "close": candidate.price,
             "pct": candidate.pct,
@@ -897,6 +1080,13 @@ pub async fn generate_picks(
                 "djia": us_sentiment.as_ref().and_then(|s| s.djia_pct),
                 "ixic": us_sentiment.as_ref().and_then(|s| s.ixic_pct),
             },
+            "auto_weight": learned_meta.get(&candidate.code).cloned().unwrap_or_else(|| serde_json::json!({
+                "adjustment": 0.0,
+                "tags": [],
+                "minimum_samples": 30,
+                "lookback_days": 30,
+            })),
+            "plan": build_trade_plan(date, now_cn, tags, has_position),
         });
         sqlx::query(
             "INSERT INTO daily_pick(date, code, name, rank, score, reasons, ai_note, meta, created_at) \
@@ -915,7 +1105,16 @@ pub async fn generate_picks(
         .await?;
     }
     tx.commit().await?;
-    list_picks(&state.db, Some(&date_key)).await
+    let mut doc = list_picks(&state.db, Some(&date_key)).await?;
+    // 执行时机：15:00 前生成 → 当天下午可买入；之后 → 次日开盘买入
+    let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    let now_cn = chrono::Utc::now().with_timezone(&tz);
+    doc.execute_hint = if now_cn.hour() < 15 {
+        "当天下午可买入".to_string()
+    } else {
+        "次日开盘买入（次日开盘价可能高于推荐日收盘价）".to_string()
+    };
+    Ok(doc)
 }
 
 fn rating_starts_buy(rating: &str) -> bool {
@@ -975,12 +1174,12 @@ async fn ai_rank(
             tags.join("/")
         ));
     }
-    lines.push("请从中挑 5 只未来一周胜率最高的，按把握排序。".into());
+    lines.push("请从中挑选最适合今日尾盘关注、下一交易日收盘上涨概率最高的 5 只，按 T+1 把握排序；避免只适合中长线但隔日不确定的标的。".into());
     lines.push("只输出 JSON：{\"picks\":[{\"code\":\"sh600xxx\",\"note\":\"一句话理由\"}]}，不要多余文字。".into());
     let messages = vec![
         ChatMessage {
             role: "system".into(),
-            content: "你是严谨的 A 股短线研究员，只基于给定数据判断，不给投资建议措辞。".into(),
+            content: "你是严谨的 A 股尾盘选股研究员，主目标是 T+1 正收益概率；只基于给定数据判断，不给承诺性投资建议。".into(),
         },
         ChatMessage {
             role: "user".into(),
@@ -1053,11 +1252,15 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
             picks: Vec::new(),
             stats: PickStats {
                 samples: 0,
+                t1_win_rate: 0.0,
+                avg_t1_pct: 0.0,
+                t5_samples: 0,
                 t5_win_rate: 0.0,
                 avg_t5_pct: 0.0,
                 tags: Vec::new(),
             },
             market: serde_json::Value::Null,
+            execute_hint: String::new(),
         });
     }
     let rows: Vec<(String, String, String, i64, f64, String, String, String)> = sqlx::query_as(
@@ -1083,22 +1286,35 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
         )
         .collect();
 
-    // 回测统计：近 30 天有 outcome 的样本
+    // 回测统计：T+1 是主目标，T+5 保留为中线参考。
     let since = (Utc::now().date_naive() - Duration::days(30))
         .format("%Y-%m-%d")
         .to_string();
     let outcomes: Vec<String> = sqlx::query_scalar(
-        "SELECT meta FROM daily_pick WHERE date >= ? AND json_extract(meta,'$.outcome.t5_pct') IS NOT NULL",
+        "SELECT meta FROM daily_pick WHERE date >= ? AND (\
+         json_extract(meta,'$.outcome.t1_pct') IS NOT NULL OR \
+         json_extract(meta,'$.outcome.t5_pct') IS NOT NULL)",
     )
     .bind(&since)
     .fetch_all(db)
     .await?;
+    let mut t1_win = 0.0;
+    let mut t1_sum = 0.0;
+    let mut t1_samples = 0_i64;
     let mut t5_win = 0.0;
     let mut t5_sum = 0.0;
-    let samples = outcomes.len() as i64;
+    let mut t5_samples = 0_i64;
     for meta in &outcomes {
         if let Ok(value) = serde_json::from_str::<Value>(meta) {
+            if let Some(pct) = value["outcome"]["t1_pct"].as_f64() {
+                t1_samples += 1;
+                t1_sum += pct;
+                if pct > 0.0 {
+                    t1_win += 1.0;
+                }
+            }
             if let Some(pct) = value["outcome"]["t5_pct"].as_f64() {
+                t5_samples += 1;
                 t5_sum += pct;
                 if pct > 0.0 {
                     t5_win += 1.0;
@@ -1106,10 +1322,10 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
             }
         }
     }
-    // 标签级回测：近 30 天有 outcome 的行，按 reasons 标签聚合 T+5 胜率
+    // 标签级回测：按 reasons 聚合 T+1 胜率，直接服务隔日目标。
     let tag_rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT reasons, meta FROM daily_pick \
-         WHERE date >= ? AND json_extract(meta,'$.outcome.t5_pct') IS NOT NULL",
+         WHERE date >= ? AND json_extract(meta,'$.outcome.t1_pct') IS NOT NULL",
     )
     .bind(&since)
     .fetch_all(db)
@@ -1118,15 +1334,15 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     let mut tag_bucket: std::collections::HashMap<String, (i64, i64)> =
         std::collections::HashMap::new();
     for (reasons, meta) in &tag_rows {
-        let t5: Option<f64> = serde_json::from_str::<Value>(meta)
+        let t1: Option<f64> = serde_json::from_str::<Value>(meta)
             .ok()
-            .and_then(|m| m["outcome"]["t5_pct"].as_f64());
-        let Some(t5) = t5 else { continue };
+            .and_then(|m| m["outcome"]["t1_pct"].as_f64());
+        let Some(t1) = t1 else { continue };
         let tags: Vec<String> = serde_json::from_str(reasons).unwrap_or_default();
         for tag in tags {
             let entry = tag_bucket.entry(tag).or_insert((0, 0));
             entry.0 += 1;
-            if t5 > 0.0 {
+            if t1 > 0.0 {
                 entry.1 += 1;
             }
         }
@@ -1155,36 +1371,55 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
         date: date_key,
         picks,
         stats: PickStats {
-            samples,
-            t5_win_rate: if samples > 0 {
-                t5_win / samples as f64
+            samples: t1_samples,
+            t1_win_rate: if t1_samples > 0 {
+                t1_win / t1_samples as f64
             } else {
                 0.0
             },
-            avg_t5_pct: if samples > 0 {
-                t5_sum / samples as f64
+            avg_t1_pct: if t1_samples > 0 {
+                t1_sum / t1_samples as f64
+            } else {
+                0.0
+            },
+            t5_samples,
+            t5_win_rate: if t5_samples > 0 {
+                t5_win / t5_samples as f64
+            } else {
+                0.0
+            },
+            avg_t5_pct: if t5_samples > 0 {
+                t5_sum / t5_samples as f64
             } else {
                 0.0
             },
             tags: tag_stats,
         },
         market,
+        execute_hint: String::new(),
     })
 }
 
-/// 回测回写：推荐日 ≥ 7 个自然日前且 outcome 缺失的行，取推荐日后第 1 / 5 根
-/// 日 K 收盘（数据不足则跳过，下次再试）。每次至多处理最近 30 天内的行。
+/// 渐进回测回写：下一交易日先回写 T+1，第 5 个交易日后再补 T+5。
+/// 基准价优先使用生成时的尾盘候选价 `meta.close`，更贴近实际可买价。
 pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
-    let today = Utc::now().date_naive();
-    let cutoff = (today - Duration::days(7)).format("%Y-%m-%d").to_string();
+    let today = Utc::now()
+        .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap())
+        .date_naive();
+    let today_key = today.format("%Y-%m-%d").to_string();
+    let t5_cutoff = (today - Duration::days(7)).format("%Y-%m-%d").to_string();
     let since = (today - Duration::days(30)).format("%Y-%m-%d").to_string();
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT date, code FROM daily_pick \
-         WHERE date >= ? AND date <= ? AND json_extract(meta,'$.outcome.t5_pct') IS NULL \
+         WHERE date >= ? AND date < ? AND (\
+           json_extract(meta,'$.outcome.t1_pct') IS NULL OR \
+           (date <= ? AND json_extract(meta,'$.outcome.t5_pct') IS NULL)\
+         ) \
          ORDER BY date DESC",
     )
     .bind(&since)
-    .bind(&cutoff)
+    .bind(&today_key)
+    .bind(&t5_cutoff)
     .fetch_all(&state.db)
     .await?;
     let mut updated = 0usize;
@@ -1195,12 +1430,6 @@ pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
         let Some(index) = bars.iter().position(|b| b.date == *date) else {
             continue;
         };
-        if index + 5 >= bars.len() || bars[index].close <= 0.0 {
-            continue;
-        }
-        let base = bars[index].close;
-        let t1 = (bars[index + 1].close - base) / base * 100.0;
-        let t5 = (bars[index + 5].close - base) / base * 100.0;
         let meta: Value = sqlx::query_scalar("SELECT meta FROM daily_pick WHERE date=? AND code=?")
             .bind(date)
             .bind(code)
@@ -1209,11 +1438,36 @@ pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
             .and_then(|m: String| Ok(serde_json::from_str(&m).unwrap_or_default()))
             .unwrap_or_default();
         let mut meta = meta;
-        let outcome = serde_json::json!({ "t1_pct": t1, "t5_pct": t5 });
-        if let Some(map) = meta.as_object_mut() {
-            map.insert("outcome".into(), outcome);
-        } else {
-            meta = serde_json::json!({ "outcome": outcome });
+        let base = meta["close"].as_f64().unwrap_or(bars[index].close);
+        if base <= 0.0 {
+            continue;
+        }
+        if !meta.is_object() {
+            meta = serde_json::json!({});
+        }
+        let map = meta.as_object_mut().expect("meta normalized to object");
+        let outcome = map
+            .entry("outcome")
+            .or_insert_with(|| serde_json::json!({}));
+        if !outcome.is_object() {
+            *outcome = serde_json::json!({});
+        }
+        let outcome_map = outcome
+            .as_object_mut()
+            .expect("outcome normalized to object");
+        let mut changed = false;
+        if outcome_map.get("t1_pct").and_then(Value::as_f64).is_none() && index + 1 < bars.len() {
+            let t1 = (bars[index + 1].close - base) / base * 100.0;
+            outcome_map.insert("t1_pct".into(), serde_json::json!(t1));
+            changed = true;
+        }
+        if outcome_map.get("t5_pct").and_then(Value::as_f64).is_none() && index + 5 < bars.len() {
+            let t5 = (bars[index + 5].close - base) / base * 100.0;
+            outcome_map.insert("t5_pct".into(), serde_json::json!(t5));
+            changed = true;
+        }
+        if !changed {
+            continue;
         }
         sqlx::query("UPDATE daily_pick SET meta=? WHERE date=? AND code=?")
             .bind(meta.to_string())
@@ -1400,6 +1654,69 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
             published_at: Utc::now(),
         }];
         assert_eq!(news_keyword_score(&empty).0, 0.0);
+    }
+
+    #[test]
+    fn learned_weights_require_enough_samples_and_are_bounded() {
+        assert_eq!(learned_tag_delta(29, 1.0), 0.0, "30 样本前不调权");
+        assert!((learned_tag_delta(30, 0.7) - 4.0).abs() < 1e-9);
+        assert!((learned_tag_delta(60, 0.7) - 8.0).abs() < 1e-9);
+        assert_eq!(learned_tag_delta(100, 1.0), 10.0, "单标签上限 +10");
+        assert_eq!(learned_tag_delta(100, 0.0), -10.0, "单标签下限 -10");
+
+        let performance = HashMap::from([
+            (
+                "MACD金叉".to_string(),
+                TagPerformance {
+                    samples: 60,
+                    win_rate: 0.8,
+                },
+            ),
+            (
+                "放量".to_string(),
+                TagPerformance {
+                    samples: 80,
+                    win_rate: 0.9,
+                },
+            ),
+            (
+                "样本少".to_string(),
+                TagPerformance {
+                    samples: 12,
+                    win_rate: 1.0,
+                },
+            ),
+        ]);
+        let tags = vec!["MACD金叉".into(), "放量".into(), "样本少".into()];
+        let (adjustment, evidence) = learned_score_adjustment(&tags, &performance);
+        assert_eq!(adjustment, 20.0, "多标签总调整上限 +20");
+        assert_eq!(
+            evidence["tags"].as_array().unwrap().len(),
+            2,
+            "样本不足不进证据"
+        );
+        assert_eq!(evidence["minimum_samples"], 30);
+    }
+
+    #[test]
+    fn trade_plan_marks_entry_timing_and_strategy() {
+        use chrono::TimeZone;
+        let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 22).unwrap();
+        let before_close = tz.with_ymd_and_hms(2026, 9, 22, 14, 46, 0).unwrap();
+        let short = build_trade_plan(date, before_close, &["放量".into()], false);
+        assert_eq!(short["entry_timing"], "today_close");
+        assert_eq!(short["strategy"], "短线");
+        assert_eq!(short["target"], "T+1");
+
+        let with_base = build_trade_plan(date, before_close, &["放量".into()], true);
+        assert_eq!(with_base["strategy"], "做T");
+        assert_eq!(with_base["has_base_position"], true);
+
+        let after_close = tz.with_ymd_and_hms(2026, 9, 22, 15, 10, 0).unwrap();
+        let late = build_trade_plan(date, after_close, &["均线多头".into()], false);
+        assert_eq!(late["entry_timing"], "next_session_pullback");
+        assert_eq!(late["strategy"], "中线");
     }
 
     #[test]

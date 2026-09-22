@@ -32,15 +32,25 @@ pub struct PicksDocument {
     /// 生成时的市场环境（隔夜美股涨跌等）；缺省 {}
     #[serde(default)]
     pub market: serde_json::Value,
+    /// 执行时机提示：「当天下午可买入」或「次日开盘买入」
+    #[serde(default)]
+    pub execute_hint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PickStats {
     pub samples: i64,
-    /// T+5 收盘价高于推荐日收盘的比例（0..1）
+    /// 主目标：T+1 收盘价高于推荐日尾盘基准价的比例（0..1）。
+    #[serde(default)]
+    pub t1_win_rate: f64,
+    #[serde(default)]
+    pub avg_t1_pct: f64,
+    /// 兼容中线观察的 T+5 口径。
+    #[serde(default)]
+    pub t5_samples: i64,
     pub t5_win_rate: f64,
     pub avg_t5_pct: f64,
-    /// 标签级回测：哪个因子真的有效（按样本数降序，最多 6 条）
+    /// 标签级 T+1 回测：哪个因子更适合隔日目标。
     #[serde(default)]
     pub tags: Vec<PickTagStat>,
 }
@@ -49,7 +59,7 @@ pub struct PickStats {
 pub struct PickTagStat {
     pub tag: String,
     pub samples: i64,
-    /// 该标签下 T+5 为正的比例（0..1）
+    /// 该标签下 T+1 为正的比例（0..1）
     pub win_rate: f64,
 }
 

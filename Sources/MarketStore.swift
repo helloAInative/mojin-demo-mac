@@ -265,14 +265,16 @@ final class MarketStore: ObservableObject {
                 apiKey: settings.aiAPIKey,
                 model: cfg.model
             )
-            picksHint = ai == nil ? "AI 生成中…" : "AI 精排中…"
+            picksHint = "AI 精排中…通常需要 30–120 秒，请勿重复点击"
         } else {
             ai = nil
-            picksHint = "量化生成中（未配置 AI，跳过精排）"
+            picksHint = "量化生成中…通常需要 20–60 秒（未配置 AI，跳过精排）"
         }
         do {
             picksDoc = try await GatewayMarketClient.runPicks(ai: ai)
             picksHint = "已生成 · \(picksDoc?.date ?? "") · \(picksDoc?.picks.count ?? 0) 只"
+        } catch let error as URLError where error.code == .timedOut {
+            picksHint = "生成超过 4 分钟：请检查 AI 接口连通性，或关闭 AI 后使用纯量化生成"
         } catch {
             picksHint = "生成失败：\(error.localizedDescription)"
         }

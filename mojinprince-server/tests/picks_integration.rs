@@ -151,6 +151,12 @@ async fn picks_run_with_ai_ranks_and_persists() {
     assert_eq!(picks[0]["code"], "sz300623", "AI 顺序优先：{doc}");
     assert_eq!(picks[0]["rank"], 1);
     assert_eq!(picks[1]["code"], "sh600519");
+    assert_eq!(picks[0]["meta"]["plan"]["target"], "T+1");
+    assert_eq!(picks[0]["meta"]["plan"]["strategy"], "短线");
+    assert_eq!(
+        picks[0]["meta"]["plan"]["objective"],
+        "next_day_positive_close"
+    );
     assert!(
         picks[0]["reasons"]
             .as_array()
@@ -302,11 +308,14 @@ async fn backfill_writes_outcome_and_stats() {
     assert!((meta["outcome"]["t1_pct"].as_f64().unwrap() - t1).abs() < 1e-9);
     assert!((meta["outcome"]["t5_pct"].as_f64().unwrap() - t5).abs() < 1e-9);
 
-    // 统计：样本 1，t5 > 0 → win_rate 1.0
+    // 统计：主口径 T+1，同时保留 T+5 中线参考。
     let doc = service::pick::list_picks(&state.db, Some(&pick_date))
         .await
         .unwrap();
     assert_eq!(doc.stats.samples, 1);
+    assert!(doc.stats.t1_win_rate > 0.99);
+    assert!((doc.stats.avg_t1_pct - t1).abs() < 1e-9);
+    assert_eq!(doc.stats.t5_samples, 1);
     assert!(doc.stats.t5_win_rate > 0.99);
     assert!((doc.stats.avg_t5_pct - t5).abs() < 1e-9);
 }

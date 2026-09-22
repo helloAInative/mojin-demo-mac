@@ -19,7 +19,7 @@ pub struct PicksQuery {
     tag = "pick",
     params(PicksQuery),
     responses(
-        (status = 200, description = "当日推荐 + 近 30 天 T+5 回测统计", body = PicksDocument),
+        (status = 200, description = "当日尾盘推荐 + 近 30 天 T+1 主回测", body = PicksDocument),
     )
 )]
 #[get("/picks")]

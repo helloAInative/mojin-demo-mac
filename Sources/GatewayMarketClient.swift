@@ -235,6 +235,60 @@ struct GatewayPick: Codable, Equatable, Identifiable {
         var pct: Double?
         var industry: String?
         var outcome: Outcome?
+        var autoWeight: AutoWeight?
+        var plan: TradePlan?
+
+        enum CodingKeys: String, CodingKey {
+            case close, pct, industry, outcome, plan
+            case autoWeight = "auto_weight"
+        }
+    }
+
+    struct TradePlan: Codable, Equatable {
+        var signalDate: String?
+        var target: String?
+        var objective: String?
+        var entryTiming: String?
+        var entryLabel: String?
+        var entryWindow: String?
+        var strategy: String?
+        var hasBasePosition: Bool?
+        var exitRule: String?
+
+        enum CodingKeys: String, CodingKey {
+            case target, objective, strategy
+            case signalDate = "signal_date"
+            case entryTiming = "entry_timing"
+            case entryLabel = "entry_label"
+            case entryWindow = "entry_window"
+            case hasBasePosition = "has_base_position"
+            case exitRule = "exit_rule"
+        }
+    }
+
+    struct AutoWeight: Codable, Equatable {
+        var adjustment: Double?
+        var tags: [WeightEvidence]?
+        var minimumSamples: Int?
+        var lookbackDays: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case adjustment, tags
+            case minimumSamples = "minimum_samples"
+            case lookbackDays = "lookback_days"
+        }
+    }
+
+    struct WeightEvidence: Codable, Equatable {
+        var tag: String
+        var samples: Int
+        var winRate: Double
+        var delta: Double
+
+        enum CodingKeys: String, CodingKey {
+            case tag, samples, delta
+            case winRate = "win_rate"
+        }
     }
 
     struct Outcome: Codable, Equatable {
@@ -253,16 +307,22 @@ struct GatewayPick: Codable, Equatable, Identifiable {
     }
 }
 
-/// 推荐文档：当日清单 + 近 30 天 T+5 回测统计。
+/// 推荐文档：当日尾盘清单 + 近 30 天 T+1 主回测（T+5 中线参考）。
 struct GatewayPicksDocument: Decodable, Equatable {
     var date: String
     var picks: [GatewayPick]
     var samples: Int
+    var t1WinRate: Double
+    var avgT1Pct: Double
+    var t5Samples: Int
     var t5WinRate: Double
     var avgT5Pct: Double
 
     private enum StatsKeys: String, CodingKey {
         case samples
+        case t1WinRate = "t1_win_rate"
+        case avgT1Pct = "avg_t1_pct"
+        case t5Samples = "t5_samples"
         case t5WinRate = "t5_win_rate"
         case avgT5Pct = "avg_t5_pct"
         case tags
@@ -270,12 +330,15 @@ struct GatewayPicksDocument: Decodable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case date, picks, stats, market
+        case executeHint = "execute_hint"
     }
 
-    /// 标签级回测（哪个因子真的有效，按样本数降序 ≤6）
+    /// 标签级 T+1 回测（哪个因子更适合隔日目标，按样本数降序 ≤6）
     var tags: [TagStat]
     /// 隔夜美股（djia / ixic 涨跌 %）
     var market: MarketInfo?
+    /// 执行时机：「当天下午可买入」或「次日开盘买入…」
+    var executeHint: String?
 
     struct TagStat: Decodable, Equatable, Identifiable {
         var tag: String
@@ -295,10 +358,14 @@ struct GatewayPicksDocument: Decodable, Equatable {
     }
 
     init(date: String, picks: [GatewayPick], samples: Int, t5WinRate: Double, avgT5Pct: Double,
-         tags: [TagStat] = [], market: MarketInfo? = nil) {
+         tags: [TagStat] = [], market: MarketInfo? = nil,
+         t1WinRate: Double = 0, avgT1Pct: Double = 0, t5Samples: Int = 0) {
         self.date = date
         self.picks = picks
         self.samples = samples
+        self.t1WinRate = t1WinRate
+        self.avgT1Pct = avgT1Pct
+        self.t5Samples = t5Samples
         self.t5WinRate = t5WinRate
         self.avgT5Pct = avgT5Pct
         self.tags = tags
@@ -311,10 +378,14 @@ struct GatewayPicksDocument: Decodable, Equatable {
         picks = try c.decode([GatewayPick].self, forKey: .picks)
         let stats = try c.nestedContainer(keyedBy: StatsKeys.self, forKey: .stats)
         samples = (try? stats.decodeIfPresent(Int.self, forKey: .samples)) ?? 0
+        t1WinRate = (try? stats.decodeIfPresent(Double.self, forKey: .t1WinRate)) ?? 0
+        avgT1Pct = (try? stats.decodeIfPresent(Double.self, forKey: .avgT1Pct)) ?? 0
+        t5Samples = (try? stats.decodeIfPresent(Int.self, forKey: .t5Samples)) ?? 0
         t5WinRate = (try? stats.decodeIfPresent(Double.self, forKey: .t5WinRate)) ?? 0
         avgT5Pct = (try? stats.decodeIfPresent(Double.self, forKey: .avgT5Pct)) ?? 0
         tags = (try? stats.decodeIfPresent([TagStat].self, forKey: .tags)) ?? []
         market = try? c.decodeIfPresent(MarketInfo.self, forKey: .market)
+        executeHint = try? c.decodeIfPresent(String.self, forKey: .executeHint)
     }
 }
 
@@ -375,6 +446,15 @@ enum GatewayMarketClient {
         config.timeoutIntervalForRequest = 3.5
         config.timeoutIntervalForResource = 4
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: config)
+    }()
+    /// 选股会串行拉取候选日 K、消息面并调用模型，不能复用行情的 4 秒超时。
+    private static let picksSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 240
+        config.timeoutIntervalForResource = 300
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.waitsForConnectivity = true
         return URLSession(configuration: config)
     }()
     private static let circuit = GatewayCircuit()
@@ -598,7 +678,8 @@ enum GatewayMarketClient {
         var request = try await dataRequest(path: "picks/run", method: "POST")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(Body(ai: ai))
-        let (data, response) = try await session.data(for: request)
+        request.timeoutInterval = 240
+        let (data, response) = try await picksSession.data(for: request)
         guard let response = response as? HTTPURLResponse,
               (200..<300).contains(response.statusCode) else { throw GatewayError.badResponse }
         return try JSONDecoder().decode(GatewayPicksDocument.self, from: data)
