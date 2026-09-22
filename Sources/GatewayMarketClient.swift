@@ -329,7 +329,7 @@ struct GatewayPicksDocument: Decodable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case date, picks, stats, market
+        case date, picks, stats, market, execution
         case executeHint = "execute_hint"
     }
 
@@ -339,6 +339,8 @@ struct GatewayPicksDocument: Decodable, Equatable {
     var market: MarketInfo?
     /// 执行时机：「当天下午可买入」或「次日开盘买入…」
     var executeHint: String?
+    /// 真实执行口径（次日开盘买入统计）
+    var execution: ExecutionStats?
 
     struct TagStat: Decodable, Equatable, Identifiable {
         var tag: String
@@ -386,6 +388,25 @@ struct GatewayPicksDocument: Decodable, Equatable {
         tags = (try? stats.decodeIfPresent([TagStat].self, forKey: .tags)) ?? []
         market = try? c.decodeIfPresent(MarketInfo.self, forKey: .market)
         executeHint = try? c.decodeIfPresent(String.self, forKey: .executeHint)
+        execution = try? c.decodeIfPresent(ExecutionStats.self, forKey: .execution)
+    }
+}
+
+/// 真实执行口径统计（从次日开盘价计算）。
+struct ExecutionStats: Decodable, Equatable {
+    /// 平均执行溢价（次日开盘 vs 推荐日收盘，%）
+    var avgEntryGap: Double
+    var t1RealWinRate: Double
+    var avgT1Real: Double
+    var avgMaxDd: Double
+    var winLossRatio: Double
+
+    enum CodingKeys: String, CodingKey {
+        case avgEntryGap = "avg_entry_gap"
+        case t1RealWinRate = "t1_real_win_rate"
+        case avgT1Real = "avg_t1_real"
+        case avgMaxDd = "avg_max_dd"
+        case winLossRatio = "win_loss_ratio"
     }
 }
 

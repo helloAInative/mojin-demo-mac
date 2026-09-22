@@ -1263,6 +1263,7 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
                 t5_win_rate: 0.0,
                 avg_t5_pct: 0.0,
                 tags: Vec::new(),
+                execution: Default::default(),
             },
             market: serde_json::Value::Null,
             execute_hint: String::new(),
@@ -1367,6 +1368,69 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     tag_stats.sort_by(|a, b| b.samples.cmp(&a.samples));
     tag_stats.truncate(6);
 
+    // 真实执行口径统计（从 meta.outcome 提取）
+    let exec_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT meta FROM daily_pick \
+         WHERE date >= ? AND json_extract(meta,'$.outcome.t1_real') IS NOT NULL",
+    )
+    .bind(&since)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut gaps: Vec<f64> = Vec::new();
+    let mut t1_reals: Vec<f64> = Vec::new();
+    let mut dds: Vec<f64> = Vec::new();
+    let mut wins: Vec<f64> = Vec::new();
+    let mut losses: Vec<f64> = Vec::new();
+    for meta in &exec_rows {
+        if let Ok(v) = serde_json::from_str::<Value>(meta) {
+            let o = &v["outcome"];
+            if let Some(g) = o["entry_gap"].as_f64() {
+                gaps.push(g);
+            }
+            if let Some(r) = o["t1_real"].as_f64() {
+                t1_reals.push(r);
+                if r > 0.0 {
+                    wins.push(r);
+                } else {
+                    losses.push(r);
+                }
+            }
+            if let Some(d) = o["max_dd"].as_f64() {
+                dds.push(d);
+            }
+        }
+    }
+    let n = t1_reals.len() as i64;
+    let avg = |v: &[f64]| {
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
+    };
+    let execution = crate::model::pick::ExecutionStats {
+        avg_entry_gap: avg(&gaps),
+        t1_real_win_rate: if n > 0 {
+            t1_reals.iter().filter(|r| **r > 0.0).count() as f64 / n as f64
+        } else {
+            0.0
+        },
+        avg_t1_real: avg(&t1_reals),
+        avg_max_dd: avg(&dds),
+        win_loss_ratio: {
+            let w = avg(&wins);
+            let l = avg(&losses).abs();
+            if l > 0.0 {
+                w / l
+            } else if w > 0.0 {
+                99.0
+            } else {
+                0.0
+            }
+        },
+    };
+
     // market 取首条 meta.us（生成时统一写入）
     let market = picks
         .first()
@@ -1399,6 +1463,7 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
                 0.0
             },
             tags: tag_stats,
+            execution,
         },
         market,
         execute_hint: String::new(),
@@ -1461,14 +1526,47 @@ pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
             .as_object_mut()
             .expect("outcome normalized to object");
         let mut changed = false;
+        // 真实执行价：次日开盘（用户实际能买到的价格，涨停股尤其重要）
+        if outcome_map
+            .get("entry_open")
+            .and_then(Value::as_f64)
+            .is_none()
+            && index + 1 < bars.len()
+        {
+            let entry_open = bars[index + 1].open;
+            if entry_open > 0.0 {
+                let gap = (entry_open - base) / base * 100.0;
+                outcome_map.insert("entry_open".into(), serde_json::json!(entry_open));
+                outcome_map.insert("entry_gap".into(), serde_json::json!(gap));
+                changed = true;
+            }
+        }
+        let entry = outcome_map
+            .get("entry_open")
+            .and_then(Value::as_f64)
+            .unwrap_or(base);
         if outcome_map.get("t1_pct").and_then(Value::as_f64).is_none() && index + 1 < bars.len() {
             let t1 = (bars[index + 1].close - base) / base * 100.0;
+            let t1r = (bars[index + 1].close - entry) / entry * 100.0;
             outcome_map.insert("t1_pct".into(), serde_json::json!(t1));
+            outcome_map.insert("t1_real".into(), serde_json::json!(t1r));
             changed = true;
         }
         if outcome_map.get("t5_pct").and_then(Value::as_f64).is_none() && index + 5 < bars.len() {
             let t5 = (bars[index + 5].close - base) / base * 100.0;
+            let t5r = (bars[index + 5].close - entry) / entry * 100.0;
             outcome_map.insert("t5_pct".into(), serde_json::json!(t5));
+            outcome_map.insert("t5_real".into(), serde_json::json!(t5r));
+            // 持有期最大回撤（T+1 到 T+5 期间最低价 vs 真实买入价）
+            let min_low = bars[index + 1..=index + 5.min(bars.len() - 1)]
+                .iter()
+                .map(|b| b.low)
+                .filter(|l| *l > 0.0)
+                .fold(f64::MAX, f64::min);
+            if min_low < f64::MAX && entry > 0.0 {
+                let dd = (min_low - entry) / entry * 100.0;
+                outcome_map.insert("max_dd".into(), serde_json::json!(dd));
+            }
             changed = true;
         }
         if !changed {

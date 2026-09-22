@@ -53,6 +53,9 @@ pub struct PickStats {
     /// 标签级 T+1 回测：哪个因子更适合隔日目标。
     #[serde(default)]
     pub tags: Vec<PickTagStat>,
+    /// 真实执行口径（次日开盘买入，非收盘价）
+    #[serde(default)]
+    pub execution: ExecutionStats,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -61,6 +64,21 @@ pub struct PickTagStat {
     pub samples: i64,
     /// 该标签下 T+1 为正的比例（0..1）
     pub win_rate: f64,
+}
+
+/// 真实执行口径统计（从次日开盘价计算，不是推荐日收盘价）。
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema, Default)]
+pub struct ExecutionStats {
+    /// 平均执行溢价（次日开盘 vs 推荐日收盘，%）——涨停股高开吃利润
+    pub avg_entry_gap: f64,
+    /// 真实 T+1 胜率（从次日开盘价算）
+    pub t1_real_win_rate: f64,
+    /// 真实 T+1 平均收益
+    pub avg_t1_real: f64,
+    /// 平均最大回撤（持有期间最低价 vs 买入价）
+    pub avg_max_dd: f64,
+    /// 盈亏比（平均盈利 / |平均亏损|）
+    pub win_loss_ratio: f64,
 }
 
 /// `POST /api/v1/picks/run` 可选 body：客户端透传 AI 配置做精排。

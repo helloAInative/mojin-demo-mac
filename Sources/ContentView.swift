@@ -2851,6 +2851,29 @@ struct ContentView: View {
                             .background(Color.orange.opacity(0.12), in: Capsule())
                             .help("推荐基于当日行情；涨停已过滤，确保有买入窗口")
                     }
+                    if let exec = doc.execution, doc.samples > 0 {
+                        HStack(spacing: 8) {
+                            Text(String(format: "真实执行(次日开盘): 胜率 %.0f%% · 溢价 %+.1f%%",
+                                        exec.t1RealWinRate * 100, exec.avgEntryGap))
+                                .font(.system(size: 9))
+                                .monospacedDigit()
+                                .foregroundStyle(exec.t1RealWinRate >= 0.5 ? .green : .orange)
+                            if exec.avgMaxDd < 0 {
+                                Text(String(format: "最大回撤 %.1f%%", exec.avgMaxDd))
+                                    .font(.system(size: 9))
+                                    .monospacedDigit()
+                                    .foregroundStyle(.orange)
+                            }
+                            if exec.winLossRatio > 0 {
+                                Text(String(format: "盈亏比 %.1f", exec.winLossRatio))
+                                    .font(.system(size: 9))
+                                    .monospacedDigit()
+                                    .foregroundStyle(exec.winLossRatio >= 2 ? .green : .secondary)
+                            }
+                            Spacer()
+                        }
+                        .help("次日开盘实际买入价 vs 推荐日收盘价的统计——更贴近真实收益")
+                    }
                     if let ixic = doc.market?.ixic {
                                 Text(String(format: "隔夜纳指 %+.1f%%", ixic))
                                     .font(.system(size: 9))
