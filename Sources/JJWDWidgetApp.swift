@@ -38,6 +38,14 @@ final class NotificationClickHandler: NSObject, UNUserNotificationCenterDelegate
         default:
             action = Self.routeDefaultClick(payload)
         }
+        // D.2 通知审计：level 预警被点击 / 忽略（系统通知中心侧栏关闭不算操作）
+        if payload["kind"] == "level", let levelKey = payload["levelKey"] {
+            let userAction = response.actionIdentifier == UNNotificationDefaultActionIdentifier
+                ? "opened" : "dismissed"
+            DispatchQueue.main.async {
+                SignalTimeline.updateUserAction(levelKey: levelKey, code: code, action: userAction)
+            }
+        }
         if !code.isEmpty || action != "open" {
             DispatchQueue.main.async { self.onAction?(code, action, payload) }
         }

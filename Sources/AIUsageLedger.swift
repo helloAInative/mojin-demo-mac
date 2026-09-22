@@ -10,6 +10,8 @@ struct AIUsageEntry: Codable, Identifiable, Equatable {
     /// 粗算「Credits 感」：输出字数/100 + 固定起步，仅作体感非账单
     var creditFeel: Double
     var note: String
+    /// D.4：失败原因（ok=false 时截取错误前 60 字），旧数据解码容错
+    var failureReason: String = ""
 
     var clock: String {
         let f = DateFormatter()
@@ -44,12 +46,13 @@ enum AIUsageLedger {
     }
 
     @discardableResult
-    static func append(model: String, ok: Bool, fallback: Bool, elapsedMs: Int, outputChars: Int, note: String) -> AIUsageEntry {
+    static func append(model: String, ok: Bool, fallback: Bool, elapsedMs: Int, outputChars: Int,
+                       note: String, failureReason: String = "") -> AIUsageEntry {
         let feel = 0.3 + Double(max(outputChars, 1)) / 100.0 + (fallback ? 0 : 0.2)
         var list = load()
         let e = AIUsageEntry(
             id: UUID(), at: Date(), model: model, ok: ok, fallback: fallback,
-            elapsedMs: elapsedMs, creditFeel: feel, note: note
+            elapsedMs: elapsedMs, creditFeel: feel, note: note, failureReason: failureReason
         )
         list.insert(e, at: 0)
         if list.count > maxKeep { list = Array(list.prefix(maxKeep)) }

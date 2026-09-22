@@ -1335,6 +1335,25 @@ final class MarketStore: ObservableObject {
 
     /// 收盘复盘通知：工作日 15:05 后盯服务端日报生成（60s 心跳，生成即通知一次）。
     /// 行情 loop 收盘后停摆，所以独立成任务；点击通知跳复盘页。
+    /// D.3 误报率自调：同 levelKey 近 3 条全被忽略 → levelLightPct 收紧 30%（下限 0.10）。
+    /// 只在工作日 15:10 后检查一次（写回 AppSettings 即全局生效），30 天内重新命中恢复。
+    private func maybeTightenLevelAlerts() {
+        let keys = SignalTimeline.overAlertedLevelKeys()
+        guard !keys.isEmpty else { return }
+        var config = settings.notifyConfig
+        let old = config.levelLightPct
+        config.levelLightPct = max(0.10, old * 0.7)
+        guard config.levelLightPct < old else { return }
+        settings.setNotifyConfig(config)
+        logSignal(
+            kind: "alert",
+            title: "误报自调：收紧价位预警阈值",
+            body: String(format: "levelLightPct %.2f%% → %.2f%%（连续 3 条无动作：%@）",
+                         old * 100, config.levelLightPct * 100, keys.sorted().joined(separator: "、")),
+            why: "D.3：同价位反复提示无用户动作 → 自动收紧防骚扰；30 天内重新命中可恢复"
+        )
+    }
+
     private func pollReviewNotify() async {
         while !Task.isCancelled {
             var sleepSec: UInt64 = 600_000_000_000
@@ -1359,6 +1378,7 @@ final class MarketStore: ObservableObject {
         guard latest.periodKey == today else { return }
         settings.lastReviewNotifyDay = today
         settings.save()
+        maybeTightenLevelAlerts()
         flashAndNotify(
             title: "收盘复盘已生成",
             body: "\(latest.title) · 点击查看复盘",
@@ -1678,7 +1698,8 @@ final class MarketStore: ObservableObject {
                     }
                     AIUsageLedger.append(
                         model: model, ok: false, fallback: true, elapsedMs: ms,
-                        outputChars: fallback.count, note: msg
+                        outputChars: fallback.count, note: msg,
+                        failureReason: String(msg.prefix(60))
                     )
                     self.reloadAIUsage()
                     self.logSignal(

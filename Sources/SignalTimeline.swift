@@ -147,6 +147,49 @@ enum SignalTimeline {
         Task { try? await GatewayMarketClient.putSignal(updated) }
     }
 
+    /// D.3 误报率自调：同 levelKey 最近 3 条 level 事件全部无 opened 动作 → 收紧。
+    /// 返回需要收紧的 levelKey 集合（调用方把 levelLightPct × 0.7，下限 0.10）。
+    static func overAlertedLevelKeys(threshold: Int = 3) -> Set<String> {
+        let list = load().filter { $0.kind == "level" }
+        var byKey: [String: [SignalEvent]] = [:]
+        for event in list {
+            if let key = event.meta["levelKey"] {
+                byKey[key, default: []].append(event)
+            }
+        }
+        var out: Set<String> = []
+        for (key, events) in byKey {
+            let recent = events.prefix(threshold)
+            guard recent.count == threshold else { continue }
+            // opened 或 hit（价到了不算误报）都不算「被忽略」
+            if recent.allSatisfy({ $0.meta["userAction"] == nil && $0.meta["hit"] != "1" }) {
+                out.insert(key)
+            }
+        }
+        return out
+    }
+
+    /// D.2 通知审计：回写用户动作（opened / dismissed / sold 等）到最近一条
+    /// 同 levelKey + code 的 level 事件 meta（周报归因已有 ignore 计数，此为客户端侧）。
+    static func updateUserAction(levelKey: String, code: String, action: String) {
+        let list = load()
+        guard let idx = list.lastIndex(where: {
+            $0.kind == "level" && $0.code == code && $0.meta["levelKey"] == levelKey
+        }) else { return }
+        updateMeta(id: list[idx].id) { meta in
+            meta["userAction"] = action
+            meta["userActionAt"] = clockNow()
+        }
+    }
+
+    private static func clockNow() -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        f.dateFormat = "MM-dd HH:mm"
+        return f.string(from: Date())
+    }
+
     /// 服务端与本地缓存按 id 合并；同 id 以服务端为准，断网时不触碰本地数据。
     static func mergeRemote(_ remote: [SignalEvent]) -> [SignalEvent] {
         var merged = Dictionary(uniqueKeysWithValues: load().map { ($0.id, $0) })

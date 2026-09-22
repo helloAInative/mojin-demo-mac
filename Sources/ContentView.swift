@@ -606,12 +606,12 @@ struct ContentView: View {
         case review = "信号"
         var tip: String {
             switch self {
-            case .watch: return "行情与指标"
-            case .list: return "自选与分组"
-            case .trade: return "半自动委托条 · 国盛照抄"
-            case .ai: return "实时分析"
-            case .strat: return "条件与回测"
-            case .review: return "复盘与时间线"
+            case .watch: return "行情与指标 · ⌘1"
+            case .list: return "自选与分组 · ⌘2"
+            case .trade: return "半自动委托条 · ⌘3"
+            case .ai: return "实时分析 · ⌘4"
+            case .strat: return "条件与回测 · ⌘5"
+            case .review: return "复盘与时间线 · ⌘6"
             }
         }
     }
@@ -704,6 +704,22 @@ struct ContentView: View {
                 if reverseCountdown == 0 { reverseCheckTicketID = nil }
             }
         }
+        // E.3 快捷键：⌘1–6 切 tab、⌘R 立即分析、⌘T 委托条
+        .background(KeyboardCatcher(onKey: { combo in
+            switch combo {
+            case "cmd1": tab = .watch
+            case "cmd2": tab = .list
+            case "cmd3": tab = .trade
+            case "cmd4": tab = .ai
+            case "cmd5": tab = .strat
+            case "cmd6": tab = .review
+            case "cmdR": store.analyzeWithAI(force: true)
+            case "cmdT":
+                store.syncTicketFromMarket(forcePrice: true)
+                tab = .trade
+            default: break
+            }
+        }))
     }
 
     private var tabBar: some View {
@@ -1487,6 +1503,19 @@ struct ContentView: View {
                 Text("用量账本")
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(.secondary)
+                // D.4 健康度：今日成功率 / 平均耗时 / 最近失败原因
+                let today = store.aiUsage.filter { Calendar.current.isDateInToday($0.at) }
+                if !today.isEmpty {
+                    let ok = today.filter(\.ok).count
+                    let avg = today.reduce(0) { $0 + $1.elapsedMs } / today.count
+                    let fail = today.filter { !$0.ok && !$0.failureReason.isEmpty }
+                        .prefix(2).map(\.failureReason).joined(separator: " / ")
+                    Text(String(format: "今日 %d/%d · 均%dms", ok, today.count, avg))
+                        .font(.system(size: 9, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(Double(ok) / Double(today.count) >= 0.8 ? .green : .orange)
+                        .help(fail.isEmpty ? "无失败" : "最近失败：\(fail)")
+                }
                 Text(String(format: "今日感 %.1f", store.aiTodayFeel))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
@@ -4139,6 +4168,35 @@ struct TokenPlanModelPicker: View {
             Text("共 \(source.count) 个可选 · 当前 \(selection.isEmpty ? "未选" : selection)")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
+        }
+    }
+}
+
+/// E.3：面板内键盘监听（NSViewRepresentable，⌘ 组合不与系统冲突）。
+struct KeyboardCatcher: NSViewRepresentable {
+    var onKey: (String) -> Void
+
+    func makeNSView(context: Context) -> KeyView {
+        let view = KeyView()
+        view.onKey = onKey
+        return view
+    }
+
+    func updateNSView(_ view: KeyView, context: Context) {
+        view.onKey = onKey
+    }
+
+    final class KeyView: NSView {
+        var onKey: ((String) -> Void)?
+
+        override var acceptsFirstResponder: Bool { true }
+
+        override func keyDown(with event: NSEvent) {
+            if event.modifierFlags.contains(.command),
+               let key = event.charactersIgnoringModifiers?.uppercased() {
+                onKey?("cmd" + key)
+            }
+            super.keyDown(with: event)
         }
     }
 }
