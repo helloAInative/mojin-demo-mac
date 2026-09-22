@@ -94,16 +94,14 @@ fn filter_sina_rows(rows: Vec<SinaRow>) -> Vec<Candidate> {
             if price <= 0.0 || price > 2000.0 {
                 return None;
             }
-            // 涨停过滤（同东财口径）
-            if is_limit_up(&row.symbol, pct) {
-                return None;
-            }
+            let lu = is_limit_up(&row.symbol, pct);
             Some(Candidate {
                 code: row.symbol,
                 name: row.name,
                 price,
                 pct,
                 industry: String::new(),
+                is_limit_up: lu,
             })
         })
         .collect()
@@ -172,6 +170,8 @@ pub struct Candidate {
     pub price: f64,
     pub pct: f64,
     pub industry: String,
+    /// 涨停（无法当日买入，标「次日开盘买入」）
+    pub is_limit_up: bool,
 }
 
 impl EastMoneyRanking {
@@ -229,16 +229,14 @@ impl EastMoneyRanking {
                 continue;
             }
             let full_code = format!("{}{}", market_prefix(code), code);
-            // 涨停过滤（买入不可能成交）：主板 10%、创业板/科创板 20%
-            if is_limit_up(&full_code, pct) {
-                continue;
-            }
+            let limit_up = is_limit_up(&full_code, pct);
             out.push(Candidate {
                 code: full_code,
                 name: name.to_string(),
                 price,
                 pct,
                 industry: row["f100"].as_str().unwrap_or("").to_string(),
+                is_limit_up: limit_up,
             });
         }
         Ok(out)
@@ -947,6 +945,12 @@ pub async fn generate_picks(
         let mut score = tech.score;
         let mut tags = tech.tags.clone();
 
+        // 涨停降权（-15）：不淘汰——好标的保留但标「次日开盘买入」
+        if candidate.is_limit_up {
+            score -= 15.0;
+            tags.push("涨停".into());
+        }
+
         // 板块动量：强势行业 +15；行业均值 ≤0 减 10
         if strong_industries.contains(&candidate.industry) {
             score += 15.0;
@@ -1076,6 +1080,7 @@ pub async fn generate_picks(
             "pct": candidate.pct,
             "industry": candidate.industry,
             "industry_avg": industry_avg.get(&candidate.industry),
+            "is_limit_up": candidate.is_limit_up,
             "us": {
                 "djia": us_sentiment.as_ref().and_then(|s| s.djia_pct),
                 "ixic": us_sentiment.as_ref().and_then(|s| s.ixic_pct),
@@ -1591,6 +1596,7 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
                         price: 10.0,
                         pct: if *industry == "半导体" { 5.0 } else { -1.0 },
                         industry: industry.to_string(),
+                        is_limit_up: false,
                     },
                     Candidate {
                         code: format!("sz30001{i}"),
@@ -1598,6 +1604,7 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
                         price: 10.0,
                         pct: if *industry == "半导体" { 3.0 } else { 0.5 },
                         industry: industry.to_string(),
+                        is_limit_up: false,
                     },
                 ]
             })
