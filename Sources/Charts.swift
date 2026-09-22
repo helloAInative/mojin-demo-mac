@@ -863,7 +863,7 @@ struct MACDChart: View {
                                               height: size.height - padT - padB))
             }
         }
-        .drawingGroup()
+        // drawingGroup：离屏光栅化在 Retina 下会糊，Canvas 直绘即可
     }
 
     /// MACD 专用：竖排 AI 价位标签，无价位纵坐标轴，因此只画标签。
@@ -986,7 +986,7 @@ struct LineTripleChart: View {
                                                 height: size.height - padT - padB))
             }
         }
-        .drawingGroup()
+        // drawingGroup：离屏光栅化在 Retina 下会糊，Canvas 直绘即可
     }
 
     /// 顶部竖排 AI 价位标签（KDJ/RSI 顶部的小行）。
@@ -1101,7 +1101,7 @@ struct VolumeChart: View {
                 }
             }
         }
-        .drawingGroup()
+        // drawingGroup：离屏光栅化在 Retina 下会糊，Canvas 直绘即可
     }
 }
 
@@ -1123,7 +1123,7 @@ struct AccuracyTrendChart: View {
                 Canvas { context, size in
                     draw(context: context, size: size)
                 }
-                .drawingGroup()
+                // drawingGroup：离屏光栅化在 Retina 下会糊，Canvas 直绘即可
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { value in
@@ -1284,7 +1284,7 @@ struct DayChart: View {
                 Canvas { context, size in
                     draw(context: context, size: size)
                 }
-                .drawingGroup()
+                // drawingGroup：离屏光栅化在 Retina 下会糊，Canvas 直绘即可
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { value in
@@ -1521,7 +1521,7 @@ struct TickChart: View {
                 Canvas { context, size in
                     draw(context: context, size: size)
                 }
-                .drawingGroup()
+                // drawingGroup：离屏光栅化在 Retina 下会糊，Canvas 直绘即可
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { value in
