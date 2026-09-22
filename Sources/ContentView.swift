@@ -39,6 +39,9 @@ struct ContentView: View {
     @State private var reviewHistoryKind: ReviewKindFilter = .all
     /// 历史回放（ROI #12）当前选中日期
     @State private var replayDate: String = ""
+    /// B.4：逐笔面板展开 + 下钻选中的分钟
+    @State private var showTicks = false
+    @State private var tickDrillMinute: String?
     var embeddedInMenu: Bool = false
 
     enum ReviewKindFilter: Hashable {
@@ -1187,6 +1190,38 @@ struct ContentView: View {
                      : "\(store.minutes.count) 点 · 拖动")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
+                Button(showTicks ? "收起逐笔" : "逐笔") {
+                    showTicks.toggle()
+                    if showTicks, store.ticks.isEmpty {
+                        Task { await store.loadTicks() }
+                    }
+                }
+                .controlSize(.mini)
+                .help("B.4：分时下方逐笔分钟柱（净买红/净卖绿），点击柱下钻该分钟逐笔明细")
+                if store.tickBusy { ProgressView().controlSize(.mini) }
+            }
+            if showTicks {
+                Text(store.tickHint)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                TickChart(buckets: store.tickBuckets, selectedMinute: $tickDrillMinute)
+                    .frame(height: 56)
+                    .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 8))
+                if let sel = tickDrillMinute,
+                   let bucket = store.tickBuckets.first(where: { $0.minute == sel }) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("· \(bucket.minute.prefix(2)):\(bucket.minute.suffix(2)) 逐笔 \(bucket.ticks.count) 笔")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.secondary)
+                        ForEach(Array(bucket.ticks.suffix(6).enumerated()), id: \.offset) { _, t in
+                            Text(String(format: "%@  %.2f  %d手  %@",
+                                        tickClock(t.ts), t.price, t.volume,
+                                        t.direction == 2 ? "卖盘" : (t.direction == 4 ? "中性" : "买盘")))
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(t.direction == 2 ? trendDown : trendUp)
+                        }
+                    }
+                }
             }
             MinuteChart(
                 bars: store.minutes,
@@ -2257,6 +2292,14 @@ struct ContentView: View {
         formatter.dateFormat = "yyyy-MM-dd"
         return (0..<n).compactMap { Calendar.current.date(byAdding: .day, value: -$0, to: Date()) }
             .map { formatter.string(from: $0) }
+    }
+
+    private func tickClock(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter.string(from: date)
     }
 
     private func clockFromMs(_ ms: Double) -> String {

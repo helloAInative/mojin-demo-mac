@@ -36,7 +36,7 @@ struct MinuteChart: View {
     @State private var hoverIndex: Int? = nil
     @State private var hoverPoint: CGPoint = .zero
 
-    private static let session: [String] = {
+    static let session: [String] = {
         var out: [String] = []
         func push(_ h0: Int, _ m0: Int, _ h1: Int, _ m1: Int) {
             var t = h0 * 60 + m0
@@ -1459,4 +1459,109 @@ struct DayChart: View {
         }
     }
 
+}
+
+
+/// B.4：逐笔分钟桶柱状图——x 对齐分时时段槽位，柱高 ∝ 分钟成交量，
+/// 净买红 / 净卖绿；点击柱下钻该分钟逐笔（由父视图展示）。
+struct TickChart: View {
+    var buckets: [TickBucket]
+    /// 点选的分钟（"HHmm"）
+    @Binding var selectedMinute: String?
+
+    private let upColor = Color(red: 1, green: 0.27, blue: 0.23)
+    private let downColor = Color(red: 0.2, green: 0.84, blue: 0.29)
+    private let padT: CGFloat = 6
+    private let padB: CGFloat = 10
+    private let padL: CGFloat = 4
+    private let padR: CGFloat = 4
+
+    private var slotIndex: [String: Int] {
+        Dictionary(uniqueKeysWithValues: MinuteChart.session.enumerated().map { ($1, $0) })
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .topLeading) {
+                Canvas { context, size in
+                    draw(context: context, size: size)
+                }
+                .drawingGroup()
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            selectedMinute = minute(atX: value.location.x, in: geo.size)
+                        }
+                        .onEnded { _ in }
+                )
+                if let sel = selectedMinute, let bucket = buckets.first(where: { $0.minute == sel }) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(String(sel.prefix(2)) + ":" + String(sel.suffix(2)))
+                        Text(String(format: "%d 手 · 买 %d / 卖 %d",
+                                    bucket.volume, bucket.buyVolume, bucket.sellVolume))
+                    }
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 5).padding(.vertical, 3)
+                    .background(Color.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 4))
+                    .offset(x: min(geo.size.width - 110, max(0, xFor(sel, in: geo.size) - 40)), y: 2)
+                }
+            }
+        }
+    }
+
+    private func xFor(_ minute: String, in size: CGSize) -> CGFloat {
+        let slots = CGFloat(max(MinuteChart.session.count - 1, 1))
+        let ratio = slotIndex[minute].map { CGFloat($0) / slots } ?? 0
+        return padL + ratio * (size.width - padL - padR)
+    }
+
+    private func minute(atX x: CGFloat, in size: CGSize) -> String? {
+        guard !buckets.isEmpty, size.width > 8 else { return nil }
+        let width = size.width - padL - padR
+        let ratio = (x - padL) / width
+        let target = ratio * CGFloat(MinuteChart.session.count)
+        // 找离目标槽位最近的桶
+        var best: (String, Double)?
+        for bucket in buckets {
+            guard let slot = slotIndex[bucket.minute] else { continue }
+            let d = abs(CGFloat(slot) - target)
+            if best == nil || d < best!.1 {
+                best = (bucket.minute, d)
+            }
+        }
+        return best?.0
+    }
+
+    private func draw(context: GraphicsContext, size: CGSize) {
+        guard !buckets.isEmpty else {
+            let text = Text("暂无逐笔").font(.system(size: 10)).foregroundColor(.secondary)
+            context.draw(text, at: CGPoint(x: 8, y: size.height / 2))
+            return
+        }
+        let maxVol = buckets.map(\.volume).max() ?? 1
+        let chartH = size.height - padT - padB
+        let chartW = size.width - padL - padR
+        let barW = max(2.0, chartW / CGFloat(MinuteChart.session.count) * 0.6)
+        for bucket in buckets {
+            let x = xFor(bucket.minute, in: size)
+            let h = CGFloat(Double(bucket.volume) / Double(maxVol)) * chartH
+            let color = bucket.netBuy ? upColor : downColor
+            let rect = CGRect(x: x - barW / 2, y: size.height - padB - h,
+                              width: barW, height: max(h, 0.5))
+            context.fill(Path(rect), with: .color(color.opacity(0.65)))
+            if bucket.minute == selectedMinute {
+                context.stroke(Path(rect), with: .color(.cyan.opacity(0.9)), lineWidth: 1)
+            }
+        }
+        // 选中参考线
+        if let sel = selectedMinute {
+            let x = xFor(sel, in: size)
+            var line = Path()
+            line.move(to: CGPoint(x: x, y: padT))
+            line.addLine(to: CGPoint(x: x, y: size.height - padB))
+            context.stroke(line, with: .color(.cyan.opacity(0.4)),
+                           style: StrokeStyle(lineWidth: 1, dash: [3, 2]))
+        }
+    }
 }

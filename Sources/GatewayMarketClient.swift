@@ -162,6 +162,59 @@ struct GatewaySectorBoard: Codable, Equatable, Identifiable {
     }
 }
 
+/// B.4：逐笔成交（服务端 TickItem）。
+struct GatewayTick: Codable, Equatable, Identifiable {
+    var ts: Date
+    var price: Double
+    /// 手
+    var volume: Int
+    /// 1 买盘 / 2 卖盘 / 4 中性（0 集合竞价）
+    var direction: Int
+
+    var id: Date { ts }
+}
+
+/// 逐笔按分钟聚合桶（B.4：分时下方柱状 + 下钻数据）。
+struct TickBucket: Equatable, Identifiable {
+    /// "HHmm"
+    var minute: String
+    var volume: Int
+    var buyVolume: Int
+    var sellVolume: Int
+    var ticks: [GatewayTick]
+    var id: String { minute }
+
+    /// 净买卖决定柱色（红买绿卖）
+    var netBuy: Bool { buyVolume >= sellVolume }
+}
+
+enum TickBucketer {
+    /// 按北京时间分钟分桶（升序）；direction 1/0 归买盘、2 归卖盘、4 中性不计入买卖。
+    static func buckets(from ticks: [GatewayTick]) -> [TickBucket] {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        formatter.dateFormat = "HHmm"
+        var order: [String] = []
+        var map: [String: TickBucket] = [:]
+        for tick in ticks.sorted(by: { $0.ts < $1.ts }) {
+            let minute = formatter.string(from: tick.ts)
+            guard minute.count == 4 else { continue }
+            var bucket = map[minute] ?? TickBucket(minute: minute, volume: 0,
+                                                   buyVolume: 0, sellVolume: 0, ticks: [])
+            bucket.volume += tick.volume
+            switch tick.direction {
+            case 2: bucket.sellVolume += tick.volume
+            default: bucket.buyVolume += tick.volume   // 1 买 / 0 竞价 / 4 中性偏买侧计数
+            }
+            bucket.ticks.append(tick)
+            if map[minute] == nil { order.append(minute) }
+            map[minute] = bucket
+        }
+        return order.map { map[$0]! }
+    }
+}
+
 /// A 股池智能推荐：单条（服务端 daily_pick 行）。
 struct GatewayPick: Codable, Equatable, Identifiable {
     var date: String
@@ -510,6 +563,11 @@ enum GatewayMarketClient {
     /// §F.4：所属概念 / 行业板块（板块指数 + 涨跌幅）。
     static func sector(code: String) async throws -> [GatewaySectorBoard] {
         try await getData("sector/\(code)")
+    }
+
+    /// B.4：逐笔成交明细（东财 push2delay details，按需拉取）。
+    static func ticks(code: String, limit: Int = 2000) async throws -> [GatewayTick] {
+        try await getData("quote/\(code)/ticks?limit=\(max(50, min(limit, 5000)))")
     }
 
     /// A 股池智能推荐：最近一份（含 T+5 回测统计）。

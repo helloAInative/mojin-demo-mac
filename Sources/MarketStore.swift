@@ -82,6 +82,28 @@ final class MarketStore: ObservableObject {
     /// 智能止损 / 止盈建议（refreshDaily / 持仓变更时重算，不逐 tick）
     @Published var stopTakeAdvice: StopTakeAdvisor.Advice?
 
+    /// B.4：逐笔成交（分时下方柱状 + 下钻）。
+    @Published var ticks: [GatewayTick] = []
+    @Published var tickBusy = false
+    @Published var tickHint = ""
+
+    /// 分钟桶（升序），供柱状图与下钻。
+    var tickBuckets: [TickBucket] {
+        TickBucketer.buckets(from: ticks)
+    }
+
+    func loadTicks() async {
+        guard !tickBusy else { return }
+        tickBusy = true
+        defer { tickBusy = false }
+        do {
+            ticks = try await GatewayMarketClient.ticks(code: settings.currentCode)
+            tickHint = "逐笔 \(ticks.count) 笔 · \(tickBuckets.count) 分钟"
+        } catch {
+            tickHint = "逐笔拉取失败：\(error.localizedDescription)"
+        }
+    }
+
     /// B.5：当前标的主营板块（is_precise 优先）。
     var primarySector: GatewaySectorBoard? {
         let boards = sectorBoards.sorted {
@@ -487,6 +509,8 @@ final class MarketStore: ObservableObject {
         restartLoops()
         syncTicketFromMarket(forcePrice: true)
         ensureCodeInfo()
+        ticks = []
+        tickHint = ""
         // days/quote 还是旧标的的：先清掉，restartLoops→loadCache / refreshDaily 会重算
         stopTakeAdvice = nil
     }

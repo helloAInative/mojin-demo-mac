@@ -145,6 +145,10 @@ $ curl http://127.0.0.1:8732/api/v1/quote/sh600460
 {"code":"sh600460","name":"士兰微","price":32.61,"prev":31.99,"open":32.5,"high":32.75,"low":31.77,"volume":55092183,"amount":1779905404.0,"source":"sina","ts":"2026-09-18T02:40:06.768634Z"}
 ```
 
+### `GET /api/v1/quote/{code}/ticks?limit=N`
+
+逐笔成交明细（B.4，东财 push2delay details）：`[{ts, price, volume, direction}]`（时间升序，direction 1 买 / 2 卖 / 4 中性 / 0 集合竞价），按需拉取不落库，limit 50..=5000。
+
 ### `GET /api/v1/quote/{code}/minutes?limit=N`
 
 返回当日分时点，按时间升序；每次请求拉取腾讯分时并写入 `minute_bar`。`volume` 为当分钟成交手数。

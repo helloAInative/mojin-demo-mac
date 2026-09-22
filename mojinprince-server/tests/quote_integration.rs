@@ -10,6 +10,7 @@
 
 use encoding_rs::GBK;
 use httpmock::prelude::*;
+use mojinprince_server::service::quote::EastMoneyTicks;
 use mojinprince_server::service::quote::{
     failover::QuoteFailover, EastMoney, QuoteProviders, Sina, Tencent,
 };
@@ -237,4 +238,42 @@ async fn live_tencent_sz000001() {
         .await
         .expect("tencent live ok");
     assert!(q.price > 0.0);
+}
+
+#[tokio::test]
+async fn ticks_endpoint_parses_details() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/qt/stock/details/get")
+            .query_param("secid", "0.300623");
+        then.status(200).json_body(serde_json::json!({
+            "data": {
+                "code": "300623", "market": 0, "decimal": 2, "prePrice": 35.03,
+                "details": [
+                    "09:30:01,35.10,200,1,3",
+                    "09:30:05,35.12,150,2,2",
+                    "坏行",
+                    "09:31:00,35.15,300,4,5"
+                ]
+            }
+        }));
+    });
+    let ticks = EastMoneyTicks {
+        base_url: server.base_url(),
+    };
+    let items = ticks
+        .fetch(&new_http(), "sz300623", 100)
+        .await
+        .expect("parse ok");
+    assert_eq!(items.len(), 3, "坏行被丢弃");
+    assert_eq!(items[0].price, 35.10);
+    assert_eq!(items[0].volume, 200);
+    assert_eq!(items[0].direction, 1);
+    // 时间按北京时间转 UTC（09:30:01 → 01:30:01Z）
+    assert!(items[0].ts.to_rfc3339().contains("01:30:01"));
+    assert_eq!(items[2].direction, 4);
+
+    // 非法代码在 fetch 前被拒
+    assert!(ticks.fetch(&new_http(), "notacode", 100).await.is_err());
 }

@@ -3,10 +3,12 @@ pub mod failover;
 pub mod history;
 pub mod sina;
 pub mod tencent;
+pub mod ticks;
 
 pub use eastmoney::EastMoney;
 pub use sina::Sina;
 pub use tencent::Tencent;
+pub use ticks::{EastMoneyTicks, TickItem};
 
 use crate::model::Quote;
 use thiserror::Error;

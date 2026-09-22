@@ -144,11 +144,42 @@ fn history_error(error: QuoteError) -> AppError {
     }
 }
 
+/// 逐笔成交明细（B.4）。东财 push2delay details，按需拉取不落库。
+#[utoipa::path(
+    get,
+    path = "/api/v1/quote/{code}/ticks",
+    tag = "quote",
+    params(
+        ("code" = String, Path, description = "股票代码"),
+        ("limit" = Option<i64>, Query, description = "最近 N 笔（50..=5000，默认 2000）"),
+    ),
+    responses(
+        (status = 200, description = "逐笔数组（时间升序）", body = [crate::service::quote::TickItem]),
+        (status = 400, description = "代码非法", body = crate::error::AppErrorBody),
+        (status = 502, description = "上游失败", body = crate::error::AppErrorBody),
+    )
+)]
+pub async fn get_ticks(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    q: web::Query<HistoryQuery>,
+) -> AppResult<HttpResponse> {
+    let code = path.into_inner();
+    let limit = q.limit.unwrap_or(2000).clamp(50, 5000);
+    let items = state
+        .ticks
+        .fetch(&state.http, &code, limit)
+        .await
+        .map_err(history_error)?;
+    Ok(HttpResponse::Ok().json(items))
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/quote")
             .route("/{code}", web::get().to(get_quote))
             .route("/{code}/minutes", web::get().to(get_minutes))
+            .route("/{code}/ticks", web::get().to(get_ticks))
             .route("/{code}/days", web::get().to(get_days)),
     );
 }
