@@ -6,6 +6,23 @@ private let trendUp = Color(red: 1, green: 0.27, blue: 0.23)
 private let trendDown = Color(red: 0.2, green: 0.84, blue: 0.29)
 
 private struct MinuteDetailSheet: View {
+    private enum MinuteRange: String, CaseIterable, Identifiable {
+        case day = "全日"
+        case m120 = "120分"
+        case m60 = "60分"
+        case m30 = "30分"
+
+        var id: String { rawValue }
+        var count: Int? {
+            switch self {
+            case .day: return nil
+            case .m120: return 120
+            case .m60: return 60
+            case .m30: return 30
+            }
+        }
+    }
+
     let name: String
     let code: String
     let quote: Quote
@@ -22,6 +39,8 @@ private struct MinuteDetailSheet: View {
     let volRatio: Double?
 
     @Environment(\.dismiss) private var dismiss
+    @State private var minuteRange: MinuteRange = .day
+    @State private var inspectedMinuteID: String?
 
     private var last: MinuteBar? { bars.last }
     private var currentPrice: Double { last?.price ?? quote.price }
@@ -34,6 +53,15 @@ private struct MinuteDetailSheet: View {
             ? (quote.high - quote.low) / previous * 100 : 0
     }
     private var totalVolume: Double { bars.reduce(0) { $0 + $1.vol } }
+    private var visibleBars: [MinuteBar] {
+        guard let count = minuteRange.count, bars.count > count else { return bars }
+        return Array(bars.suffix(count))
+    }
+    private var visibleStartIndex: Int { max(0, bars.count - visibleBars.count) }
+    private var inspectedMinute: MinuteBar? {
+        guard let inspectedMinuteID else { return nil }
+        return bars.first(where: { $0.id == inspectedMinuteID })
+    }
     private var changeColor: Color {
         changePct > 0 ? trendUp : (changePct < 0 ? trendDown : .primary)
     }
@@ -69,19 +97,52 @@ private struct MinuteDetailSheet: View {
                 detailMetric("分时量", totalVolume > 0 ? String(format: "%.0f", totalVolume) : "--", .primary)
             }
 
+            HStack(spacing: 8) {
+                Label("时间区间", systemImage: "magnifyingglass")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Picker("时间区间", selection: Binding(
+                    get: { minuteRange },
+                    set: { newValue in
+                        minuteRange = newValue
+                        inspectedMinuteID = nil
+                    }
+                )) {
+                    ForEach(MinuteRange.allCases) { range in
+                        Text(range.rawValue).tag(range)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 300)
+                Spacer()
+                Text(minuteRange == .day
+                     ? "全日坐标 · 展示 \(bars.count) 点"
+                     : "局部铺满 · \(formatMinute(visibleBars.first?.minute ?? "--"))–\(formatMinute(visibleBars.last?.minute ?? "--"))")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+
+            inspectedMinuteStrip
+            chartLegend
+
             MinuteChart(
-                bars: bars,
+                bars: visibleBars,
                 prev: previous > 0 ? previous : (bars.first?.price ?? 0),
                 base: base,
                 support: support,
                 resistance: resistance,
                 aiSignal: aiSignal,
                 detailed: true,
+                fitToBars: minuteRange != .day,
+                sessionStartIndex: visibleStartIndex,
                 levelLightPct: levelLightPct,
                 levelDeepPct: levelDeepPct,
                 cost: cost,
                 costLightPct: costLightPct,
-                levelMarks: levelMarks
+                levelMarks: levelMarks,
+                keepsSelection: true,
+                selectedMinuteID: $inspectedMinuteID
             )
             .frame(height: 350)
             .background(Color.black.opacity(0.34), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -92,8 +153,10 @@ private struct MinuteDetailSheet: View {
                     .padding(7)
             }
 
-            HStack(alignment: .top, spacing: 10) {
-                detailSection(title: "关键价位", systemImage: "scope") {
+            ScrollView {
+                VStack(spacing: 10) {
+                    HStack(alignment: .top, spacing: 10) {
+                        detailSection(title: "关键价位", systemImage: "scope") {
                     LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
                         levelRow("阻力", resistance, .orange)
                         levelRow("基准", base, .cyan)
@@ -106,7 +169,7 @@ private struct MinuteDetailSheet: View {
                         .foregroundStyle(.tertiary)
                 }
 
-                detailSection(title: "AI 盘中观察", systemImage: "sparkles") {
+                        detailSection(title: "AI 盘中观察", systemImage: "sparkles") {
                     if let signal = aiSignal {
                         HStack(spacing: 6) {
                             Text(verdictText(signal.verdict))
@@ -136,11 +199,11 @@ private struct MinuteDetailSheet: View {
                     Text(volRatio.map { String(format: "当前量比 %.2f", $0) } ?? "量比数据不足")
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(.secondary)
-                }
-            }
+                        }
+                    }
 
-            HStack(alignment: .top, spacing: 10) {
-                detailSection(title: "AI 事件时间线", systemImage: "bolt.fill") {
+                    HStack(alignment: .top, spacing: 10) {
+                        detailSection(title: "AI 事件时间线", systemImage: "bolt.fill") {
                     if let events = aiSignal?.events, !events.isEmpty {
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 6) {
@@ -156,7 +219,7 @@ private struct MinuteDetailSheet: View {
                     }
                 }
 
-                detailSection(title: "今日价位预警", systemImage: "bell.badge") {
+                        detailSection(title: "今日价位预警", systemImage: "bell.badge") {
                     if levelMarks.isEmpty {
                         Text("暂无触发记录")
                             .font(.system(size: 10))
@@ -168,11 +231,37 @@ private struct MinuteDetailSheet: View {
                             }
                         }
                     }
+                        }
+                    }
+
+                    HStack(alignment: .top, spacing: 10) {
+                        detailSection(title: "最近分钟明细", systemImage: "list.bullet.rectangle") {
+                            minuteTableHeader
+                            ForEach(Array(bars.indices.suffix(12).reversed()), id: \.self) { index in
+                                minuteTableRow(index)
+                            }
+                        }
+
+                        detailSection(title: "分钟放量排名", systemImage: "chart.bar.fill") {
+                            if bars.isEmpty {
+                                Text("暂无成交量数据")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(Array(bars.indices.sorted {
+                                    bars[$0].vol > bars[$1].vol
+                                }.prefix(8)), id: \.self) { index in
+                                    volumeRankRow(index)
+                                }
+                            }
+                        }
+                    }
                 }
             }
+            .frame(maxHeight: 250)
         }
         .padding(16)
-        .frame(minWidth: 820, idealWidth: 900, minHeight: 700)
+        .frame(minWidth: 820, idealWidth: 900, minHeight: 740)
     }
 
     private func detailMetric(_ title: String, _ value: String, _ color: Color) -> some View {
@@ -185,6 +274,99 @@ private struct MinuteDetailSheet: View {
         .padding(.horizontal, 9)
         .padding(.vertical, 7)
         .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 7))
+    }
+
+    private var inspectedMinuteStrip: some View {
+        let bar = inspectedMinute ?? visibleBars.last
+        let index = bar.flatMap { selected in bars.firstIndex(where: { $0.id == selected.id }) }
+        let priorPrice = index.flatMap { $0 > bars.startIndex ? bars[$0 - 1].price : nil } ?? previous
+        let minutePct = bar.map { priorPrice > 0 ? ($0.price - priorPrice) / priorPrice * 100 : 0 } ?? 0
+        let averagePct = bar.map { $0.avg > 0 ? ($0.price - $0.avg) / $0.avg * 100 : 0 } ?? 0
+        let nearest = nearestLevel(to: bar?.price ?? 0)
+        return HStack(spacing: 12) {
+            Label(inspectedMinute == nil ? "最新分钟" : "已定位",
+                  systemImage: inspectedMinute == nil ? "clock" : "scope")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(inspectedMinute == nil ? Color.secondary : Color.accentColor)
+            cursorValue("时间", bar.map { formatMinute($0.minute) } ?? "--", .primary)
+            cursorValue("价格", bar.map { String(format: "%.2f", $0.price) } ?? "--",
+                        minutePct >= 0 ? trendUp : trendDown)
+            cursorValue("分钟涨跌", bar == nil ? "--" : String(format: "%+.2f%%", minutePct),
+                        minutePct >= 0 ? trendUp : trendDown)
+            cursorValue("均价偏离", bar == nil ? "--" : String(format: "%+.2f%%", averagePct),
+                        averagePct >= 0 ? trendUp : trendDown)
+            cursorValue("成交量", bar.map { String(format: "%.0f", $0.vol) } ?? "--", .primary)
+            cursorValue("最近价位", nearest.text, nearest.color)
+            Spacer(minLength: 0)
+            if inspectedMinute != nil {
+                Button {
+                    inspectedMinuteID = nil
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .buttonStyle(.borderless)
+                .help("恢复到最新分钟")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Color.accentColor.opacity(inspectedMinute == nil ? 0.035 : 0.08),
+                    in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var chartLegend: some View {
+        HStack(spacing: 14) {
+            legendItem("价格", color: changeColor, dashed: false)
+            legendItem("均价", color: .yellow, dashed: false)
+            legendItem("昨收", color: .white.opacity(0.75), dashed: true)
+            legendItem("阻力", color: .orange, dashed: true)
+            legendItem("基准", color: .cyan, dashed: true)
+            legendItem("支撑", color: .green, dashed: true)
+            if cost > 0 { legendItem("持仓成本", color: .purple, dashed: true) }
+            Spacer()
+            Label("AI 事件", systemImage: "triangle.fill")
+                .font(.system(size: 9))
+                .foregroundStyle(.orange)
+        }
+        .padding(.horizontal, 4)
+    }
+
+    private func legendItem(_ title: String, color: Color, dashed: Bool) -> some View {
+        HStack(spacing: 4) {
+            Capsule()
+                .fill(color)
+                .frame(width: dashed ? 5 : 14, height: 2)
+            if dashed {
+                Capsule().fill(color.opacity(0.45)).frame(width: 5, height: 2)
+            }
+            Text(title)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func cursorValue(_ title: String, _ value: String, _ color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title).font(.system(size: 8)).foregroundStyle(.tertiary)
+            Text(value)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundStyle(color)
+        }
+    }
+
+    private func nearestLevel(to price: Double) -> (text: String, color: Color) {
+        guard price > 0 else { return ("--", .secondary) }
+        let levels: [(String, Double, Color)] = [
+            ("阻", resistance, .orange),
+            ("基", base, .cyan),
+            ("支", support, .green),
+            ("本", cost, .purple)
+        ].filter { $0.1 > 0 }
+        guard let nearest = levels.min(by: { abs($0.1 - price) < abs($1.1 - price) }) else {
+            return ("--", .secondary)
+        }
+        let distance = (price - nearest.1) / nearest.1 * 100
+        return (String(format: "%@ %@%.2f%%", nearest.0, distance >= 0 ? "+" : "", distance), nearest.2)
     }
 
     private func detailSection<Content: View>(
@@ -212,6 +394,71 @@ private struct MinuteDetailSheet: View {
                 .fontWeight(.semibold).monospacedDigit().foregroundStyle(color)
         }
         .font(.system(size: 10))
+    }
+
+    private var minuteTableHeader: some View {
+        HStack(spacing: 8) {
+            Text("时间").frame(width: 48, alignment: .leading)
+            Text("价格").frame(width: 58, alignment: .trailing)
+            Text("分钟涨跌").frame(width: 66, alignment: .trailing)
+            Text("偏离均价").frame(width: 66, alignment: .trailing)
+            Text("成交量").frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .font(.system(size: 8, weight: .semibold))
+        .foregroundStyle(.tertiary)
+        .padding(.bottom, 2)
+    }
+
+    private func minuteTableRow(_ index: Int) -> some View {
+        let bar = bars[index]
+        let reference = index > bars.startIndex ? bars[index - 1].price : previous
+        let minutePct = reference > 0 ? (bar.price - reference) / reference * 100 : 0
+        let avgPct = bar.avg > 0 ? (bar.price - bar.avg) / bar.avg * 100 : 0
+        let color = minutePct > 0 ? trendUp : (minutePct < 0 ? trendDown : Color.secondary)
+        return HStack(spacing: 8) {
+            Text(formatMinute(bar.minute)).frame(width: 48, alignment: .leading)
+            Text(String(format: "%.2f", bar.price)).frame(width: 58, alignment: .trailing)
+            Text(String(format: "%+.2f%%", minutePct))
+                .foregroundStyle(color)
+                .frame(width: 66, alignment: .trailing)
+            Text(String(format: "%+.2f%%", avgPct))
+                .foregroundStyle(avgPct >= 0 ? trendUp : trendDown)
+                .frame(width: 66, alignment: .trailing)
+            Text(String(format: "%.0f", bar.vol)).frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .font(.system(size: 9, design: .monospaced))
+        .padding(.vertical, 2)
+        .background(index == bars.indices.last ? Color.accentColor.opacity(0.08) : Color.clear)
+    }
+
+    private func volumeRankRow(_ index: Int) -> some View {
+        let bar = bars[index]
+        let maxVolume = max(bars.map(\.vol).max() ?? 1, 1)
+        let widthRatio = min(max(bar.vol / maxVolume, 0), 1)
+        return HStack(spacing: 7) {
+            Text(formatMinute(bar.minute))
+                .frame(width: 46, alignment: .leading)
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.06))
+                    Capsule()
+                        .fill(Color.accentColor.opacity(0.55))
+                        .frame(width: proxy.size.width * widthRatio)
+                }
+            }
+            .frame(height: 6)
+            Text(String(format: "%.0f", bar.vol))
+                .frame(width: 62, alignment: .trailing)
+            Text(String(format: "%.2f", bar.price))
+                .frame(width: 50, alignment: .trailing)
+        }
+        .font(.system(size: 9, design: .monospaced))
+        .padding(.vertical, 2)
+    }
+
+    private func formatMinute(_ minute: String) -> String {
+        guard minute.count >= 4 else { return minute }
+        return "\(minute.prefix(2)):\(minute.suffix(2))"
     }
 
     private func eventCard(_ event: AIEvent) -> some View {
@@ -1474,6 +1721,14 @@ struct ContentView: View {
                     Text("智能止损/止盈")
                         .font(.system(size: 10, weight: .bold))
                         .foregroundStyle(.secondary)
+                    if let tier = store.stopTakeTier {
+                        Text(tier.label)
+                            .font(.system(size: 8))
+                            .foregroundStyle(.tertiary)
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(Color.primary.opacity(0.06), in: Capsule())
+                            .help("近 60 日日均振幅中位数分档：低波动 k=2.5 收紧止损，高波动 k=1.5 放宽防毛刺扫掉")
+                    }
                     if advice.stop > 0 && advice.take > 0 {
                         Text(String(format: "盈亏比 %.2f", advice.ratio))
                             .font(.system(size: 9, weight: .semibold))

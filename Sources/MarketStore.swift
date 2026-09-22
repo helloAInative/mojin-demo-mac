@@ -81,6 +81,8 @@ final class MarketStore: ObservableObject {
 
     /// 智能止损 / 止盈建议（refreshDaily / 持仓变更时重算，不逐 tick）
     @Published var stopTakeAdvice: StopTakeAdvisor.Advice?
+    /// C.5 M2：当前标的的波动档（低/中/高 → 参数自适应）
+    @Published var stopTakeTier: StopTakeAdvisor.VolatilityTier?
 
     /// B.4：逐笔成交（分时下方柱状 + 下钻）。
     @Published var ticks: [GatewayTick] = []
@@ -1376,13 +1378,16 @@ final class MarketStore: ObservableObject {
             stopTakeAdvice = nil
             return
         }
-        stopTakeAdvice = StopTakeAdvisor.advise(
+        var tier: StopTakeAdvisor.VolatilityTier?
+        stopTakeAdvice = StopTakeAdvisor.adviseAdaptive(
             days: days,
             price: quote.price,
             cost: settings.position.cost,
             resistance: settings.levels.resistance,
-            drawdownPct: settings.strategy.drawdownPct
+            drawdownPct: settings.strategy.drawdownPct,
+            tier: &tier
         )
+        stopTakeTier = tier
     }
 
     /// 一键应用建议到持仓：写本地 + 网关 PUT（联动到价上/下），并落一条时间线记录供复盘对照。

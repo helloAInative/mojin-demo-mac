@@ -19,6 +19,65 @@ enum StopTakeAdvisor {
         var maxAcceptableDrawdownPct: Double = 5
     }
 
+    /// 波动档位（C.5 M2：按近 60 日日均振幅中位数分档，参数自适应）。
+    enum VolatilityTier: Equatable {
+        case low, medium, high
+
+        /// 日均振幅（(高−低)/昨收%）中位数的分档阈值：中位 2% / 3.5%。
+        /// 低波动股止损收紧（k 大），高波动股放宽（k 小），避免被日内毛刺扫掉。
+        static func classify(days: [DayBar]) -> VolatilityTier? {
+            let ratios = dailyAmplitudePcts(days)
+            guard ratios.count >= 20 else { return nil }
+            let sorted = ratios.sorted()
+            let mid = sorted[sorted.count / 2]
+            if mid < 2.0 { return .low }
+            if mid > 3.5 { return .high }
+            return .medium
+        }
+
+        /// 自适应参数（k = 止损 ATR 系数，m = 止盈 ATR 系数）。
+        var params: Params {
+            switch self {
+            case .low: return Params(atrStopMultiple: 2.5, atrTakeMultiple: 3.5)
+            case .medium: return Params(atrStopMultiple: 2, atrTakeMultiple: 3)
+            case .high: return Params(atrStopMultiple: 1.5, atrTakeMultiple: 2.5)
+            }
+        }
+
+        var label: String {
+            switch self {
+            case .low: return "低波动（止损收紧）"
+            case .medium: return "中波动（标准参数）"
+            case .high: return "高波动（止损放宽）"
+            }
+        }
+
+        /// 近 60 日日均振幅（%），过滤无效行。
+        static func dailyAmplitudePcts(_ days: [DayBar]) -> [Double] {
+            days.suffix(60).compactMap { bar in
+                guard bar.high > 0, bar.low > 0, bar.close > 0 else { return nil }
+                return (bar.high - bar.low) / bar.close * 100
+            }
+        }
+    }
+
+    /// M2 自适应入口：按波动档选参数再推导。tier 为 nil（数据不足）时用默认参数。
+    static func adviseAdaptive(
+        days: [DayBar],
+        price: Double,
+        cost: Double,
+        resistance: Double,
+        drawdownPct: Double,
+        tier outTier: inout VolatilityTier?
+    ) -> Advice {
+        let tier = VolatilityTier.classify(days: days)
+        outTier = tier
+        return advise(
+            days: days, price: price, cost: cost,
+            resistance: resistance, drawdownPct: drawdownPct,
+            params: tier?.params ?? Params())
+    }
+
     struct Advice: Equatable {
         /// 建议止损价（0 = 数据不足）
         var stop: Double

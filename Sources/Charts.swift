@@ -25,6 +25,10 @@ struct MinuteChart: View {
     var aiSignal: AILatestSignal? = nil
     /// 放大模式展示 AI 事件文字；常规模式只保留三角提示。
     var detailed: Bool = false
+    /// 局部区间模式：将传入 bars 铺满整个画布，用于 30/60/120 分钟放大。
+    var fitToBars: Bool = false
+    /// bars.first 在全日 session 中的索引，供 AI 事件对齐局部时间轴。
+    var sessionStartIndex: Int = 0
     /// 关键价位预警阈值（%），来自 settings.notifyConfig
     var levelLightPct: Double = 0.30
     var levelDeepPct: Double = 0.15
@@ -36,6 +40,9 @@ struct MinuteChart: View {
     var levelMarks: [LevelMark] = []
     /// 单击图表时打开详细视图；详细视图本身不传入，避免重复弹出。
     var onOpenDetail: (() -> Void)? = nil
+    /// 详细视图可保留最后一次十字光标，并将选中分钟同步到外部数据条。
+    var keepsSelection: Bool = false
+    var selectedMinuteID: Binding<String?>? = nil
 
     @State private var hoverIndex: Int? = nil
     @State private var hoverPoint: CGPoint = .zero
@@ -76,7 +83,10 @@ struct MinuteChart: View {
                                 updateHover(at: value.location, in: geo.size)
                             }
                             .onEnded { value in
-                                hoverIndex = nil
+                                if !keepsSelection {
+                                    hoverIndex = nil
+                                    selectedMinuteID?.wrappedValue = nil
+                                }
                                 if abs(value.translation.width) < 3,
                                    abs(value.translation.height) < 3 {
                                     onOpenDetail?()
@@ -112,6 +122,15 @@ struct MinuteChart: View {
                 }
             }
         }
+        .onChange(of: selectedMinuteID?.wrappedValue) { _, minuteID in
+            guard keepsSelection else { return }
+            if let minuteID,
+               let index = bars.firstIndex(where: { $0.id == minuteID }) {
+                hoverIndex = index
+            } else {
+                hoverIndex = nil
+            }
+        }
     }
 
     /// 根据 bar 的 minute 字符串（如 "0935"）找 ±1 分钟内的最近事件 note。
@@ -139,11 +158,13 @@ struct MinuteChart: View {
         guard !bars.isEmpty else { return }
         let padL: CGFloat = 4
         let padR: CGFloat = min(92, max(76, size.width * 0.14))
-        let slots = CGFloat(max(Self.session.count - 1, 1))
+        let slots = CGFloat(fitToBars ? max(bars.count - 1, 1) : max(Self.session.count - 1, 1))
         let ratio = min(max((point.x - padL) / max(size.width - padL - padR, 1), 0), 1)
         let idx = Int(round(ratio * slots))
-        hoverIndex = max(0, min(bars.count - 1, idx))
+        let safeIndex = max(0, min(bars.count - 1, idx))
+        hoverIndex = safeIndex
         hoverPoint = point
+        selectedMinuteID?.wrappedValue = bars[safeIndex].id
     }
 
     private func draw(context: GraphicsContext, size: CGSize, flashPhase: Double = 0, flashPhaseDeep: Double = 0) {
@@ -165,7 +186,7 @@ struct MinuteChart: View {
         let padR: CGFloat = min(92, max(76, size.width * 0.14))
         let padT: CGFloat = 6
         let padB: CGFloat = 16
-        let slots = CGFloat(max(Self.session.count - 1, 1))
+        let slots = CGFloat(fitToBars ? max(bars.count - 1, 1) : max(Self.session.count - 1, 1))
 
         func snap(_ value: CGFloat) -> CGFloat {
             (value * displayScale).rounded() / max(displayScale, 1)
@@ -266,7 +287,9 @@ struct MinuteChart: View {
                          padL: padL, padR: padR,
                          y: y, yMin: padT, yMax: size.height - padB,
                          prev: prev,
-                         showLabels: detailed)
+                         showLabels: detailed,
+                         domainStart: fitToBars ? sessionStartIndex : 0,
+                         domainSlots: Int(slots))
         }
 
         // Y 轴价格刻度（右贴文本，关键价位都用不同颜色）
@@ -305,7 +328,9 @@ struct MinuteChart: View {
         drawXAxisTicks(context: context,
                        padL: padL, padR: padR,
                        yBottom: size.height - padB,
-                       totalW: size.width - padL - padR)
+                       totalW: size.width - padL - padR,
+                       visibleBars: bars,
+                       fitted: fitToBars)
     }
 
     /// 轻量网格只帮助判断时间和价位，不与关键价位线抢视觉层级。
@@ -459,13 +484,17 @@ struct MinuteChart: View {
         y: (Double) -> CGFloat,
         yMin: CGFloat, yMax: CGFloat,
         prev: Double,
-        showLabels: Bool
+        showLabels: Bool,
+        domainStart: Int,
+        domainSlots: Int
     ) {
         guard !events.isEmpty else { return }
-        let slots = CGFloat(max(Self.session.count - 1, 1))
+        let slots = CGFloat(max(domainSlots, 1))
+        let domainEnd = domainStart + domainSlots
         for ev in events.prefix(showLabels ? 10 : 6) {
+            guard ev.minuteOffset >= domainStart, ev.minuteOffset <= domainEnd else { continue }
             // minuteOffset ∈ [0, session.count-1]；越界夹紧
-            let offset = CGFloat(min(max(ev.minuteOffset, 0), Int(slots)))
+            let offset = CGFloat(ev.minuteOffset - domainStart)
             let ratio = offset / slots
             let px = padL + ratio * chartW
             let priceForY = ev.price > 0 ? ev.price : prev
@@ -605,13 +634,25 @@ struct MinuteChart: View {
         context: GraphicsContext,
         padL: CGFloat, padR: CGFloat,
         yBottom: CGFloat,
-        totalW: CGFloat
+        totalW: CGFloat,
+        visibleBars: [MinuteBar],
+        fitted: Bool
     ) {
-        let markers: [(label: String, ratio: CGFloat)] = [
-            ("9:30", 0),
-            ("11:30/13:00", 0.5),
-            ("15:00", 1)
-        ]
+        let markers: [(label: String, ratio: CGFloat)]
+        if fitted, let first = visibleBars.first, let last = visibleBars.last {
+            let middle = visibleBars[visibleBars.count / 2]
+            markers = [
+                (fmtHM(first.minute), 0),
+                (fmtHM(middle.minute), 0.5),
+                (fmtHM(last.minute), 1)
+            ]
+        } else {
+            markers = [
+                ("9:30", 0),
+                ("11:30/13:00", 0.5),
+                ("15:00", 1)
+            ]
+        }
         for m in markers {
             let x = padL + m.ratio * totalW
             // 短竖线
