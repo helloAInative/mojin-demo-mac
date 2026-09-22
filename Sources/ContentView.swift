@@ -1184,7 +1184,8 @@ struct ContentView: View {
                 levelLightPct: settings.notifyConfig.levelLightPct,
                 levelDeepPct: settings.notifyConfig.levelDeepPct,
                 cost: settings.position.cost,
-                costLightPct: settings.notifyConfig.costLightPct
+                costLightPct: settings.notifyConfig.costLightPct,
+                levelMarks: store.levelMarks
             )
             .frame(height: 96)
             .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -1333,6 +1334,59 @@ struct ContentView: View {
             .background(.quaternary.opacity(0.35), in: Capsule())
     }
 
+    /// B.6：自选股热力图——按当日涨跌幅着色的 4 列格子，一眼看全场强弱。
+    @ViewBuilder private var watchHeatmap: some View {
+        let cells = settings.symbols.compactMap { symbol -> WatchHeatCell? in
+            let quote = store.watchQuotes[symbol.code]
+            guard let quote, quote.price > 0, quote.prev > 0 else { return nil }
+            return WatchHeatCell(code: symbol.code, name: symbol.name, pct: quote.pct)
+        }
+        if !cells.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("自选热力 · \(cells.count) 只有报价")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.secondary)
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 4), spacing: 4) {
+                    ForEach(cells) { cell in
+                        Button {
+                            store.switchSymbol(cell.code)
+                            tab = .watch
+                        } label: {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(cell.name)
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .lineLimit(1)
+                                Text(String(format: "%@%.2f%%", cell.pct >= 0 ? "+" : "", cell.pct))
+                                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                                    .monospacedDigit()
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 4)
+                            .background(heatColor(cell.pct), in: RoundedRectangle(cornerRadius: 5))
+                            .help("\(cell.name) \(cell.code) · 点击去盯盘")
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(8)
+            .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    /// 涨跌幅 → 背景色（A 股红涨绿跌；±3% 封顶梯度，中性灰）。
+    private func heatColor(_ pct: Double) -> Color {
+        let clamped = max(min(pct, 3.0), -3.0) / 3.0
+        if clamped > 0.02 {
+            return Color(red: 1, green: 0.27, blue: 0.23).opacity(0.15 + 0.45 * clamped)
+        }
+        if clamped < -0.02 {
+            return Color(red: 0.2, green: 0.84, blue: 0.29).opacity(0.15 + 0.45 * (-clamped))
+        }
+        return Color.primary.opacity(0.06)
+    }
+
     /// 多标的组合视图（ROI #10）：持仓聚合 + 每只一行，点击跳盯盘。
     @ViewBuilder private var portfolioCard: some View {
         let portfolio = store.portfolio
@@ -1475,6 +1529,7 @@ struct ContentView: View {
 
     private var listTab: some View {
         VStack(alignment: .leading, spacing: 8) {
+            watchHeatmap
             portfolioCard
             GroupBox {
                 VStack(alignment: .leading, spacing: 6) {

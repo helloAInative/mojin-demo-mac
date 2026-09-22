@@ -82,6 +82,33 @@ final class MarketStore: ObservableObject {
     /// 智能止损 / 止盈建议（refreshDaily / 持仓变更时重算，不逐 tick）
     @Published var stopTakeAdvice: StopTakeAdvisor.Advice?
 
+    /// B.1：当日当前标的的 level 事件（分时图右侧栏）。
+    var levelMarks: [LevelMark] {
+        let stampFormatter = DateFormatter()
+        stampFormatter.locale = Locale(identifier: "en_US_POSIX")
+        stampFormatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        stampFormatter.dateFormat = "yyyyMMdd"
+        let clockFormatter = DateFormatter()
+        clockFormatter.locale = Locale(identifier: "en_US_POSIX")
+        clockFormatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        clockFormatter.dateFormat = "HHmm"
+        let today = stampFormatter.string(from: Date())
+        return signalEvents
+            .filter { $0.kind == "level" && $0.code == settings.currentCode }
+            .compactMap { event in
+                guard stampFormatter.string(from: event.at) == today else { return nil }
+                let hit = event.meta["hit"] == "1"
+                let windowOpen = Date().timeIntervalSince(event.at) < 6 * 3600
+                let state: LevelMark.State = hit ? .hit : (windowOpen ? .waiting : .missed)
+                return LevelMark(
+                    minute: clockFormatter.string(from: event.at),
+                    state: state,
+                    title: event.title,
+                    leadSec: hit ? Int(event.meta["leadSec"] ?? "") : nil
+                )
+            }
+    }
+
     /// A 股池智能推荐（复盘页）：文档 + 加载/生成状态
     @Published var picksDoc: GatewayPicksDocument?
     @Published var picksBusy = false

@@ -39,6 +39,14 @@ struct DayBar: Identifiable, Equatable, Codable {
     var volume: Double = 0
 }
 
+/// B.6 热力图单元格数据。
+struct WatchHeatCell: Identifiable, Equatable {
+    var code: String
+    var name: String
+    var pct: Double
+    var id: String { code }
+}
+
 enum MarketError: Error {
     case badData
 }

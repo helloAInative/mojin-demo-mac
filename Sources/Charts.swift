@@ -1,5 +1,21 @@
 import SwiftUI
 
+/// B.1：当日 level 事件的分时图右侧栏标记。
+struct LevelMark: Equatable, Identifiable {
+    /// 分钟 "HHmm"
+    var minute: String
+    var state: State
+    var title: String
+    var leadSec: Int?
+    var id: String { minute + title }
+
+    enum State {
+        case hit
+        case missed
+        case waiting
+    }
+}
+
 struct MinuteChart: View {
     var bars: [MinuteBar]
     var prev: Double
@@ -14,6 +30,8 @@ struct MinuteChart: View {
     var cost: Double = 0
     /// 现价相对成本线预警阈值（%），默认 1.0
     var costLightPct: Double = 1.0
+    /// B.1：当日 level 事件右侧栏（按时间戳竖列，颜色分 hit / 失效 / 等待中）
+    var levelMarks: [LevelMark] = []
 
     @State private var hoverIndex: Int? = nil
     @State private var hoverPoint: CGPoint = .zero
@@ -189,6 +207,20 @@ struct MinuteChart: View {
         }
         context.stroke(line, with: .color(color), lineWidth: 1.6)
 
+        // B.3：均价线（VWAP，腾讯分钟数据的 avg）——黄细线，hover 亦有数值
+        var avgLine = Path()
+        var started = false
+        for (i, b) in bars.enumerated() where b.avg > 0 {
+            let pt = CGPoint(x: x(i), y: y(b.avg))
+            if started {
+                avgLine.addLine(to: pt)
+            } else {
+                avgLine.move(to: pt)
+                started = true
+            }
+        }
+        context.stroke(avgLine, with: .color(Color(red: 1, green: 0.84, blue: 0.04).opacity(0.65)), lineWidth: 1)
+
         if let i = hoverIndex, i < bars.count {
             let hx = x(i)
             let hy = y(bars[i].price)
@@ -241,11 +273,79 @@ struct MinuteChart: View {
                          flashPhase: flashPhase)
         }
 
+        // B.1：当日 level 事件右侧栏（竖列时间轴：上=开盘，下=收盘）
+        if !levelMarks.isEmpty {
+            drawLevelRail(context: context,
+                          padL: padL, padR: padR,
+                          yTop: padT, yBottom: size.height - padB,
+                          totalW: size.width - padL - padR)
+        }
+
         // X 轴时间刻度
         drawXAxisTicks(context: context,
                        padL: padL, padR: padR,
                        yBottom: size.height - padB,
                        totalW: size.width - padL - padR)
+    }
+
+    /// 右侧栏：宽 ~20pt 竖列，每个事件按时间戳落位；hit=绿✓、失效=红×、等待=灰•。
+    private func drawLevelRail(
+        context: GraphicsContext,
+        padL: CGFloat, padR: CGFloat,
+        yTop: CGFloat, yBottom: CGFloat,
+        totalW: CGFloat
+    ) {
+        let railW: CGFloat = 20
+        let railX = padL + totalW - railW / 2
+        // 栏底线
+        var rail = Path()
+        rail.move(to: CGPoint(x: railX - railW / 2, y: yTop))
+        rail.addLine(to: CGPoint(x: railX - railW / 2, y: yBottom))
+        context.stroke(rail, with: .color(.white.opacity(0.12)), lineWidth: 1)
+        // 交易时段映射：09:30-15:00（含午休折叠——用 session slot 而非线性时间）
+        let slots = CGFloat(max(Self.session.count - 1, 1))
+        for mark in levelMarks {
+            guard mark.minute.count == 4,
+                  let h = Int(mark.minute.prefix(2)),
+                  let m = Int(mark.minute.suffix(2)) else { continue }
+            let timeMinutes = h * 60 + m
+            let slot = Self.session.firstIndex(of: mark.minute)
+            let ratio: CGFloat
+            if let slot {
+                ratio = CGFloat(slot) / slots
+            } else {
+                // 非交易时段（开盘前 / 午休夹缝）：线性夹到栏内
+                let open = 9 * 60 + 30, close = 15 * 60
+                ratio = CGFloat(max(min(timeMinutes, close), open) - open) / CGFloat(close - open)
+            }
+            let py = yTop + ratio * (yBottom - yTop)
+            let color: Color = {
+                switch mark.state {
+                case .hit: return Color(red: 0.2, green: 0.84, blue: 0.29)
+                case .missed: return Color(red: 1, green: 0.35, blue: 0.3)
+                case .waiting: return .gray
+                }
+            }()
+            context.fill(Path(ellipseIn: CGRect(x: railX - 3.5, y: py - 3.5, width: 7, height: 7)),
+                         with: .color(color))
+            let glyph: String = {
+                switch mark.state {
+                case .hit: return "✓"
+                case .missed: return "×"
+                case .waiting: return "…"
+                }
+            }()
+            let label = Text(glyph)
+                .font(.system(size: 7, weight: .bold))
+                .foregroundColor(color)
+            context.draw(label, at: CGPoint(x: railX + railW / 2 - 2, y: py))
+            if mark.state == .hit, let lead = mark.leadSec, lead > 0 {
+                let leadText = Text(lead >= 60 ? "\(lead / 60)m" : "\(lead)s")
+                    .font(.system(size: 6))
+                    .foregroundColor(.secondary)
+                context.draw(leadText, at: CGPoint(x: railX - railW / 2 - 6, y: py))
+            }
+        }
     }
 
     /// 在分时图上画 AI 事件流（折角箭头 + 标签）。
