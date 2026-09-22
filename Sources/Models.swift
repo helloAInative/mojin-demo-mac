@@ -68,6 +68,19 @@ enum SectorAlignment {
     }
 }
 
+/// C.3 提示冷却：同一价位近 5 分钟触发 ≥3 次 → 第 3 次起折叠（后续抑制 + 标记）。
+enum AlertFold {
+    /// 返回 (fold: 是否抑制后续, mark: 标题是否加「刚才提示过」)。
+    /// mark 在第 3 次（阈值命中那次）置 true；之后 fold 为 true。
+    static func judge(fires: [Date], now: Date = Date(),
+                      window: TimeInterval = 300, threshold: Int = 3) -> (fold: Bool, mark: Bool) {
+        let recent = fires.filter { now.timeIntervalSince($0) < window }
+        if recent.count >= threshold { return (true, false) }
+        if recent.count == threshold - 1 { return (false, true) }
+        return (false, false)
+    }
+}
+
 enum MarketError: Error {
     case badData
 }

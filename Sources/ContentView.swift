@@ -1245,6 +1245,12 @@ struct ContentView: View {
                     Text("日K · \(store.days.count) 根")
                         .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(.secondary)
+                    if !backtestMarks.isEmpty {
+                        Text("回测 \(backtestMarks.count) 点 ▲✕")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                            .help("策略页跑的回测命中点：▲ 净盈（红）/ ✕ 净亏（绿），悬停看进出价与净幅")
+                    }
                     ForEach(Array([(5, Color(red: 1, green: 0.84, blue: 0.04)),
                                    (10, Color(red: 0.39, green: 0.82, blue: 1)),
                                    (20, Color(red: 0.8, green: 0.5, blue: 1))].enumerated()), id: \.offset) { _, pair in
@@ -1263,7 +1269,7 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                DayChart(days: store.days, limit: 90)
+                DayChart(days: store.days, limit: 90, marks: backtestMarks)
                     .frame(height: 190)
                     .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
@@ -2292,6 +2298,14 @@ struct ContentView: View {
         formatter.dateFormat = "yyyy-MM-dd"
         return (0..<n).compactMap { Calendar.current.date(byAdding: .day, value: -$0, to: Date()) }
             .map { formatter.string(from: $0) }
+    }
+
+    /// C.2：lastBacktest 的交易点转 K 线标记（回测针对当前标的跑的）。
+    private var backtestMarks: [DayMark] {
+        guard let result = store.lastBacktest else { return [] }
+        return result.trades.map {
+            DayMark(date: $0.signalDate, netPct: $0.netPct, entry: $0.entry, exit: $0.exit)
+        }
     }
 
     private func tickClock(_ date: Date) -> String {

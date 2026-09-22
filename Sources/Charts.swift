@@ -1244,10 +1244,22 @@ struct AccuracyTrendChart: View {
 
 /// B.2：日 K 多周期——蜡烛图 + MA5/10/20 + 底部成交量条 + hover 十字线。
 /// 与分时图上下叠放构成多周期视角（时间轴各自独立：分钟 vs 交易日）。
+/// C.2：回测命中标记（策略页跑完回测后画到日 K 上）。
+struct DayMark: Equatable, Identifiable {
+    var date: String
+    /// netPct ≥ 0 → 盈利 ▲；< 0 → 亏损 ✕
+    var netPct: Double
+    var entry: Double
+    var exit: Double
+    var id: String { date }
+}
+
 struct DayChart: View {
     var days: [DayBar]
     /// 展示最近 N 根（默认 90）
     var limit: Int = 90
+    /// C.2：回测命中 / 失效点
+    var marks: [DayMark] = []
     /// 顶部预留（最高价标注）
     private let padT: CGFloat = 10
     private let padB: CGFloat = 12
@@ -1291,6 +1303,12 @@ struct DayChart: View {
                         Text(String(format: "量%.0f MA5%@ MA10%@ MA20%@",
                                      bar.volume,
                                      maText(i, period: 5), maText(i, period: 10), maText(i, period: 20)))
+                        if let mark = marks.first(where: { $0.date == bar.date }) {
+                            Text(String(format: "回测 入%.2f 出%.2f 净%+.1f%%",
+                                        mark.entry, mark.exit, mark.netPct))
+                                .foregroundColor(mark.netPct >= 0 ? Color(red: 1, green: 0.27, blue: 0.23)
+                                                              : Color(red: 0.2, green: 0.84, blue: 0.29))
+                        }
                     }
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundColor(.white)
@@ -1444,6 +1462,23 @@ struct DayChart: View {
                 .font(.system(size: 8))
                 .foregroundColor(.secondary)
             context.draw(text, at: CGPoint(x: xFor(i, in: size), y: size.height - 5))
+        }
+
+        // C.2：回测命中标记（▲ 盈利红 / ✕ 亏损绿，画在蜡烛高点上方）
+        if !marks.isEmpty {
+            let markMap = Dictionary(uniqueKeysWithValues: marks.map { ($0.date, $0) })
+            for (i, bar) in view.enumerated() {
+                guard let mark = markMap[bar.date] else { continue }
+                let x = xFor(i, in: size)
+                let yTop = y(bar.high) - 8
+                let win = mark.netPct >= 0
+                let color = win ? upColor : downColor
+                let glyph = win ? "▲" : "✕"
+                let text = Text(glyph)
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundColor(color)
+                context.draw(text, at: CGPoint(x: x, y: yTop))
+            }
         }
 
         // hover 十字线

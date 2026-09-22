@@ -340,6 +340,8 @@ final class MarketStore: ObservableObject {
     /// 每条价位线的当前预警档位（用于决定是否发通知）。
     /// key: "base" | "support" | "resistance"
     private var lastLevelAlert: [String: LevelAlertTier] = [:]
+    /// C.3：同价位预警触发时间戳（近 5 分钟窗口，用于折叠判定）
+    private var levelAlertFires: [String: [Date]] = [:]
     /// 持仓到本预警状态：当前是否在 costLightPct 内（防重复）
     private var lastPositionAlertState: Bool = false
 
@@ -1713,9 +1715,18 @@ final class MarketStore: ObservableObject {
             }
             lastLevelAlert[key] = newTier
             if shouldFire {
+                // C.3 同价位 5 分钟 ≥3 次折叠：阈值那次加「刚才提示过」，之后静默
+                let now = Date()
+                levelAlertFires[key, default: []].append(now)
+                levelAlertFires[key] = (levelAlertFires[key] ?? []).filter {
+                    now.timeIntervalSince($0) < 300
+                }
+                let fold = AlertFold.judge(fires: levelAlertFires[key] ?? [], now: now)
+                if fold.fold { continue }
                 let distStr = String(format: "%.2f%%", distPct)
                 let tierStr = newTier == .deep ? "二级预警" : "一级预警"
-                let title = "\(name) · \(label)\(tierStr)"
+                var title = "\(name) · \(label)\(tierStr)"
+                if fold.mark { title += "（刚才提示过）" }
                 let body  = String(format: "现价 %.2f  距 %.2f  %@",
                                    p, value, distStr)
                 let nid = "alert-level-\(key)-\(newTier == .deep ? "deep" : "light")"
