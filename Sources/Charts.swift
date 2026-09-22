@@ -1241,3 +1241,222 @@ struct AccuracyTrendChart: View {
         }
     }
 }
+
+/// B.2：日 K 多周期——蜡烛图 + MA5/10/20 + 底部成交量条 + hover 十字线。
+/// 与分时图上下叠放构成多周期视角（时间轴各自独立：分钟 vs 交易日）。
+struct DayChart: View {
+    var days: [DayBar]
+    /// 展示最近 N 根（默认 90）
+    var limit: Int = 90
+    /// 顶部预留（最高价标注）
+    private let padT: CGFloat = 10
+    private let padB: CGFloat = 12
+    private let padL: CGFloat = 4
+    private let padR: CGFloat = 4
+    /// 成交量区占图高比例
+    private let volRatio: CGFloat = 0.24
+
+    @State private var hoverIndex: Int? = nil
+
+    private let upColor = Color(red: 1, green: 0.27, blue: 0.23)
+    private let downColor = Color(red: 0.2, green: 0.84, blue: 0.29)
+    private let maColors: [(Int, Color)] = [
+        (5, Color(red: 1, green: 0.84, blue: 0.04)),
+        (10, Color(red: 0.39, green: 0.82, blue: 1)),
+        (20, Color(red: 0.8, green: 0.5, blue: 1)),
+    ]
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .topLeading) {
+                Canvas { context, size in
+                    draw(context: context, size: size)
+                }
+                .drawingGroup()
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            hoverIndex = index(atX: value.location.x, in: geo.size)
+                        }
+                        .onEnded { _ in hoverIndex = nil }
+                )
+
+                if let i = hoverIndex, i < view.count {
+                    let bar = view[i]
+                    let up = bar.close >= bar.open
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(bar.date)
+                        Text(String(format: "开%.2f 高%.2f", bar.open, bar.high))
+                        Text(String(format: "低%.2f 收%.2f", bar.low, bar.close))
+                        Text(String(format: "量%.0f MA5%@ MA10%@ MA20%@",
+                                     bar.volume,
+                                     maText(i, period: 5), maText(i, period: 10), maText(i, period: 20)))
+                    }
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 6).padding(.vertical, 4)
+                    .background(Color.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 4))
+                    .offset(x: min(geo.size.width - 190, max(0, xFor(i, in: geo.size) - 80)),
+                            y: 2)
+                    .id(up) // 防布局抖动
+                }
+            }
+        }
+    }
+
+    private var view: [DayBar] {
+        Array(days.suffix(max(limit, 20)))
+    }
+
+    /// 简单移动平均：前 period-1 个为 nil。
+    private func maSeries(_ values: [Double], period: Int) -> [Double?] {
+        guard values.count >= period else { return values.map { _ in nil } }
+        var out: [Double?] = Array(repeating: nil, count: period - 1)
+        var sum = values.prefix(period).reduce(0, +)
+        out.append(sum / Double(period))
+        for i in period..<values.count {
+            sum += values[i] - values[i - period]
+            out.append(sum / Double(period))
+        }
+        return out
+    }
+
+    private func maText(_ i: Int, period: Int) -> String {
+        let closes = view.map(\.close)
+        let series = maSeries(closes, period: period)
+        guard i < series.count, let v = series[i] else { return "--" }
+        return String(format: "%.2f", v)
+    }
+
+    private func xFor(_ i: Int, in size: CGSize) -> CGFloat {
+        let count = max(view.count, 1)
+        return padL + (CGFloat(i) + 0.5) / CGFloat(count) * (size.width - padL - padR)
+    }
+
+    private func index(atX x: CGFloat, in size: CGSize) -> Int? {
+        guard view.count > 0, size.width > 8 else { return nil }
+        let width = size.width - padL - padR
+        let i = Int(((x - padL) / width) * CGFloat(view.count))
+        return min(max(i, 0), view.count - 1)
+    }
+
+    private func draw(context: GraphicsContext, size: CGSize) {
+        let view = self.view
+        guard !view.isEmpty else {
+            let text = Text("等待日 K…").font(.system(size: 11)).foregroundColor(.secondary)
+            context.draw(text, at: CGPoint(x: 8, y: size.height / 2))
+            return
+        }
+        let count = view.count
+        let chartW = size.width - padL - padR
+        let chartH = size.height - padT - padB
+        let volH = chartH * volRatio
+        let priceH = chartH - volH - 6
+
+        // 价格区间（含 MA 极值，避免线出界）
+        let closes = view.map(\.close)
+        var hi = view.map(\.high).max() ?? 1
+        var lo = view.map(\.low).min() ?? 0
+        for (period, _) in maColors {
+            for v in maSeries(closes, period: period).compactMap({ $0 }) {
+                hi = max(hi, v)
+                lo = min(lo, v)
+            }
+        }
+        guard hi > lo else { return }
+        let pad = (hi - lo) * 0.02
+        hi += pad
+        lo -= pad
+        func y(_ price: Double) -> CGFloat {
+            padT + (1 - CGFloat((price - lo) / (hi - lo))) * priceH
+        }
+
+        // 网格：昨收虚线（仅最后一根前收）+ 成交量区分隔
+        let last = view.last!
+        let lastUp = last.close >= last.open
+        var prevLine = Path()
+        prevLine.move(to: CGPoint(x: padL, y: y(last.close)))
+        prevLine.addLine(to: CGPoint(x: size.width - padR, y: y(last.close)))
+        context.stroke(prevLine, with: .color(.white.opacity(0.2)), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+        // 最新收盘价标注（右上）
+        let lastLabel = Text(String(format: "%.2f", last.close))
+            .font(.system(size: 9, weight: .bold))
+            .foregroundColor(lastUp ? upColor : downColor)
+        context.draw(lastLabel, at: CGPoint(x: size.width - 26, y: y(last.close) - 6))
+
+        let candleW = max(1.5, chartW / CGFloat(count) * 0.66)
+
+        // 蜡烛：红涨绿跌（A 股），wick 同色
+        for (i, bar) in view.enumerated() {
+            let x = xFor(i, in: size)
+            let up = bar.close >= bar.open
+            let color = up ? upColor : downColor
+            var wick = Path()
+            wick.move(to: CGPoint(x: x, y: y(bar.high)))
+            wick.addLine(to: CGPoint(x: x, y: y(bar.low)))
+            context.stroke(wick, with: .color(color.opacity(0.85)), lineWidth: 1)
+            let top = y(max(bar.open, bar.close))
+            let bottom = y(min(bar.open, bar.close))
+            let body = CGRect(x: x - candleW / 2, y: top, width: candleW,
+                              height: max(bottom - top, 1))
+            // 阴线空心（A 股习惯），阳线实心
+            if up {
+                context.fill(Path(body), with: .color(color.opacity(0.9)))
+            } else {
+                context.stroke(Path(body), with: .color(color.opacity(0.9)), lineWidth: 1)
+                context.fill(Path(body), with: .color(color.opacity(0.12)))
+            }
+        }
+
+        // MA5 / 10 / 20
+        for (period, color) in maColors {
+            let series = maSeries(closes, period: period)
+            var line = Path()
+            var started = false
+            for (i, v) in series.enumerated() {
+                guard let v else { continue }
+                let pt = CGPoint(x: xFor(i, in: size), y: y(v))
+                if started {
+                    line.addLine(to: pt)
+                } else {
+                    line.move(to: pt)
+                    started = true
+                }
+            }
+            context.stroke(line, with: .color(color.opacity(0.9)), lineWidth: 1.1)
+        }
+
+        // 成交量条（底部 24%，随涨跌着色）
+        let maxVol = view.map(\.volume).max() ?? 1
+        let volTop = padT + priceH + 6
+        for (i, bar) in view.enumerated() {
+            let x = xFor(i, in: size)
+            let up = bar.close >= bar.open
+            let h = CGFloat(bar.volume / maxVol) * volH
+            let rect = CGRect(x: x - candleW / 2, y: size.height - padB - h,
+                              width: candleW, height: max(h, 0.5))
+            context.fill(Path(rect), with: .color((up ? upColor : downColor).opacity(0.55)))
+        }
+
+        // X 轴稀疏日期（首 / 中 / 尾）
+        for i in [0, count / 2, count - 1] {
+            let text = Text(String(view[i].date.suffix(5)))
+                .font(.system(size: 8))
+                .foregroundColor(.secondary)
+            context.draw(text, at: CGPoint(x: xFor(i, in: size), y: size.height - 5))
+        }
+
+        // hover 十字线
+        if let i = hoverIndex, i < count {
+            let x = xFor(i, in: size)
+            let hy = y(view[i].close)
+            var cross = Path()
+            cross.move(to: CGPoint(x: x, y: padT))
+            cross.addLine(to: CGPoint(x: x, y: size.height - padB))
+            cross.move(to: CGPoint(x: padL, y: hy))
+            cross.addLine(to: CGPoint(x: size.width - padR, y: hy))
+            context.stroke(cross, with: .color(.cyan.opacity(0.55)), style: StrokeStyle(lineWidth: 1, dash: [3, 2]))
+        }
+    }
+
+}

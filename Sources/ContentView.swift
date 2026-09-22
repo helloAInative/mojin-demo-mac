@@ -1189,6 +1189,37 @@ struct ContentView: View {
             )
             .frame(height: 96)
             .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            // B.2：日 K 多周期（分时下方，K 线 + MA5/10/20 + 成交量）
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text("日K · \(store.days.count) 根")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.secondary)
+                    ForEach(Array([(5, Color(red: 1, green: 0.84, blue: 0.04)),
+                                   (10, Color(red: 0.39, green: 0.82, blue: 1)),
+                                   (20, Color(red: 0.8, green: 0.5, blue: 1))].enumerated()), id: \.offset) { _, pair in
+                        HStack(spacing: 2) {
+                            Circle().fill(pair.1).frame(width: 4, height: 4)
+                            Text("MA\(pair.0)")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    Spacer()
+                    if let last = store.days.last {
+                        Text(String(format: "收 %.2f · 量 %.0f", last.close, last.volume))
+                            .font(.system(size: 9))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                DayChart(days: store.days, limit: 90)
+                    .frame(height: 190)
+                    .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .padding(8)
+            .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .padding(8)
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
