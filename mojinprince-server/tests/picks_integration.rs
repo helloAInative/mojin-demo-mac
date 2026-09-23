@@ -319,3 +319,132 @@ async fn backfill_writes_outcome_and_stats() {
     assert!(doc.stats.t5_win_rate > 0.99);
     assert!((doc.stats.avg_t5_pct - t5).abs() < 1e-9);
 }
+
+#[actix_web::test]
+async fn realtime_limit_up_recalibrates_plan_to_next_session_open() {
+    let upstream = MockServer::start();
+    // 候选池：一只候选 snapshot pct=2.8（未涨停）
+    upstream.mock(|when, then| {
+        when.method(GET).path("/api/qt/clist/get");
+        then.status(200).json_body(json!({
+            "data": {"diff": [
+                {"f12": "300623", "f14": "捷捷微电", "f2": 35.11, "f3": 2.8, "f100": "半导体"}
+            ]}
+        }));
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/appstock/app/fqkline/get");
+        then.status(200).json_body(json!({
+            "data": {"sz300623": {"qfqday": zigzag_bars()}}
+        }));
+    });
+    // 隔夜美股 mock
+    upstream.mock(|when, then| {
+        when.method(GET).path("/q=usDJI,usIXIC");
+        then.status(200).body(
+            "v_usDJI=\"200~DJI~.DJI~102.0~100.0~102.5~1\";\nv_usIXIC=\"200~IXIC~.IXIC~102.0~100.0~102.5~1\"",
+        );
+    });
+    // §A.5.1 实时校准 mock：f3=20.0（创业板已封板）→ 实时涨停
+    upstream.mock(|when, then| {
+        when.method(GET)
+            .path("/api/qt/stock/get")
+            .query_param("secid", "0.300623");
+        then.status(200).json_body(json!({
+            "data": {"f2": 42.13, "f3": 20.0}
+        }));
+    });
+
+    let mut state = fresh_state().await;
+    state.pick_ranking.base_url = upstream.base_url();
+    state.day_k.base_url = upstream.base_url();
+    state.us_index.base_url = upstream.base_url();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::pick::configure)),
+    )
+    .await;
+
+    let doc: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/picks/run")
+            .to_request(),
+    )
+    .await;
+    let pick = &doc["picks"][0];
+    // 实时校准命中 → plan 强制次日开盘
+    assert_eq!(pick["meta"]["limit_up_realtime"], true);
+    assert_eq!(pick["meta"]["limit_up_calibrated"], true);
+    assert_eq!(pick["meta"]["plan"]["entry_label"], "次日开盘");
+    assert_eq!(pick["meta"]["plan"]["entry_timing"], "next_session_open");
+    assert_eq!(pick["meta"]["plan"]["entry_window"], "09:30-09:35");
+    // snapshot 仍是未涨停（meta.is_limit_up 保留）
+    assert_eq!(pick["meta"]["is_limit_up"], false);
+}
+
+#[actix_web::test]
+async fn realtime_limit_up_recalibrate_falls_back_to_snapshot_on_network_error() {
+    let upstream = MockServer::start();
+    upstream.mock(|when, then| {
+        when.method(GET).path("/api/qt/clist/get");
+        then.status(200).json_body(json!({
+            "data": {"diff": [
+                {"f12": "300623", "f14": "捷捷微电", "f2": 35.11, "f3": 2.8, "f100": "半导体"}
+            ]}
+        }));
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/appstock/app/fqkline/get");
+        then.status(200).json_body(json!({
+            "data": {"sz300623": {"qfqday": zigzag_bars()}}
+        }));
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/q=usDJI,usIXIC");
+        then.status(200).body(
+            "v_usDJI=\"200~DJI~.DJI~102.0~100.0~102.5~1\";\nv_usIXIC=\"200~IXIC~.IXIC~102.0~100.0~102.5~1\"",
+        );
+    });
+    // 实时校准接口返回 500 → fetch 返回 None → 不改 plan
+    upstream.mock(|when, then| {
+        when.method(GET)
+            .path("/api/qt/stock/get")
+            .query_param("secid", "0.300623");
+        then.status(500);
+    });
+
+    let mut state = fresh_state().await;
+    state.pick_ranking.base_url = upstream.base_url();
+    state.day_k.base_url = upstream.base_url();
+    state.us_index.base_url = upstream.base_url();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::pick::configure)),
+    )
+    .await;
+
+    let doc: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/picks/run")
+            .to_request(),
+    )
+    .await;
+    let pick = &doc["picks"][0];
+    assert_eq!(
+        pick["meta"]["limit_up_calibrated"], false,
+        "上游 500 时不应标 calibrated"
+    );
+    assert_eq!(pick["meta"]["limit_up_realtime"], false);
+    // snapshot 是未涨停，所以 plan 走 14:45 窗口
+    let entry_timing = pick["meta"]["plan"]["entry_timing"].as_str().unwrap();
+    assert!(
+        entry_timing == "today_close" || entry_timing == "next_session_pullback",
+        "网络失败应保留 snapshot 决策：{entry_timing}"
+    );
+}

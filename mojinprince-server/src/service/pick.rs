@@ -265,6 +265,65 @@ fn market_prefix(raw: &str) -> &'static str {
 }
 
 // ============================================================================
+// §A.5.1 涨停二次校准：拉取实时价/涨幅，重新判定是否当日已封板。
+// ============================================================================
+
+/// 单票实时校准结果。`Some(true)` = 实时涨停、`Some(false)` = 未涨停、
+/// `None` = 拉取失败（保留 snapshot 的 is_limit_up）。
+async fn fetch_realtime_limit_up(
+    http: &reqwest::Client,
+    base_url: &str,
+    code: &str,
+) -> Option<bool> {
+    let normalized = code;
+    let market = if normalized.starts_with("sh") {
+        "1"
+    } else {
+        "0"
+    };
+    let pure = normalized.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+    let url = format!("{}/api/qt/stock/get", base_url);
+    let resp = http
+        .get(&url)
+        .query(&[
+            ("secid", format!("{}.{}", market, pure).as_str()),
+            ("fields", "f2,f3"),
+        ])
+        .timeout(StdDuration::from_millis(2_000))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: Value = resp.json().await.ok()?;
+    let pct = json["data"]["f3"].as_f64()?;
+    Some(is_limit_up(normalized, pct))
+}
+
+/// 对 top picks 做实时涨停二次校准；网络失败的票不出现在 map 里，调用方应回退到候选快照。
+async fn recalibrate_limit_up_realtime(
+    http: &reqwest::Client,
+    base_url: &str,
+    picks: &[(Candidate, f64, Vec<String>)],
+) -> HashMap<String, bool> {
+    let mut out = HashMap::new();
+    for (candidate, _, _) in picks {
+        match fetch_realtime_limit_up(http, base_url, &candidate.code).await {
+            Some(lu) => {
+                out.insert(candidate.code.clone(), lu);
+            }
+            None => {
+                tracing::debug!(code = %candidate.code, "limit-up realtime fetch failed, keep snapshot");
+            }
+        }
+        // 实时校准要快，避免阻塞落库
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+    }
+    out
+}
+
+// ============================================================================
 // 隔夜美股情绪（腾讯，与行情网关同源）
 // ============================================================================
 
@@ -1000,6 +1059,9 @@ pub async fn generate_picks(
     // §A.6 主力净流入抓取（拉取失败只降级跳过）
     let mut main_net_map: std::collections::HashMap<String, MainNetSnapshot> =
         std::collections::HashMap::new();
+    // 暴露到 meta 用于回溯：每只票 main_net_score 实际加分（便于回测 / 调试）。
+    let mut main_net_deltas: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
     for (candidate, _) in &scored {
         match state.main_net.fetch(&state.http, &candidate.code).await {
             Ok(Some(snapshot)) => {
@@ -1115,6 +1177,7 @@ pub async fn generate_picks(
         if let Some(snapshot) = main_net_snapshot {
             let (delta, tag) = main_net_score(snapshot.main_net_wan, snapshot.pct_ratio);
             score += delta;
+            main_net_deltas.insert(candidate.code.clone(), delta);
             if let Some(tag) = tag {
                 tags.push(tag);
             }
@@ -1163,6 +1226,11 @@ pub async fn generate_picks(
     }
     picks.truncate(5);
 
+    // §A.5.1 涨停二次校准：拉取实时价/涨幅，把当下涨停的票 plan 强制改次日开盘。
+    // 网络失败 → fallback 到候选快照的 is_limit_up，不改 plan。
+    let limit_up_realtime: HashMap<String, bool> =
+        recalibrate_limit_up_realtime(&state.http, &state.pick_ranking.base_url, &picks).await;
+
     // 落库（同日全量刷新）
     let date_key = date.format("%Y-%m-%d").to_string();
     let position_codes: Vec<String> =
@@ -1179,12 +1247,24 @@ pub async fn generate_picks(
     let now_ms = Utc::now().timestamp_millis();
     for (rank, (candidate, score, tags)) in picks.iter().enumerate() {
         let has_position = position_codes.iter().any(|code| code == &candidate.code);
+        // 二次校准：实时拉到涨停的票，is_limit_up 视为 true（plan 强制次日开盘）；
+        // 实时拉到未涨停，且 snapshot 也未涨停 → false；未拉到则用 snapshot。
+        let realtime_limit_up = limit_up_realtime
+            .get(&candidate.code)
+            .copied()
+            .unwrap_or(candidate.is_limit_up);
+        let plan_limit_up = realtime_limit_up || candidate.is_limit_up;
         let meta = serde_json::json!({
             "close": candidate.price,
             "pct": candidate.pct,
             "industry": candidate.industry,
             "industry_avg": industry_avg.get(&candidate.industry),
             "is_limit_up": candidate.is_limit_up,
+            "limit_up_realtime": limit_up_realtime
+                .get(&candidate.code)
+                .copied()
+                .unwrap_or(false),
+            "limit_up_calibrated": limit_up_realtime.contains_key(&candidate.code),
             "us": {
                 "djia": us_sentiment.as_ref().and_then(|s| s.djia_pct),
                 "ixic": us_sentiment.as_ref().and_then(|s| s.ixic_pct),
@@ -1196,6 +1276,7 @@ pub async fn generate_picks(
                 "pct_ratio": s.pct_ratio,
                 "turnover": s.turnover,
                 "trade_date": s.trade_date,
+                "score_delta": main_net_deltas.get(&candidate.code).copied().unwrap_or(0.0),
             })),
             "auto_weight": learned_meta.get(&candidate.code).cloned().unwrap_or_else(|| serde_json::json!({
                 "adjustment": 0.0,
@@ -1203,7 +1284,7 @@ pub async fn generate_picks(
                 "minimum_samples": 30,
                 "lookback_days": 30,
             })),
-            "plan": build_trade_plan(date, now_cn, tags, has_position, candidate.is_limit_up),
+            "plan": build_trade_plan(date, now_cn, tags, has_position, plan_limit_up),
         });
         sqlx::query(
             "INSERT INTO daily_pick(date, code, name, rank, score, reasons, ai_note, meta, created_at) \
@@ -2036,5 +2117,18 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
     fn market_prefix_maps_codes() {
         assert_eq!(market_prefix("600519"), "sh");
         assert_eq!(market_prefix("300623"), "sz");
+    }
+
+    #[test]
+    fn is_limit_up_respects_board_and_tolerance() {
+        // 主板：9.5/10 容差
+        assert!(is_limit_up("sh600519", 9.5));
+        assert!(is_limit_up("sh600519", 10.0));
+        assert!(!is_limit_up("sh600519", 9.4));
+        // 创业板/科创板：19.5/20 容差
+        assert!(is_limit_up("sz300623", 19.5));
+        assert!(is_limit_up("sz300623", 20.0));
+        assert!(!is_limit_up("sz300623", 19.4));
+        assert!(!is_limit_up("sh688111", 9.5));
     }
 }
