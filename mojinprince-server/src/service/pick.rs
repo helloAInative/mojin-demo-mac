@@ -827,6 +827,7 @@ fn build_trade_plan(
     now_cn: DateTime<FixedOffset>,
     tags: &[String],
     has_position: bool,
+    is_limit_up: bool,
 ) -> Value {
     let momentum = tags.iter().any(|tag| {
         matches!(
@@ -841,12 +842,26 @@ fn build_trade_plan(
     } else {
         "中线"
     };
+    // 今日已涨停的票：T 日买入不了，必须次日开盘（甚至集合竞价）才有成交。
+    // 不论当前是不是 14:45 窗口，entry_label 强制改成「次日开盘」。
     let before_close = now_cn.hour() * 60 + now_cn.minute() < 15 * 60;
     let today_signal = date == now_cn.date_naive();
-    let (entry_timing, entry_label, entry_window) = if today_signal && before_close {
-        ("today_close", "今日尾盘", "14:45-14:57")
+    let (entry_timing, entry_label, entry_window, objective) = if is_limit_up {
+        (
+            "next_session_open",
+            "次日开盘",
+            "09:30-09:35",
+            "next_day_open_positive",
+        )
+    } else if today_signal && before_close {
+        ("today_close", "今日尾盘", "14:45-14:57", "next_day_positive_close")
     } else {
-        ("next_session_pullback", "下一交易日回踩", "09:35-10:30")
+        (
+            "next_session_pullback",
+            "下一交易日回踩",
+            "09:35-10:30",
+            "next_day_positive_close",
+        )
     };
     let exit_rule = match strategy {
         "做T" => "仅适合已有底仓；新增仓按 T+1，次日冲高再减",
@@ -856,12 +871,13 @@ fn build_trade_plan(
     serde_json::json!({
         "signal_date": date.format("%Y-%m-%d").to_string(),
         "target": "T+1",
-        "objective": "next_day_positive_close",
+        "objective": objective,
         "entry_timing": entry_timing,
         "entry_label": entry_label,
         "entry_window": entry_window,
         "strategy": strategy,
         "has_base_position": has_position,
+        "is_limit_up": is_limit_up,
         "exit_rule": exit_rule,
     })
 }
@@ -945,10 +961,12 @@ pub async fn generate_picks(
         let mut score = tech.score;
         let mut tags = tech.tags.clone();
 
-        // 涨停降权（-15）：不淘汰——好标的保留但标「次日开盘买入」
+        // 今日已涨停的票：T 日买不进，必须次日开盘才有成交。
+        // 不硬淘汰（好标的仍可保留），扣分 -5（弱惩罚），打「次日开盘」标签；
+        // build_trade_plan 会把 entry_label 强制改为「次日开盘 09:30-09:35」。
         if candidate.is_limit_up {
-            score -= 15.0;
-            tags.push("涨停".into());
+            score -= 5.0;
+            tags.push("次日开盘".into());
         }
 
         // 板块动量：强势行业 +15；行业均值 ≤0 减 10
@@ -1091,7 +1109,7 @@ pub async fn generate_picks(
                 "minimum_samples": 30,
                 "lookback_days": 30,
             })),
-            "plan": build_trade_plan(date, now_cn, tags, has_position),
+            "plan": build_trade_plan(date, now_cn, tags, has_position, candidate.is_limit_up),
         });
         sqlx::query(
             "INSERT INTO daily_pick(date, code, name, rank, score, reasons, ai_note, meta, created_at) \
@@ -1483,6 +1501,7 @@ pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
         "SELECT date, code FROM daily_pick \
          WHERE date >= ? AND date < ? AND (\
            json_extract(meta,'$.outcome.t1_pct') IS NULL OR \
+           json_extract(meta,'$.outcome.entry_open') IS NULL OR \
            (date <= ? AND json_extract(meta,'$.outcome.t5_pct') IS NULL)\
          ) \
          ORDER BY date DESC",
@@ -1809,19 +1828,29 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         let tz = FixedOffset::east_opt(8 * 3600).unwrap();
         let date = NaiveDate::from_ymd_opt(2026, 9, 22).unwrap();
         let before_close = tz.with_ymd_and_hms(2026, 9, 22, 14, 46, 0).unwrap();
-        let short = build_trade_plan(date, before_close, &["放量".into()], false);
+        let short = build_trade_plan(date, before_close, &["放量".into()], false, false);
         assert_eq!(short["entry_timing"], "today_close");
         assert_eq!(short["strategy"], "短线");
         assert_eq!(short["target"], "T+1");
+        assert_eq!(short["entry_label"], "今日尾盘");
 
-        let with_base = build_trade_plan(date, before_close, &["放量".into()], true);
+        let with_base = build_trade_plan(date, before_close, &["放量".into()], true, false);
         assert_eq!(with_base["strategy"], "做T");
         assert_eq!(with_base["has_base_position"], true);
 
         let after_close = tz.with_ymd_and_hms(2026, 9, 22, 15, 10, 0).unwrap();
-        let late = build_trade_plan(date, after_close, &["均线多头".into()], false);
+        let late = build_trade_plan(date, after_close, &["均线多头".into()], false, false);
         assert_eq!(late["entry_timing"], "next_session_pullback");
         assert_eq!(late["strategy"], "中线");
+
+        // 今日已涨停：不论窗口是否 14:45 前，强制「次日开盘」
+        let locked = build_trade_plan(date, before_close, &["放量".into()], false, true);
+        assert_eq!(locked["entry_timing"], "next_session_open");
+        assert_eq!(locked["entry_label"], "次日开盘");
+        assert_eq!(locked["entry_window"], "09:30-09:35");
+        assert_eq!(locked["is_limit_up"], true);
+        let locked_late = build_trade_plan(date, after_close, &["放量".into()], false, true);
+        assert_eq!(locked_late["entry_label"], "次日开盘");
     }
 
     #[test]
