@@ -316,17 +316,37 @@ struct GatewayPicksDocument: Decodable, Equatable {
     var picks: [GatewayPick]
     var samples: Int
     var t1WinRate: Double
+    /// Wilson 95% 区间下界：避免「胜率 70% · 样本 10」被误读为稳定指标
+    var t1WinRateLow: Double
+    /// Wilson 95% 区间上界
+    var t1WinRateHigh: Double
+    /// Wilson 区间半宽（绝对值），便于直接显示 ±margin
+    var t1WinRateMargin: Double
+    /// true = 样本 ≥ 30，胜率可参考；false = 样本不足，仅参考方向
+    var t1SamplesSufficient: Bool
     var avgT1Pct: Double
     var t5Samples: Int
     var t5WinRate: Double
+    var t5WinRateLow: Double
+    var t5WinRateHigh: Double
+    var t5WinRateMargin: Double
+    var t5SamplesSufficient: Bool
     var avgT5Pct: Double
 
     private enum StatsKeys: String, CodingKey {
         case samples
         case t1WinRate = "t1_win_rate"
+        case t1WinRateLow = "t1_win_rate_low"
+        case t1WinRateHigh = "t1_win_rate_high"
+        case t1WinRateMargin = "t1_win_rate_margin"
+        case t1SamplesSufficient = "t1_samples_sufficient"
         case avgT1Pct = "avg_t1_pct"
         case t5Samples = "t5_samples"
         case t5WinRate = "t5_win_rate"
+        case t5WinRateLow = "t5_win_rate_low"
+        case t5WinRateHigh = "t5_win_rate_high"
+        case t5WinRateMargin = "t5_win_rate_margin"
+        case t5SamplesSufficient = "t5_samples_sufficient"
         case avgT5Pct = "avg_t5_pct"
         case tags
     }
@@ -365,11 +385,19 @@ struct GatewayPicksDocument: Decodable, Equatable {
         var tag: String
         var samples: Int
         var winRate: Double
+        var winRateLow: Double
+        var winRateHigh: Double
+        var winRateMargin: Double
+        var samplesSufficient: Bool
         var id: String { tag }
 
         enum CodingKeys: String, CodingKey {
             case tag, samples
             case winRate = "win_rate"
+            case winRateLow = "win_rate_low"
+            case winRateHigh = "win_rate_high"
+            case winRateMargin = "win_rate_margin"
+            case samplesSufficient = "samples_sufficient"
         }
     }
 
@@ -380,14 +408,26 @@ struct GatewayPicksDocument: Decodable, Equatable {
 
     init(date: String, picks: [GatewayPick], samples: Int, t5WinRate: Double, avgT5Pct: Double,
          tags: [TagStat] = [], market: MarketInfo? = nil,
-         t1WinRate: Double = 0, avgT1Pct: Double = 0, t5Samples: Int = 0) {
+         t1WinRate: Double = 0, avgT1Pct: Double = 0, t5Samples: Int = 0,
+         t1WinRateLow: Double = 0, t1WinRateHigh: Double = 0, t1WinRateMargin: Double = 0,
+         t1SamplesSufficient: Bool = false,
+         t5WinRateLow: Double = 0, t5WinRateHigh: Double = 0, t5WinRateMargin: Double = 0,
+         t5SamplesSufficient: Bool = false) {
         self.date = date
         self.picks = picks
         self.samples = samples
         self.t1WinRate = t1WinRate
+        self.t1WinRateLow = t1WinRateLow
+        self.t1WinRateHigh = t1WinRateHigh
+        self.t1WinRateMargin = t1WinRateMargin
+        self.t1SamplesSufficient = t1SamplesSufficient
         self.avgT1Pct = avgT1Pct
         self.t5Samples = t5Samples
         self.t5WinRate = t5WinRate
+        self.t5WinRateLow = t5WinRateLow
+        self.t5WinRateHigh = t5WinRateHigh
+        self.t5WinRateMargin = t5WinRateMargin
+        self.t5SamplesSufficient = t5SamplesSufficient
         self.avgT5Pct = avgT5Pct
         self.tags = tags
         self.market = market
@@ -400,9 +440,17 @@ struct GatewayPicksDocument: Decodable, Equatable {
         let stats = try c.nestedContainer(keyedBy: StatsKeys.self, forKey: .stats)
         samples = (try? stats.decodeIfPresent(Int.self, forKey: .samples)) ?? 0
         t1WinRate = (try? stats.decodeIfPresent(Double.self, forKey: .t1WinRate)) ?? 0
+        t1WinRateLow = (try? stats.decodeIfPresent(Double.self, forKey: .t1WinRateLow)) ?? 0
+        t1WinRateHigh = (try? stats.decodeIfPresent(Double.self, forKey: .t1WinRateHigh)) ?? 0
+        t1WinRateMargin = (try? stats.decodeIfPresent(Double.self, forKey: .t1WinRateMargin)) ?? 0
+        t1SamplesSufficient = (try? stats.decodeIfPresent(Bool.self, forKey: .t1SamplesSufficient)) ?? false
         avgT1Pct = (try? stats.decodeIfPresent(Double.self, forKey: .avgT1Pct)) ?? 0
         t5Samples = (try? stats.decodeIfPresent(Int.self, forKey: .t5Samples)) ?? 0
         t5WinRate = (try? stats.decodeIfPresent(Double.self, forKey: .t5WinRate)) ?? 0
+        t5WinRateLow = (try? stats.decodeIfPresent(Double.self, forKey: .t5WinRateLow)) ?? 0
+        t5WinRateHigh = (try? stats.decodeIfPresent(Double.self, forKey: .t5WinRateHigh)) ?? 0
+        t5WinRateMargin = (try? stats.decodeIfPresent(Double.self, forKey: .t5WinRateMargin)) ?? 0
+        t5SamplesSufficient = (try? stats.decodeIfPresent(Bool.self, forKey: .t5SamplesSufficient)) ?? false
         avgT5Pct = (try? stats.decodeIfPresent(Double.self, forKey: .avgT5Pct)) ?? 0
         tags = (try? stats.decodeIfPresent([TagStat].self, forKey: .tags)) ?? []
         market = try? c.decodeIfPresent(MarketInfo.self, forKey: .market)
@@ -416,6 +464,14 @@ struct ExecutionStats: Decodable, Equatable {
     /// 平均执行溢价（次日开盘 vs 推荐日收盘，%）
     var avgEntryGap: Double
     var t1RealWinRate: Double
+    /// Wilson 95% 区间下界（真实执行口径）
+    var t1RealWinRateLow: Double
+    /// Wilson 95% 区间上界
+    var t1RealWinRateHigh: Double
+    /// Wilson 区间半宽
+    var t1RealWinRateMargin: Double
+    /// 样本是否足以给出有意义的胜率（≥30）
+    var t1RealSamplesSufficient: Bool
     var avgT1Real: Double
     var avgMaxDd: Double
     var winLossRatio: Double
@@ -423,6 +479,10 @@ struct ExecutionStats: Decodable, Equatable {
     enum CodingKeys: String, CodingKey {
         case avgEntryGap = "avg_entry_gap"
         case t1RealWinRate = "t1_real_win_rate"
+        case t1RealWinRateLow = "t1_real_win_rate_low"
+        case t1RealWinRateHigh = "t1_real_win_rate_high"
+        case t1RealWinRateMargin = "t1_real_win_rate_margin"
+        case t1RealSamplesSufficient = "t1_real_samples_sufficient"
         case avgT1Real = "avg_t1_real"
         case avgMaxDd = "avg_max_dd"
         case winLossRatio = "win_loss_ratio"

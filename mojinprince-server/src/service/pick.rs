@@ -1518,6 +1518,37 @@ struct AiPick {
 }
 
 /// 读某日推荐 + 统计。`date = None` 取库中最近一天。
+/// §A.8 胜率置信区间（Wilson score interval，95%）。
+///
+///  真实样本 ≥30 时区间半宽通常 ≤ 0.18；样本 10 的 70% 胜率下界 0.35、
+///  上界 0.93——这个宽度足以让「70% 胜率」不再被误读为稳定指标。
+///  返回 (low, high, margin)；n == 0 时 low/high/margin 全部为 0。
+pub fn wilson_interval(samples: i64, hits: i64, z: f64) -> (f64, f64, f64) {
+    if samples <= 0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let n = samples as f64;
+    let p = hits as f64 / n;
+    let z2 = z * z;
+    let denom = 1.0 + z2 / n;
+    let center = (p + z2 / (2.0 * n)) / denom;
+    let half = (z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt()) / denom;
+    let low = (center - half).clamp(0.0, 1.0);
+    let high = (center + half).clamp(0.0, 1.0);
+    (low, high, (high - low) / 2.0)
+}
+
+/// 阈值以下视为「样本不足，胜率仅作参考」。来源：A.4 调权门槛 = 30。
+pub fn samples_sufficient(samples: i64) -> bool {
+    samples >= 30
+}
+
+/// 标准化 Wilson 区间元组（用于 PickStats 字段填充）。
+pub fn confidence_bounds(samples: i64, hits: i64) -> (f64, f64, f64, bool) {
+    let (low, high, margin) = wilson_interval(samples, hits, 1.96);
+    (low, high, margin, samples_sufficient(samples))
+}
+
 pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocument, PickError> {
     let date_key = match date {
         Some(d) => d.to_string(),
@@ -1535,9 +1566,17 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
             stats: PickStats {
                 samples: 0,
                 t1_win_rate: 0.0,
+                t1_win_rate_low: 0.0,
+                t1_win_rate_high: 0.0,
+                t1_win_rate_margin: 0.0,
+                t1_samples_sufficient: false,
                 avg_t1_pct: 0.0,
                 t5_samples: 0,
                 t5_win_rate: 0.0,
+                t5_win_rate_low: 0.0,
+                t5_win_rate_high: 0.0,
+                t5_win_rate_margin: 0.0,
+                t5_samples_sufficient: false,
                 avg_t5_pct: 0.0,
                 tags: Vec::new(),
                 execution: Default::default(),
@@ -1587,6 +1626,11 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     let mut t5_win = 0.0;
     let mut t5_sum = 0.0;
     let mut t5_samples = 0_i64;
+    // §A.8 Wilson 95% 区间：避免「胜率 70% · 样本 10」被误读为稳定指标
+    let (mut t1_low, mut t1_high, mut t1_margin, mut t1_sufficient) =
+        confidence_bounds(0, 0);
+    let (mut t5_low, mut t5_high, mut t5_margin, mut t5_sufficient) =
+        confidence_bounds(0, 0);
     for meta in &outcomes {
         if let Ok(value) = serde_json::from_str::<Value>(meta) {
             if let Some(pct) = value["outcome"]["t1_pct"].as_f64() {
@@ -1605,6 +1649,16 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
             }
         }
     }
+    let (l, h, m, ok) = confidence_bounds(t1_samples, t1_win as i64);
+    t1_low = l;
+    t1_high = h;
+    t1_margin = m;
+    t1_sufficient = ok;
+    let (l, h, m, ok) = confidence_bounds(t5_samples, t5_win as i64);
+    t5_low = l;
+    t5_high = h;
+    t5_margin = m;
+    t5_sufficient = ok;
     // 标签级回测：按 reasons 聚合 T+1 胜率，直接服务隔日目标。
     let tag_rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT reasons, meta FROM daily_pick \
@@ -1632,14 +1686,21 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     }
     let mut tag_stats: Vec<PickTagStat> = tag_bucket
         .into_iter()
-        .map(|(tag, (samples, wins))| PickTagStat {
-            tag,
-            samples,
-            win_rate: if samples > 0 {
-                wins as f64 / samples as f64
-            } else {
-                0.0
-            },
+        .map(|(tag, (samples, wins))| {
+            let (low, high, margin, sufficient) = confidence_bounds(samples, wins);
+            PickTagStat {
+                tag,
+                samples,
+                win_rate: if samples > 0 {
+                    wins as f64 / samples as f64
+                } else {
+                    0.0
+                },
+                win_rate_low: low,
+                win_rate_high: high,
+                win_rate_margin: margin,
+                samples_sufficient: sufficient,
+            }
         })
         .collect();
     tag_stats.sort_by(|a, b| b.samples.cmp(&a.samples));
@@ -1686,13 +1747,19 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
             v.iter().sum::<f64>() / v.len() as f64
         }
     };
+    let real_hits = t1_reals.iter().filter(|r| **r > 0.0).count() as i64;
+    let (real_low, real_high, real_margin, real_sufficient) = confidence_bounds(n, real_hits);
     let execution = crate::model::pick::ExecutionStats {
         avg_entry_gap: avg(&gaps),
         t1_real_win_rate: if n > 0 {
-            t1_reals.iter().filter(|r| **r > 0.0).count() as f64 / n as f64
+            real_hits as f64 / n as f64
         } else {
             0.0
         },
+        t1_real_win_rate_low: real_low,
+        t1_real_win_rate_high: real_high,
+        t1_real_win_rate_margin: real_margin,
+        t1_real_samples_sufficient: real_sufficient,
         avg_t1_real: avg(&t1_reals),
         avg_max_dd: avg(&dds),
         win_loss_ratio: {
@@ -1723,6 +1790,10 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
             } else {
                 0.0
             },
+            t1_win_rate_low: t1_low,
+            t1_win_rate_high: t1_high,
+            t1_win_rate_margin: t1_margin,
+            t1_samples_sufficient: t1_sufficient,
             avg_t1_pct: if t1_samples > 0 {
                 t1_sum / t1_samples as f64
             } else {
@@ -1734,6 +1805,10 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
             } else {
                 0.0
             },
+            t5_win_rate_low: t5_low,
+            t5_win_rate_high: t5_high,
+            t5_win_rate_margin: t5_margin,
+            t5_samples_sufficient: t5_sufficient,
             avg_t5_pct: if t5_samples > 0 {
                 t5_sum / t5_samples as f64
             } else {
@@ -2258,6 +2333,39 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         let (score, cats) = negative_signal_score("减持 + 立案 + 处罚");
         assert_eq!(cats.len(), 3);
         assert_eq!(score, -8.0 + -10.0 + -10.0);
+    }
+
+    #[test]
+    fn wilson_interval_brackets_and_zero_handling() {
+        // 0/N 全部命中 → 区间下界 > 0
+        let (low, high, margin) = wilson_interval(10, 10, 1.96);
+        assert!(low > 0.65, "10/10 下界应 > 0.65：{low}");
+        assert!(high > 0.99);
+        assert!(margin > 0.0);
+
+        // 0/N 全部失败
+        let (low, high, margin) = wilson_interval(10, 0, 1.96);
+        assert!(high < 0.35, "0/10 上界应 < 0.35：{high}");
+        assert!(margin > 0.0);
+
+        // 7/10 = 0.7 经典误读场景。Wilson 95% 实际给出约 (0.398, 0.892)——
+// 与「用 N 算 ±√(p(1-p)/N) ≈ 0.46」相比，区间偏窄但下界依旧低于 0.5。
+        let (low, high, _m) = wilson_interval(10, 7, 1.96);
+        assert!(low < 0.45, "7/10 下界应 < 0.45：{low}");
+        assert!(high > 0.85, "7/10 上界应 > 0.85：{high}");
+        assert!(low < 0.5, "下界应低于 0.5（说明 70% 胜率无统计意义）：{low}");
+
+        // 30 样本时区间收窄
+        let (low30, high30, _) = wilson_interval(30, 21, 1.96);
+        let (low10, high10, _) = wilson_interval(10, 7, 1.96);
+        assert!(high30 - low30 < high10 - low10, "30 样本区间更窄");
+
+        // 0 样本：返回 (0,0,0)
+        assert_eq!(wilson_interval(0, 0, 1.96), (0.0, 0.0, 0.0));
+
+        // 充分性阈值 = 30
+        assert!(!samples_sufficient(29));
+        assert!(samples_sufficient(30));
     }
 
     #[test]

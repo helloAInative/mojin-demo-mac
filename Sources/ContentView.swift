@@ -2827,16 +2827,29 @@ struct ContentView: View {
                     } else {
                         HStack(spacing: 8) {
                             if doc.samples > 0 {
-                                Text(String(format: "T+1 胜率 %.0f%%（%d 样本 · 平均 %+.1f%%）",
-                                            doc.t1WinRate * 100, doc.samples, doc.avgT1Pct))
+                                // §A.8 置信区间：样本不足时显示 ⚠️ + Wilson 95% 区间，避免误读「70% 胜率」
+                                let lowPct = doc.t1WinRateLow * 100
+                                let highPct = doc.t1WinRateHigh * 100
+                                let intervalLabel = String(format: "[%.0f–%.0f%%]", lowPct, highPct)
+                                let warningIcon = doc.t1SamplesSufficient ? "" : "⚠️ "
+                                let warningColor: Color = doc.t1SamplesSufficient ? .secondary : .orange
+                                Text("\(warningIcon)T+1 胜率 \(String(format: "%.0f", doc.t1WinRate * 100))%\(intervalLabel) · \(doc.samples) 样本 · 平均 \(String(format: "%+.1f", doc.avgT1Pct))%")
                                     .font(.system(size: 9, weight: .semibold))
                                     .foregroundStyle(doc.t1WinRate >= 0.5 ? .green : .orange)
-                                    .help("尾盘推荐基准价 vs 下一交易日收盘；近 30 天口径")
+                                    .help("尾盘推荐基准价 vs 下一交易日收盘；近 30 天口径。区间为 Wilson 95% 置信区间，样本 < 30 时区间很宽，不可作为稳定指标。")
                                 if doc.t5Samples > 0 {
-                                    Text(String(format: "T+5 %.0f%%", doc.t5WinRate * 100))
+                                    let t5Low = doc.t5WinRateLow * 100
+                                    let t5High = doc.t5WinRateHigh * 100
+                                    let t5Interval = String(format: "[%.0f–%.0f%%]", t5Low, t5High)
+                                    Text("T+5 \(String(format: "%.0f", doc.t5WinRate * 100))%\(t5Interval) · \(doc.t5Samples) 样本")
                                         .font(.system(size: 8))
                                         .foregroundStyle(.tertiary)
-                                        .help("T+5 中线参考 · \(doc.t5Samples) 样本")
+                                        .help("T+5 中线参考 · Wilson 95% 区间")
+                                }
+                                if !doc.t1SamplesSufficient {
+                                    Text("⚠️ 样本不足 \(doc.samples)，胜率仅供方向参考")
+                                        .font(.system(size: 8, weight: .semibold))
+                                        .foregroundStyle(warningColor)
                                 }
                             } else {
                                 Text("T+1 样本积累中（下一交易日收盘后回写）")
@@ -2853,11 +2866,16 @@ struct ContentView: View {
                     }
                     if let exec = doc.execution, doc.samples > 0 {
                         HStack(spacing: 8) {
-                            Text(String(format: "真实执行(次日开盘): 胜率 %.0f%% · 溢价 %+.1f%%",
-                                        exec.t1RealWinRate * 100, exec.avgEntryGap))
+                            // 真实执行：同上，T+1 真实胜率也加区间提示
+                            let execInterval = String(format: "[%.0f–%.0f%%]",
+                                                      exec.t1RealWinRateLow * 100,
+                                                      exec.t1RealWinRateHigh * 100)
+                            Text(String(format: "真实执行(次日开盘): 胜率 %.0f%%%@ · 溢价 %+.1f%%",
+                                        exec.t1RealWinRate * 100, execInterval, exec.avgEntryGap))
                                 .font(.system(size: 9))
                                 .monospacedDigit()
                                 .foregroundStyle(exec.t1RealWinRate >= 0.5 ? .green : .orange)
+                                .help("Wilson 95% 区间；样本 < 30 时只看方向，不看数字")
                             if exec.avgMaxDd < 0 {
                                 Text(String(format: "最大回撤 %.1f%%", exec.avgMaxDd))
                                     .font(.system(size: 9))

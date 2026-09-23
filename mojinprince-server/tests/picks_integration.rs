@@ -619,3 +619,82 @@ async fn anomaly_tag_appears_when_pct_above_board_threshold() {
         "pct=7.2 应触发「异常波动」：{reasons:?}"
     );
 }
+
+#[actix_web::test]
+async fn list_picks_exposes_wilson_interval_and_low_sample_flag() {
+    // 准备 10 条 daily_pick，命中 7 条（70% 胜率），样本不足触发 samples_sufficient=false
+    let state = fresh_state().await;
+    let db = state.db.clone();
+    let pick_date = "2026-09-15";
+    let next_open_better = |base_close: f64, t1_close: f64, t1_open: f64| {
+        serde_json::json!({
+            "close": base_close,
+            "outcome": {
+                "t1_pct": (t1_close - base_close) / base_close * 100.0,
+                "t1_real": (t1_close - t1_open) / t1_open * 100.0,
+                "entry_gap": (t1_open - base_close) / base_close * 100.0,
+            }
+        })
+    };
+    for i in 0..10i64 {
+        let code = format!("sz30060{}", i + 1);
+        let win = i < 7; // 前 7 条赢，后 3 条输
+        let base = 10.0 + i as f64 * 0.05;
+        let t1_close = if win { base * 1.012 } else { base * 0.985 };
+        let t1_open = base * 1.001;
+        let meta = next_open_better(base, t1_close, t1_open).to_string();
+        sqlx::query(
+            "INSERT INTO daily_pick(date, code, name, rank, score, reasons, ai_note, meta, created_at) \
+             VALUES(?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(pick_date)
+        .bind(&code)
+        .bind(format!("测试{}", i))
+        .bind(i + 1)
+        .bind(80.0)
+        .bind("[\"放量\"]")
+        .bind("")
+        .bind(&meta)
+        .bind(0)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::pick::configure)),
+    )
+    .await;
+
+    let doc: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/api/v1/picks?date={pick_date}"))
+            .to_request(),
+    )
+    .await;
+
+    let stats = &doc["stats"];
+    assert_eq!(stats["samples"].as_i64().unwrap(), 10);
+    assert!(
+        (stats["t1_win_rate"].as_f64().unwrap() - 0.7).abs() < 1e-9,
+        "t1_win_rate 应 = 0.7"
+    );
+    // 关键断言：< 30 样本应标记为 insufficient，前端据此显示 ⚠️
+    assert_eq!(stats["t1_samples_sufficient"], false);
+    // Wilson 区间：10/7 实际约为 (0.398, 0.892)
+    let low = stats["t1_win_rate_low"].as_f64().unwrap();
+    let high = stats["t1_win_rate_high"].as_f64().unwrap();
+    let margin = stats["t1_win_rate_margin"].as_f64().unwrap();
+    assert!(low < 0.45, "下界应 < 0.45（避免误读 70%）：{low}");
+    assert!(high > 0.85, "上界应 > 0.85：{high}");
+    assert!(low < 0.5, "下界 < 0.5 明确告诉用户「70% 胜率无统计意义」：{low}");
+    assert!((margin - (high - low) / 2.0).abs() < 1e-9, "margin 应等于区间半宽");
+    // 真实执行：同样有区间
+    let exec = &stats["execution"];
+    assert_eq!(exec["t1_real_samples_sufficient"], false);
+    let r_low = exec["t1_real_win_rate_low"].as_f64().unwrap();
+    assert!(r_low > 0.0, "真实执行区间下界应 > 0");
+}

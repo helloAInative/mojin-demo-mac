@@ -43,12 +43,32 @@ pub struct PickStats {
     /// 主目标：T+1 收盘价高于推荐日尾盘基准价的比例（0..1）。
     #[serde(default)]
     pub t1_win_rate: f64,
+    /// Wilson 95% 置信区间下界（样本 < 30 时宽度大，避免误读）
+    #[serde(default)]
+    pub t1_win_rate_low: f64,
+    /// Wilson 95% 置信区间上界
+    #[serde(default)]
+    pub t1_win_rate_high: f64,
+    /// 置信区间半宽（绝对值）。前端可直接读 `t1_win_rate ± t1_win_rate_margin`
+    #[serde(default)]
+    pub t1_win_rate_margin: f64,
+    /// 「样本是否足以给出有意义胜率」的便捷阈值。默认 false 表示样本 < 30
+    #[serde(default)]
+    pub t1_samples_sufficient: bool,
     #[serde(default)]
     pub avg_t1_pct: f64,
     /// 兼容中线观察的 T+5 口径。
     #[serde(default)]
     pub t5_samples: i64,
     pub t5_win_rate: f64,
+    #[serde(default)]
+    pub t5_win_rate_low: f64,
+    #[serde(default)]
+    pub t5_win_rate_high: f64,
+    #[serde(default)]
+    pub t5_win_rate_margin: f64,
+    #[serde(default)]
+    pub t5_samples_sufficient: bool,
     pub avg_t5_pct: f64,
     /// 标签级 T+1 回测：哪个因子更适合隔日目标。
     #[serde(default)]
@@ -64,6 +84,14 @@ pub struct PickTagStat {
     pub samples: i64,
     /// 该标签下 T+1 为正的比例（0..1）
     pub win_rate: f64,
+    #[serde(default)]
+    pub win_rate_low: f64,
+    #[serde(default)]
+    pub win_rate_high: f64,
+    #[serde(default)]
+    pub win_rate_margin: f64,
+    #[serde(default)]
+    pub samples_sufficient: bool,
 }
 
 /// 真实执行口径统计（从次日开盘价计算，不是推荐日收盘价）。
@@ -73,6 +101,14 @@ pub struct ExecutionStats {
     pub avg_entry_gap: f64,
     /// 真实 T+1 胜率（从次日开盘价算）
     pub t1_real_win_rate: f64,
+    #[serde(default)]
+    pub t1_real_win_rate_low: f64,
+    #[serde(default)]
+    pub t1_real_win_rate_high: f64,
+    #[serde(default)]
+    pub t1_real_win_rate_margin: f64,
+    #[serde(default)]
+    pub t1_real_samples_sufficient: bool,
     /// 真实 T+1 平均收益
     pub avg_t1_real: f64,
     /// 平均最大回撤（持有期间最低价 vs 买入价）
