@@ -7,6 +7,8 @@
 ### Added
 
 - SwiftUI macOS 菜单栏行情、指标、预警、策略、回测与复盘功能
+- AI 模型清单新增 `MiniMax-M3`（品牌「MiniMax」，推理 / 文本，Token Plan 对话模型），保留 `MiniMax-M2.5`；`TokenPlanCatalog.chat` 自动收录，设置面板模型下拉可直接切换
+- A 股池智能推荐：服务端 `build_trade_plan` 透传 `is_limit_up` —— 已涨停的候选 `entry_timing="next_session_open" / entry_label="次日开盘" / entry_window="09:30-09:35"`，即使在 14:45-15:00 窗口也强制跳到次日开盘（涨停股 T 日买不进）；Swift 复盘页「尾盘智能推荐」卡片新增「**尾盘买进清单**」分区，按 `entry_timing == today_close && !is_limit_up` 拆分已涨停/未涨停两类，已涨停归「次盘新股 · 09:30-09:35」橙色提示，单测覆盖 11/11 全绿
 - Rust Actix Web 行情网关，支持三数据源 failover、熔断和 SQLite 持久化
 - 分时与前复权日 K API、Swagger UI、冒烟测试和并发基准脚本
 - Swift 前端网关设置、连接测试与临时直连回退
