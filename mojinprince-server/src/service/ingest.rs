@@ -653,6 +653,137 @@ pub async fn persist_sector_boards(
     Ok(())
 }
 
+// ============================================================================
+// §A.6 主力资金净流入（A 股池智能推荐因子）
+// 数据源：东财 push2 /api/qt/stock/get secid={market}.{code}
+// 字段：f62 主力净额(元) / f63 超大单净额 / f64 大单净额 / f170 主力净占比 %
+//       f168 换手率 % / f60 昨收（异常警戒参考）
+// 单次拉单股 1 个 HTTP 请求，无需鉴权；调度器在 picks 生成时按候选批量拉一次。
+// ============================================================================
+
+/// 主力资金净流入快照（按日，14:30+ 净流入用于尾盘推荐打分）。
+#[derive(Debug, Clone)]
+pub struct MainNetSnapshot {
+    pub code: String,
+    pub trade_date: String, // YYYY-MM-DD 北京
+    /// 主力净流入 / 万元。东财 f62 是「元」，除 10000。
+    pub main_net_wan: f64,
+    /// 超大单净流入 / 万元（f63）
+    pub super_net_wan: f64,
+    /// 大单净流入 / 万元（f64）
+    pub big_net_wan: f64,
+    /// 主力净占比 %（f170）
+    pub pct_ratio: f64,
+    /// 换手率 %（f168）
+    pub turnover: f64,
+    /// 昨收 / 元（f60，尾盘对照参考）
+    pub prev_close: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct EastMoneyMainNet {
+    /// 测试可覆写 base_url（默认 `https://push2.eastmoney.com`）
+    pub base_url: String,
+}
+
+impl Default for EastMoneyMainNet {
+    fn default() -> Self {
+        Self {
+            base_url: "https://push2.eastmoney.com".into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MainNetEnvelope {
+    data: Option<serde_json::Value>,
+}
+
+impl EastMoneyMainNet {
+    /// 拉单股主力资金流；返回 None 表示「已尝试但今日无数据」（盘中早期 / 停牌）。
+    pub async fn fetch(
+        &self,
+        http: &reqwest::Client,
+        code: &str,
+    ) -> Result<Option<MainNetSnapshot>, IngestError> {
+        let normalized = normalize_code(code)?;
+        let pure = pure_digits(&normalized);
+        let market = if normalized.starts_with("sh") { "1" } else { "0" };
+        let resp = http
+            .get(format!("{}/api/qt/stock/get", self.base_url))
+            .query(&[
+                ("secid", format!("{}.{}", market, pure).as_str()),
+                ("fields", "f43,f60,f62,f63,f64,f168,f170"),
+            ])
+            .send()
+            .await
+            .map_err(|e| IngestError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(IngestError::Network(format!("status {}", resp.status())));
+        }
+        let env: MainNetEnvelope = resp
+            .json()
+            .await
+            .map_err(|e| IngestError::Parse(e.to_string()))?;
+        let Some(data) = env.data else { return Ok(None) };
+        let main_net = json_num(data.get("f62")).unwrap_or(0.0);
+        let super_net = json_num(data.get("f63")).unwrap_or(0.0);
+        let big_net = json_num(data.get("f64")).unwrap_or(0.0);
+        let pct_ratio = json_num(data.get("f170")).unwrap_or(0.0);
+        let turnover = json_num(data.get("f168")).unwrap_or(0.0);
+        let prev_close = json_num(data.get("f60")).unwrap_or(0.0);
+        if main_net == 0.0 && super_net == 0.0 && big_net == 0.0 && pct_ratio == 0.0 {
+            return Ok(None);
+        }
+        let today_cn = Utc::now()
+            .with_timezone(&cn_offset())
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        Ok(Some(MainNetSnapshot {
+            code: normalized.clone(),
+            trade_date: today_cn,
+            main_net_wan: main_net / 10000.0,
+            super_net_wan: super_net / 10000.0,
+            big_net_wan: big_net / 10000.0,
+            pct_ratio,
+            turnover,
+            prev_close,
+        }))
+    }
+}
+
+/// 批量 UPSERT 落库；按 code 串行写入（避免并发争抢 SQLite 写锁）。
+pub async fn persist_main_net(
+    db: &SqlitePool,
+    snapshots: &[MainNetSnapshot],
+) -> Result<(), sqlx::Error> {
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+    let mut tx = db.begin().await?;
+    for s in snapshots {
+        sqlx::query(
+            "INSERT OR REPLACE INTO main_net_snapshot(\
+             code,trade_date,main_net,super_net,big_net,pct_ratio,turnover,prev_close,fetched_at)\
+             VALUES(?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&s.code)
+        .bind(&s.trade_date)
+        .bind(s.main_net_wan)
+        .bind(s.super_net_wan)
+        .bind(s.big_net_wan)
+        .bind(s.pct_ratio)
+        .bind(s.turnover)
+        .bind(s.prev_close)
+        .bind(now_ms())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,7 +1,7 @@
 //! 全局共享状态：DB 连接池、HTTP 客户端、行情 failover 引擎
 use crate::config::Config;
 use crate::model::Quote;
-use crate::service::ingest::{EastMoneyNews, EastMoneyReports, EastMoneySector};
+use crate::service::ingest::{EastMoneyMainNet, EastMoneyNews, EastMoneyReports, EastMoneySector};
 use crate::service::pick::{DayKSource, EastMoneyRanking, SinaRanking, TencentUsIndex};
 use crate::service::quote::failover::QuoteFailover;
 use crate::service::quote::EastMoneyTicks;
@@ -54,6 +54,8 @@ pub struct AppState {
     pub reports: EastMoneyReports,
     /// 概念板块（成分 + 行情）
     pub sector: EastMoneySector,
+    /// §A.6 主力资金净流入（东财 push2 单股 f62/f63/f64）
+    pub main_net: EastMoneyMainNet,
     /// 逐笔成交明细（东财 push2delay details）
     pub ticks: EastMoneyTicks,
     /// 智能推荐：东财涨幅榜候选源
@@ -119,6 +121,7 @@ impl AppState {
             news: EastMoneyNews::default(),
             reports: EastMoneyReports::default(),
             sector: EastMoneySector::default(),
+            main_net: EastMoneyMainNet::default(),
             pick_ranking: EastMoneyRanking::default(),
             sina_ranking: SinaRanking::default(),
             ticks: EastMoneyTicks::default(),

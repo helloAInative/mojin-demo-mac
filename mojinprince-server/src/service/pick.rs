@@ -9,6 +9,7 @@ use crate::error::AppError;
 use crate::model::pick::{AiRankConfig, DailyPick, PickStats, PickTagStat, PicksDocument};
 use crate::model::DayBar;
 use crate::service::ai::{self, ChatMessage};
+use crate::service::ingest::MainNetSnapshot;
 use crate::state::AppState;
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Timelike, Utc};
 use serde::Deserialize;
@@ -440,6 +441,56 @@ fn news_keyword_score(items: &[crate::model::NewsItem]) -> (f64, Option<String>)
         Some("利好新闻".to_string())
     } else if hits < 0.0 {
         Some("利空新闻".to_string())
+    } else {
+        None
+    };
+    (score, tag)
+}
+
+/// §A.6 主力资金净流入打分（净流入 / 万元）：
+/// |主力净流入| 档位 → 加分；流入为负则对称减分。
+///  资金流入：>1亿 +25 / 5000万-1亿 +15 / 1000万-5000万 +8 / 100-1000万 +3
+///  资金流出：<1亿 -25 / 5000万-1亿 -15 / 1000万-5000万 -8 / 100-1000万 -3
+///  净占比（f170）：|x| >= 10 时 ±5 加成（流入正 / 流出负）
+/// 标签：流入>1亿 →「主力抢筹」；流出>1亿 →「主力出逃」；其他档位显「主力流入」/「主力流出」。
+pub fn main_net_score(main_net_wan: f64, pct_ratio: f64) -> (f64, Option<String>) {
+    let wan = main_net_wan;
+    let base: f64 = if wan >= 10_000.0 {
+        25.0
+    } else if wan >= 5_000.0 {
+        15.0
+    } else if wan >= 1_000.0 {
+        8.0
+    } else if wan >= 100.0 {
+        3.0
+    } else if wan <= -10_000.0 {
+        -25.0
+    } else if wan <= -5_000.0 {
+        -15.0
+    } else if wan <= -1_000.0 {
+        -8.0
+    } else if wan <= -100.0 {
+        -3.0
+    } else {
+        0.0
+    };
+    // 占比加成（pct_ratio 是百分数；>=10 视为强主力）
+    let pct_bonus: f64 = if pct_ratio >= 10.0 {
+        5.0
+    } else if pct_ratio <= -10.0 {
+        -5.0
+    } else {
+        0.0
+    };
+    let score = (base + pct_bonus).clamp(-30.0_f64, 30.0_f64);
+    let tag = if wan >= 10_000.0 {
+        Some("主力抢筹".into())
+    } else if wan <= -10_000.0 {
+        Some("主力出逃".into())
+    } else if wan >= 1_000.0 {
+        Some("主力流入".into())
+    } else if wan <= -1_000.0 {
+        Some("主力流出".into())
     } else {
         None
     };
@@ -946,6 +997,32 @@ pub async fn generate_picks(
     });
     scored.truncate(20);
 
+    // §A.6 主力净流入抓取（拉取失败只降级跳过）
+    let mut main_net_map: std::collections::HashMap<String, MainNetSnapshot> =
+        std::collections::HashMap::new();
+    for (candidate, _) in &scored {
+        match state.main_net.fetch(&state.http, &candidate.code).await {
+            Ok(Some(snapshot)) => {
+                main_net_map.insert(candidate.code.clone(), snapshot);
+            }
+            Ok(None) => {
+                tracing::debug!(code = %candidate.code, "main_net empty (pre-market / halted)");
+            }
+            Err(error) => {
+                tracing::debug!(code = %candidate.code, %error, "main_net fetch failed");
+            }
+        }
+        tokio::time::sleep(StdDuration::from_millis(200)).await;
+    }
+    if let Err(error) = crate::service::ingest::persist_main_net(
+        &state.db,
+        &main_net_map.values().cloned().collect::<Vec<_>>(),
+    )
+    .await
+    {
+        tracing::warn!(%error, "main_net persist failed");
+    }
+
     // ③ 消息面加分：近 7 天研报评级 + 近 3 天新闻热度
     let since_reports = (date - Duration::days(7)).format("%Y-%m-%d").to_string();
     let since_news_ms = {
@@ -1033,6 +1110,15 @@ pub async fn generate_picks(
                 tracing::debug!(code = %candidate.code, %error, "pick news fetch failed");
             }
         }
+        // §A.6 主力净流入打分（候选池 §A.6 已批量抓过，落库）
+        let main_net_snapshot = main_net_map.get(&candidate.code);
+        if let Some(snapshot) = main_net_snapshot {
+            let (delta, tag) = main_net_score(snapshot.main_net_wan, snapshot.pct_ratio);
+            score += delta;
+            if let Some(tag) = tag {
+                tags.push(tag);
+            }
+        }
         let (learned_adjustment, evidence) = learned_score_adjustment(&tags, &learned_performance);
         score += learned_adjustment;
         learned_meta.insert(candidate.code.clone(), evidence);
@@ -1103,6 +1189,14 @@ pub async fn generate_picks(
                 "djia": us_sentiment.as_ref().and_then(|s| s.djia_pct),
                 "ixic": us_sentiment.as_ref().and_then(|s| s.ixic_pct),
             },
+            "main_net": main_net_map.get(&candidate.code).map(|s| serde_json::json!({
+                "main_net_wan": s.main_net_wan,
+                "super_net_wan": s.super_net_wan,
+                "big_net_wan": s.big_net_wan,
+                "pct_ratio": s.pct_ratio,
+                "turnover": s.turnover,
+                "trade_date": s.trade_date,
+            })),
             "auto_weight": learned_meta.get(&candidate.code).cloned().unwrap_or_else(|| serde_json::json!({
                 "adjustment": 0.0,
                 "tags": [],
@@ -1778,6 +1872,39 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
             published_at: Utc::now(),
         }];
         assert_eq!(news_keyword_score(&empty).0, 0.0);
+    }
+
+    #[test]
+    fn main_net_score_brackets() {
+        // 大档：流入 >1亿 +25 / 占比 ≥10% +5 = +30（封顶）
+        let (score, tag) = main_net_score(15_000.0, 12.0);
+        assert_eq!(score, 30.0, "流入大 + 占比强，封顶 +30");
+        assert_eq!(tag.as_deref(), Some("主力抢筹"));
+
+        // 流出 >1亿 + 占比 ≤-10% = -30
+        let (score, tag) = main_net_score(-12_000.0, -11.0);
+        assert_eq!(score, -30.0, "流出大 + 占比负，封顶 -30");
+        assert_eq!(tag.as_deref(), Some("主力出逃"));
+
+        // 中档：5000-1亿 +15
+        let (score, tag) = main_net_score(6_500.0, 0.0);
+        assert_eq!(score, 15.0);
+        assert_eq!(tag.as_deref(), Some("主力流入"));
+
+        // 小档：1000-5000万 +8
+        let (score, tag) = main_net_score(2_000.0, 0.0);
+        assert_eq!(score, 8.0);
+        assert_eq!(tag.as_deref(), Some("主力流入"));
+
+        // 噪声档：<100 万中性
+        let (score, tag) = main_net_score(50.0, 0.0);
+        assert_eq!(score, 0.0);
+        assert_eq!(tag, None);
+
+        // 流出对称：-2000 万 -8 / 「主力流出」
+        let (score, tag) = main_net_score(-2_000.0, 0.0);
+        assert_eq!(score, -8.0);
+        assert_eq!(tag.as_deref(), Some("主力流出"));
     }
 
     #[test]
