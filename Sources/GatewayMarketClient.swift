@@ -237,10 +237,13 @@ struct GatewayPick: Codable, Equatable, Identifiable {
         var outcome: Outcome?
         var autoWeight: AutoWeight?
         var plan: TradePlan?
+        /// 今日已涨停（T 日买不进，需次日开盘）
+        var isLimitUp: Bool?
 
         enum CodingKeys: String, CodingKey {
             case close, pct, industry, outcome, plan
             case autoWeight = "auto_weight"
+            case isLimitUp = "is_limit_up"
         }
     }
 
@@ -341,6 +344,22 @@ struct GatewayPicksDocument: Decodable, Equatable {
     var executeHint: String?
     /// 真实执行口径（次日开盘买入统计）
     var execution: ExecutionStats?
+
+    /// 今日可尾盘买进子集：
+    /// 1. entryTiming == today_close（服务端 14:45-15:00 窗口标的）
+    /// 2. 未涨停（meta.is_limit_up != true）
+    ///    —— 已涨停的票服务端会改成 entry_timing=next_session_open，不计入此列表。
+    var tailBuyPicks: [GatewayPick] {
+        picks.filter { pick in
+            pick.meta.plan?.entryTiming == "today_close"
+                && (pick.meta.isLimitUp ?? false) == false
+        }
+    }
+
+    /// 今日被识别为涨停、需要次日开盘买入的子集
+    var nextOpenPicks: [GatewayPick] {
+        picks.filter { ($0.meta.isLimitUp ?? false) == true }
+    }
 
     struct TagStat: Decodable, Equatable, Identifiable {
         var tag: String

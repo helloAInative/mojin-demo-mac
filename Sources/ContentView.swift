@@ -2909,6 +2909,8 @@ struct ContentView: View {
                         ForEach(doc.picks) { pick in
                             pickRow(pick)
                         }
+                        // 尾盘买进专项：仅当日、未涨停、entry_timing=today_close
+                        tailBuySection(doc)
                     }
                 } else if !store.picksHint.isEmpty {
                     Text(store.picksHint)
@@ -3076,6 +3078,59 @@ struct ContentView: View {
         let strategy = plan?.strategy ?? "短线"
         let exit = plan?.exitRule ?? "T+1 观察，不承诺次日上涨"
         return "\(pick.name) \(pick.code) · \(entry) · \(strategy)\n目标：T+1 收盘正收益（概率筛选，非保证）\n计划：\(exit)\n\(pick.reasons.joined(separator: " / ")) · 综合分 \(Int(pick.score))\(pick.aiNote.isEmpty ? "" : "\nAI：\(pick.aiNote)")\n\(autoWeightHelp(pick.meta.autoWeight))\n点击加入自选并去盯盘（仅关注建议，不构成投资建议）"
+    }
+
+    /// 尾盘买进专项清单：仅展示今日可买入窗口（14:45-14:57）的票，
+    /// 涨停股归到另一行（次盘新股、需次日开盘）。
+    @ViewBuilder
+    private func tailBuySection(_ doc: GatewayPicksDocument) -> some View {
+        let today = doc.tailBuyPicks
+        let nextOpen = doc.nextOpenPicks
+        if today.isEmpty && nextOpen.isEmpty { EmptyView() } else {
+            VStack(alignment: .leading, spacing: 4) {
+                Divider().padding(.vertical, 2)
+                HStack(spacing: 6) {
+                    Image(systemName: "clock.badge.checkmark")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.green)
+                    Text("尾盘买进清单")
+                        .font(.system(size: 10, weight: .bold))
+                    Text("仅当日未涨停 · \(today.count) 只")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                    if !nextOpen.isEmpty {
+                        Text("· 已涨停 \(nextOpen.count) 只 → 次日开盘")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.orange)
+                    }
+                    Spacer(minLength: 0)
+                }
+                if today.isEmpty {
+                    Text("今日 Top\(doc.picks.count) 全部已涨停或错过尾盘窗口 —— 参看下方「次日开盘」")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                } else {
+                    ForEach(today) { pick in
+                        pickRow(pick)
+                    }
+                }
+                if !nextOpen.isEmpty {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.orange)
+                        Text("次盘新股 · 09:30-09:35 集合竞价优先")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.orange)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.top, 2)
+                    ForEach(nextOpen) { pick in
+                        pickRow(pick)
+                    }
+                }
+            }
+        }
     }
 
     private func autoWeightHelp(_ weight: GatewayPick.AutoWeight?) -> String {

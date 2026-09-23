@@ -93,6 +93,7 @@ enum TokenPlanCatalog {
         .init(brand: "智谱 AI", modelID: "glm-5.1", capability: "推理 / 文本", chat: true),
         .init(brand: "智谱 AI", modelID: "glm-5", capability: "推理 / 文本", chat: true),
         .init(brand: "MiniMax", modelID: "MiniMax-M2.5", capability: "推理 / 文本", chat: true),
+        .init(brand: "MiniMax", modelID: "MiniMax-M3", capability: "推理 / 文本", chat: true),
         .init(brand: "HappyHorse", modelID: "happyhorse-1.1-i2v", capability: "视频生成", chat: false),
         .init(brand: "HappyHorse", modelID: "happyhorse-1.1-t2v", capability: "视频生成", chat: false),
         .init(brand: "HappyHorse", modelID: "happyhorse-1.1-r2v", capability: "视频生成", chat: false),
