@@ -448,3 +448,174 @@ async fn realtime_limit_up_recalibrate_falls_back_to_snapshot_on_network_error()
         "网络失败应保留 snapshot 决策：{entry_timing}"
     );
 }
+
+#[actix_web::test]
+async fn negative_signals_split_into_specific_tags_and_meta() {
+    let upstream = MockServer::start();
+    upstream.mock(|when, then| {
+        when.method(GET).path("/api/qt/clist/get");
+        then.status(200).json_body(json!({
+            "data": {"diff": [
+                {"f12": "300623", "f14": "捷捷微电", "f2": 35.11, "f3": 2.8, "f100": "半导体"}
+            ]}
+        }));
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/appstock/app/fqkline/get");
+        then.status(200).json_body(json!({
+            "data": {"sz300623": {"qfqday": zigzag_bars()}}
+        }));
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/q=usDJI,usIXIC");
+        then.status(200).body(
+            "v_usDJI=\"200~DJI~.DJI~102.0~100.0~102.5~1\";\nv_usIXIC=\"200~IXIC~.IXIC~102.0~100.0~102.5~1\"",
+        );
+    });
+    // 实时校准上游不通 → fallback 到 snapshot（未涨停）
+    upstream.mock(|when, then| {
+        when.method(GET)
+            .path("/api/qt/stock/get")
+            .query_param("secid", "0.300623");
+        then.status(500);
+    });
+    // 新闻上游：1 条减持 + 1 条问询 → 期望两个细分 tag + negative_signals
+    upstream.mock(|when, then| {
+        when.method(GET).path("/search/jsonp");
+        then.status(200).json_body(json!({
+            "code": 0,
+            "result": {"cmsArticleWebOld": [
+                {
+                    "date": "2026-09-22 10:30:00",
+                    "title": "股东减持计划公告",
+                    "content": "拟减持不超过 2%",
+                    "mediaName": "证券时报",
+                    "url": "https://news.example.com/r1"
+                },
+                {
+                    "date": "2026-09-21 09:15:00",
+                    "title": "公司收到问询函",
+                    "content": "关注函",
+                    "mediaName": "深交所",
+                    "url": "https://news.example.com/r2"
+                }
+            ]}
+        }));
+    });
+
+    let mut state = fresh_state().await;
+    state.pick_ranking.base_url = upstream.base_url();
+    state.day_k.base_url = upstream.base_url();
+    state.us_index.base_url = upstream.base_url();
+    state.news.base_url = upstream.base_url();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::pick::configure)),
+    )
+    .await;
+
+    let doc: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/picks/run")
+            .to_request(),
+    )
+    .await;
+    let pick = &doc["picks"][0];
+    let reasons = pick["reasons"].as_array().unwrap();
+    let reason_text: Vec<&str> = reasons.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        reason_text.contains(&"股东减持"),
+        "reasons 应包含「股东减持」细分 tag：{reasons:?}"
+    );
+    assert!(
+        reason_text.contains(&"收到问询函"),
+        "reasons 应包含「收到问询函」细分 tag：{reasons:?}"
+    );
+    // 不再使用笼统的「利空新闻」tag
+    assert!(
+        !reason_text.contains(&"利空新闻"),
+        "「利空新闻」已被细分 tag 取代：{reasons:?}"
+    );
+    let neg = pick["meta"]["negative_signals"].as_array().unwrap();
+    let cats: Vec<&str> = neg
+        .iter()
+        .filter_map(|v| v["category"].as_str())
+        .collect();
+    assert!(cats.contains(&"股东减持"));
+    assert!(cats.contains(&"收到问询函"));
+    // 每条都带原文标题
+    for sig in neg {
+        assert!(sig["title"].is_string(), "title 必须存在：{sig}");
+        assert!(!sig["title"].as_str().unwrap().is_empty());
+    }
+}
+
+#[actix_web::test]
+async fn anomaly_tag_appears_when_pct_above_board_threshold() {
+    let upstream = MockServer::start();
+    // 主板 pct=7.2 → 触发「异常波动」阈值 7%
+    upstream.mock(|when, then| {
+        when.method(GET).path("/api/qt/clist/get");
+        then.status(200).json_body(json!({
+            "data": {"diff": [
+                {"f12": "600519", "f14": "贵州茅台", "f2": 1500.5, "f3": 7.2, "f100": "白酒"}
+            ]}
+        }));
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/appstock/app/fqkline/get");
+        then.status(200).json_body(json!({
+            "data": {"sh600519": {"qfqday": zigzag_bars()}}
+        }));
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/q=usDJI,usIXIC");
+        then.status(200).body(
+            "v_usDJI=\"200~DJI~.DJI~102.0~100.0~102.5~1\";\nv_usIXIC=\"200~IXIC~.IXIC~102.0~100.0~102.5~1\"",
+        );
+    });
+    // 实时校准返回 pct=7.0（未封板，但仍在异常波动阈值 7% 之上）
+    upstream.mock(|when, then| {
+        when.method(GET)
+            .path("/api/qt/stock/get")
+            .query_param("secid", "1.600519");
+        then.status(200).json_body(json!({}));
+    });
+    // 实时校准上游对 600519 也用 path 区分
+    upstream.mock(|when, then| {
+        when.method(GET)
+            .path("/api/qt/stock/get")
+            .query_param("secid", "1.600519");
+        then.status(200).json_body(json!({"data": {"f2": 1620.0, "f3": 7.2}}));
+    });
+
+    let mut state = fresh_state().await;
+    state.pick_ranking.base_url = upstream.base_url();
+    state.day_k.base_url = upstream.base_url();
+    state.us_index.base_url = upstream.base_url();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::pick::configure)),
+    )
+    .await;
+
+    let doc: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/picks/run")
+            .to_request(),
+    )
+    .await;
+    let pick = &doc["picks"][0];
+    let reasons = pick["reasons"].as_array().unwrap();
+    let text: Vec<&str> = reasons.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        text.contains(&"异常波动"),
+        "pct=7.2 应触发「异常波动」：{reasons:?}"
+    );
+}

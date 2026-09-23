@@ -268,6 +268,18 @@ fn market_prefix(raw: &str) -> &'static str {
 // §A.5.1 涨停二次校准：拉取实时价/涨幅，重新判定是否当日已封板。
 // ============================================================================
 
+/// §A.7 异动检测：单日内 pct 接近涨停但尚未封板（主板 ≥7 / 创业 ≥17）即视为异动。
+pub fn is_anomaly(code: &str, pct: f64) -> bool {
+    let threshold = if code.starts_with("sz30") || code.starts_with("sh68") {
+        17.0
+    } else {
+        7.0
+    };
+    pct >= threshold
+}
+
+// ============================================================================
+
 /// 单票实时校准结果。`Some(true)` = 实时涨停、`Some(false)` = 未涨停、
 /// `None` = 拉取失败（保留 snapshot 的 is_limit_up）。
 async fn fetch_realtime_limit_up(
@@ -473,37 +485,71 @@ fn is_tech_industry(industry: &str) -> bool {
         || industry.contains("光学")
 }
 
-/// 新闻关键词扫描：利好 +5 / 利空 −8 每条命中，净分 ±25 封顶。
-fn news_keyword_score(items: &[crate::model::NewsItem]) -> (f64, Option<String>) {
+/// §A.7 负面信号分类。命中扣分的同时，把**具体类型**（减持/问询/立案/...）单独返回，
+/// 用于 reasons + meta.negative_signals，便于回溯「为什么这票没推」。
+const NEGATIVE_CATEGORIES: &[(&str, &str, f64)] = &[
+    ("减持", "股东减持", -8.0),
+    ("问询", "收到问询函", -5.0),
+    ("立案", "被立案调查", -10.0),
+    ("处罚", "监管处罚", -10.0),
+    ("退市", "退市风险", -15.0),
+    ("终止", "重组/上市终止", -8.0),
+    ("诉讼", "重大诉讼", -5.0),
+    ("质押", "高比例质押", -3.0),
+];
+
+fn negative_signal_score(text: &str) -> (f64, Vec<(String, f64)>) {
+    let mut score = 0.0_f64;
+    let mut cats = Vec::new();
+    for (kw, tag, delta) in NEGATIVE_CATEGORIES {
+        if text.contains(kw) {
+            score += delta;
+            cats.push((tag.to_string(), *delta));
+        }
+    }
+    (score, cats)
+}
+
+/// 新闻关键词扫描：利好 +5 / 利空按分类扣分（最多 −15 单条），总分 ±25 封顶。
+/// 返回 (score, positive_tag, negative_tags, negative_signals)
+///   negative_signals 每条 (来源类型, 命中的原文标题) 供 meta 透出。
+fn news_keyword_score(
+    items: &[crate::model::NewsItem],
+) -> (f64, Option<String>, Vec<String>, Vec<(String, String)>) {
     const POSITIVE: [&str; 9] = [
         "中标", "订单", "回购", "增持", "预增", "突破", "签约", "上调", "涨停",
     ];
-    const NEGATIVE: [&str; 8] = [
-        "减持", "质押", "诉讼", "问询", "处罚", "立案", "退市", "终止",
-    ];
-    let mut hits = 0.0_f64;
+    let mut score = 0.0_f64;
+    let mut pos_hit = false;
+    let mut neg_tags: Vec<String> = Vec::new();
+    let mut neg_signals: Vec<(String, String)> = Vec::new();
     for item in items {
         let text = format!("{}{}", item.title, item.summary);
         for word in POSITIVE {
             if text.contains(word) {
-                hits += 5.0;
+                score += 5.0;
+                pos_hit = true;
             }
         }
-        for word in NEGATIVE {
-            if text.contains(word) {
-                hits -= 8.0;
+        let (delta, cats) = negative_signal_score(&text);
+        if delta < 0.0 {
+            // 单条负面 ≥ -15 封底，避免极端词刷屏
+            let clamped = delta.max(-15.0);
+            score += clamped;
+            for (cat_tag, _) in cats {
+                if !neg_tags.contains(&cat_tag) {
+                    neg_tags.push(cat_tag.clone());
+                }
+                // 取首条命中条目的标题作展示（若多条同 tag）
+                if !neg_signals.iter().any(|(t, _)| t == &cat_tag) {
+                    neg_signals.push((cat_tag, item.title.clone()));
+                }
             }
         }
     }
-    let score = hits.clamp(-25.0, 25.0);
-    let tag = if hits > 0.0 {
-        Some("利好新闻".to_string())
-    } else if hits < 0.0 {
-        Some("利空新闻".to_string())
-    } else {
-        None
-    };
-    (score, tag)
+    let total = score.clamp(-25.0, 25.0);
+    let positive_tag = if pos_hit { Some("利好新闻".to_string()) } else { None };
+    (total, positive_tag, neg_tags, neg_signals)
 }
 
 /// §A.6 主力资金净流入打分（净流入 / 万元）：
@@ -1085,6 +1131,18 @@ pub async fn generate_picks(
         tracing::warn!(%error, "main_net persist failed");
     }
 
+    // §A.5.1 涨停实时校准（候选池阶段就拉，便于异动检测复用）
+    let scored_for_realtime: Vec<(Candidate, f64, Vec<String>)> = scored
+        .iter()
+        .map(|(c, t)| (c.clone(), t.score, t.tags.clone()))
+        .collect();
+    let limit_up_realtime: HashMap<String, bool> = recalibrate_limit_up_realtime(
+        &state.http,
+        &state.pick_ranking.base_url,
+        &scored_for_realtime,
+    )
+    .await;
+
     // ③ 消息面加分：近 7 天研报评级 + 近 3 天新闻热度
     let since_reports = (date - Duration::days(7)).format("%Y-%m-%d").to_string();
     let since_news_ms = {
@@ -1096,6 +1154,7 @@ pub async fn generate_picks(
             .unwrap_or_else(|| Utc::now().timestamp_millis())
     };
     let mut boosted: Vec<(Candidate, f64, Vec<String>)> = Vec::new();
+    let mut negative_signals_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
     for (candidate, tech) in &scored {
         let mut score = tech.score;
         let mut tags = tech.tags.clone();
@@ -1130,6 +1189,17 @@ pub async fn generate_picks(
             tags.push("隔夜纳指拖累".into());
         }
 
+        // §A.7 异动：实时校准 pct ≥ 阈值（主板 7 / 创业 17）→ 加「异常波动」标签
+        // 复用 limit_up_realtime 字典避免二次拉取
+        if let Some(true) = limit_up_realtime.get(&candidate.code).copied() {
+            // 实时已封板会进 plan 的次日开盘，不在这里再加「异常波动」以免标签重复
+        } else {
+            // 用 candidate 快照 pct 作为粗筛；若上游不通则跳过
+            if is_anomaly(&candidate.code, candidate.pct) {
+                tags.push("异常波动".into());
+            }
+        }
+
         // 研报评级（近 7 天）
         let report_rows: Vec<(i64, String, String)> = sqlx::query_as(
             "SELECT rating_change, rating, last_rating FROM research_report \
@@ -1158,10 +1228,16 @@ pub async fn generate_picks(
                 if let Err(error) = crate::service::ingest::persist_news(&state.db, &items).await {
                     tracing::warn!(code = %candidate.code, %error, "pick news persist failed");
                 }
-                let (news_score, news_tag) = news_keyword_score(&items);
+                let (news_score, positive_tag, neg_tags, neg_signals) = news_keyword_score(&items);
                 score += news_score;
-                if let Some(tag) = news_tag {
+                if let Some(tag) = positive_tag {
                     tags.push(tag);
+                }
+                for tag in &neg_tags {
+                    tags.push(tag.clone());
+                }
+                if !neg_signals.is_empty() {
+                    negative_signals_map.insert(candidate.code.clone(), neg_signals);
                 }
                 if items.len() >= 3 {
                     tags.push("新闻活跃".into());
@@ -1226,10 +1302,7 @@ pub async fn generate_picks(
     }
     picks.truncate(5);
 
-    // §A.5.1 涨停二次校准：拉取实时价/涨幅，把当下涨停的票 plan 强制改次日开盘。
-    // 网络失败 → fallback 到候选快照的 is_limit_up，不改 plan。
-    let limit_up_realtime: HashMap<String, bool> =
-        recalibrate_limit_up_realtime(&state.http, &state.pick_ranking.base_url, &picks).await;
+    // §A.5.1 涨停二次校准已在候选池阶段完成（提前到 scored 之后），这里直接复用。
 
     // 落库（同日全量刷新）
     let date_key = date.format("%Y-%m-%d").to_string();
@@ -1284,6 +1357,17 @@ pub async fn generate_picks(
                 "minimum_samples": 30,
                 "lookback_days": 30,
             })),
+            "negative_signals": negative_signals_map
+                .get(&candidate.code)
+                .map(|signals| {
+                    signals
+                        .iter()
+                        .map(|(cat, title)| {
+                            serde_json::json!({"category": cat, "title": title})
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
             "plan": build_trade_plan(date, now_cn, tags, has_position, plan_limit_up),
         });
         sqlx::query(
@@ -1935,14 +2019,15 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
             },
         ];
         // 中标 + 订单 = +10；减持 −8 → 净 +2
-        let (score, tag) = news_keyword_score(&items);
+        let (score, pos_tag, neg_tags, _) = news_keyword_score(&items);
         assert_eq!(score, 2.0);
-        assert_eq!(tag.as_deref(), Some("利好新闻"));
+        assert_eq!(pos_tag.as_deref(), Some("利好新闻"));
+        assert!(neg_tags.contains(&"股东减持".to_string()));
         // 纯利空封顶
         let bad: Vec<crate::model::NewsItem> = (0..5).map(|_| items[1].clone()).collect();
-        let (score2, tag2) = news_keyword_score(&bad);
+        let (score2, _pos2, neg_tags2, _) = news_keyword_score(&bad);
         assert_eq!(score2, -25.0, "负分封顶 -25");
-        assert_eq!(tag2.as_deref(), Some("利空新闻"));
+        assert!(neg_tags2.contains(&"股东减持".to_string()));
         // 无命中
         let empty = vec![crate::model::NewsItem {
             code: "x".into(),
@@ -2130,5 +2215,69 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         assert!(is_limit_up("sz300623", 20.0));
         assert!(!is_limit_up("sz300623", 19.4));
         assert!(!is_limit_up("sh688111", 9.5));
+    }
+
+    #[test]
+    fn is_anomaly_uses_board_threshold() {
+        // 主板阈值 7%，创业/科创 17%
+        assert!(is_anomaly("sh600519", 7.0));
+        assert!(!is_anomaly("sh600519", 6.9));
+        assert!(is_anomaly("sz300623", 17.0));
+        assert!(!is_anomaly("sz300623", 16.5));
+    }
+
+    fn sample_news(title: &str, summary: &str) -> crate::model::NewsItem {
+        crate::model::NewsItem {
+            code: "sz300623".into(),
+            title: title.into(),
+            summary: summary.into(),
+            media: "证券时报".into(),
+            url: format!("https://news.example.com/{}", title),
+            published_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn negative_signal_score_classifies_each_keyword() {
+        let cases = [
+            ("股东减持计划", vec!["股东减持"]),
+            ("收到问询函", vec!["收到问询函"]),
+            ("被立案调查", vec!["被立案调查"]),
+            ("监管处罚决定", vec!["监管处罚"]),
+            ("存在退市风险", vec!["退市风险"]),
+        ];
+        for (kw, expected) in cases {
+            let (score, cats) = negative_signal_score(kw);
+            assert!(score < 0.0, "{kw} 应扣分，得 {score}");
+            let names: Vec<&str> = cats.iter().map(|(n, _)| n.as_str()).collect();
+            for tag in expected {
+                assert!(names.contains(&tag), "{kw} 应打 {tag}，得 {names:?}");
+            }
+        }
+        // 命中多条关键词累加
+        let (score, cats) = negative_signal_score("减持 + 立案 + 处罚");
+        assert_eq!(cats.len(), 3);
+        assert_eq!(score, -8.0 + -10.0 + -10.0);
+    }
+
+    #[test]
+    fn news_keyword_score_returns_separated_positive_and_negative_tags() {
+        let items = vec![
+            sample_news("公司中标3亿元订单", "利好落地"),
+            sample_news("股东减持2%", "拟减持"),
+            sample_news("收到问询函", "关注函"),
+        ];
+        let (score, pos_tag, neg_tags, signals) = news_keyword_score(&items);
+        // 中标 +5 + 订单 +5 = +10；减持 -8 + 问询 -5 = -13 → 净 -3
+        assert_eq!(score, -3.0);
+        assert_eq!(pos_tag.as_deref(), Some("利好新闻"));
+        assert!(neg_tags.contains(&"股东减持".to_string()));
+        assert!(neg_tags.contains(&"收到问询函".to_string()));
+        assert_eq!(neg_tags.len(), 2, "不重复打相同 tag：{neg_tags:?}");
+        assert_eq!(signals.len(), 2, "两条原文标题都透出");
+        // 极端负向：单条同时命中「减持 + 立案」累计 -18，clamp 单条 -15
+        let extreme = vec![sample_news("减持 + 立案 + 处罚", "全部命中")];
+        let (score, _, _, _) = news_keyword_score(&extreme);
+        assert_eq!(score, -15.0, "单条负面封底 -15");
     }
 }
