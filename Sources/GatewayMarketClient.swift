@@ -394,6 +394,7 @@ struct GatewayPicksDocument: Decodable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case date, picks, stats, market, execution
         case executeHint = "execute_hint"
+        case previousPicks = "previous_picks"
     }
 
     /// 标签级 T+1 回测（哪个因子更适合隔日目标，按样本数降序 ≤6）
@@ -404,6 +405,9 @@ struct GatewayPicksDocument: Decodable, Equatable {
     var executeHint: String?
     /// 真实执行口径（次日开盘买入统计）
     var execution: ExecutionStats?
+
+    /// §A.9 上一交易日推荐（已有 T+1 outcome 回写），用于展示「昨日推荐 → 今日卖点」
+    var previousPicks: [GatewayPreviousPick]?
 
     /// 今日可尾盘买进子集：
     /// 1. entryTiming == today_close（服务端 14:45-15:00 窗口标的）
@@ -444,6 +448,12 @@ struct GatewayPicksDocument: Decodable, Equatable {
     struct MarketInfo: Decodable, Equatable {
         var djia: Double?
         var ixic: Double?
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case date, picks, stats, market, execution
+        case executeHint = "execute_hint"
+        case previousPicks = "previous_picks"
     }
 
     init(date: String, picks: [GatewayPick], samples: Int, t5WinRate: Double, avgT5Pct: Double,
@@ -496,6 +506,45 @@ struct GatewayPicksDocument: Decodable, Equatable {
         market = try? c.decodeIfPresent(MarketInfo.self, forKey: .market)
         executeHint = try? c.decodeIfPresent(String.self, forKey: .executeHint)
         execution = try? c.decodeIfPresent(ExecutionStats.self, forKey: .execution)
+        previousPicks = try? c.decodeIfPresent([GatewayPreviousPick].self, forKey: .previousPicks)
+    }
+}
+
+/// §A.9 上一交易日推荐（昨日 / 最近一次有 outcome 回写）
+struct GatewayPreviousPick: Codable, Equatable, Identifiable {
+    var date: String
+    var code: String
+    var name: String
+    var rank: Int
+    var close: Double?
+    var t1Open: Double?
+    var t1Close: Double?
+    var t1Pct: Double?
+    var t1RealPct: Double?
+    var entryGap: Double?
+    var sellPriceLow: Double?
+    var sellPriceHigh: Double?
+    var sellBasisPrice: Double?
+    var sellBasisKind: String?
+    var entryTiming: String?
+    var entryLabel: String?
+    var reasons: [String]
+
+    var id: String { "\(date)-\(code)" }
+
+    enum CodingKeys: String, CodingKey {
+        case date, code, name, rank, close, reasons
+        case t1Open = "t1_open"
+        case t1Close = "t1_close"
+        case t1Pct = "t1_pct"
+        case t1RealPct = "t1_real_pct"
+        case entryGap = "entry_gap"
+        case sellPriceLow = "sell_price_low"
+        case sellPriceHigh = "sell_price_high"
+        case sellBasisPrice = "sell_basis_price"
+        case sellBasisKind = "sell_basis_kind"
+        case entryTiming = "entry_timing"
+        case entryLabel = "entry_label"
     }
 }
 

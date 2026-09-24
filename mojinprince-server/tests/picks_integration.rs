@@ -852,3 +852,120 @@ async fn picks_run_falls_back_to_default_sell_zone_when_no_history() {
     // samples = 0
     assert_eq!(pick["meta"]["sell_zone_basis"]["samples"].as_i64().unwrap(), 0);
 }
+
+#[actix_web::test]
+async fn list_picks_returns_previous_picks_with_sell_zone() {
+    // 今天：2026-09-22 → 拉最新生成日 2026-09-21 的 daily_pick 作为 previous_picks
+    let state = fresh_state().await;
+    let db = state.db.clone();
+    let yesterday = "2026-09-21";
+    for (i, code) in ["sz300603", "sz300604"].iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO daily_pick(date, code, name, rank, score, reasons, ai_note, meta, created_at) \
+             VALUES(?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(yesterday)
+        .bind(*code)
+        .bind(format!("票{}", i + 1))
+        .bind((i + 1) as i64)
+        .bind(80.0)
+        .bind("[\"放量\"]")
+        .bind("")
+        .bind(json!({
+            "close": 10.0,
+            "plan": {"entry_timing": "today_close", "entry_label": "今日尾盘"},
+            "outcome": {"t1_pct": 2.0, "t1_close": 10.20, "t1_open_basis": 10.02, "t1_real": 1.7}
+        }).to_string())
+        .bind(0)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::pick::configure)),
+    )
+    .await;
+
+    let doc: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/picks?date=2026-09-22")
+            .to_request(),
+    )
+    .await;
+
+    let prev = doc["previous_picks"].as_array().expect("必须有 previous_picks");
+    assert_eq!(prev.len(), 2, "应返回 2 条昨日推荐");
+    // 上一交易日推荐：entry_timing=today_close → basis=t1_close=10.20
+    //   sell_low = 10.20 * 0.985 = 10.05, sell_high = 10.20 * 1.015 = 10.35
+    let first = &prev[0];
+    assert_eq!(first["code"], "sz300603");
+    assert_eq!(first["entry_label"], "今日尾盘");
+    assert_eq!(first["sell_basis_kind"], "t1_close");
+    assert!((first["sell_basis_price"].as_f64().unwrap() - 10.20).abs() < 1e-9);
+    assert!((first["sell_price_low"].as_f64().unwrap() - 10.05).abs() < 0.02);
+    assert!((first["sell_price_high"].as_f64().unwrap() - 10.35).abs() < 0.02);
+    // t1_pct / t1_real 也要透出
+    assert!((first["t1_pct"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+    assert!((first["t1_real_pct"].as_f64().unwrap() - 1.7).abs() < 1e-9);
+}
+
+#[actix_web::test]
+async fn list_picks_previous_picks_uses_open_basis_for_next_session_open() {
+    // 推荐时 entry_timing=next_session_open（封板票），昨日推荐应使用 t1_open_basis 作为
+    // 卖出价基准（真实买入价），更能反映「昨天推荐的票今天能卖的价」
+    let state = fresh_state().await;
+    let db = state.db.clone();
+    let yesterday = "2026-09-21";
+    sqlx::query(
+        "INSERT INTO daily_pick(date, code, name, rank, score, reasons, ai_note, meta, created_at) \
+         VALUES(?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(yesterday)
+    .bind("sz300605")
+    .bind("封板票")
+    .bind(1)
+    .bind(90.0)
+    .bind("[\"涨停\"]")
+    .bind("")
+    .bind(json!({
+        "close": 21.00, // T 日收盘/封板价
+        "plan": {"entry_timing": "next_session_open", "entry_label": "次日开盘"},
+        "outcome": {
+            "t1_pct": 5.0,
+            "t1_close": 22.05,
+            "t1_open_basis": 21.50, // T+1 开盘价（次日开盘买入的真实价）
+            "t1_real": 2.3
+        }
+    }).to_string())
+    .bind(0)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::pick::configure)),
+    )
+    .await;
+
+    let doc: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/picks?date=2026-09-22")
+            .to_request(),
+    )
+    .await;
+    let prev = &doc["previous_picks"][0];
+    // basis = t1_open_basis * 1.005 = 21.50 * 1.005 = 21.6075
+    assert_eq!(prev["sell_basis_kind"], "actual_t1_open");
+    assert!((prev["sell_basis_price"].as_f64().unwrap() - 21.6075).abs() < 0.01);
+    let s_low = prev["sell_price_low"].as_f64().unwrap();
+    let s_high = prev["sell_price_high"].as_f64().unwrap();
+    assert!(s_low >= 21.27 && s_low <= 21.29, "sell_low={s_low}");
+    assert!(s_high > 21.92 && s_high < 21.94, "sell_high={s_high}");
+}

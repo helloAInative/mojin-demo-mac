@@ -35,6 +35,10 @@ pub struct PicksDocument {
     /// 执行时机提示：「当天下午可买入」或「次日开盘买入」
     #[serde(default)]
     pub execute_hint: String,
+    /// §A.9 上一交易日推荐（只含近 30 天内已有 T+1 outcome 回写的票，
+    /// 用于在「AI 精选」卡下方展示「昨日推荐 → 卖出参考」）。
+    #[serde(default)]
+    pub previous_picks: Vec<PreviousPick>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -115,6 +119,56 @@ pub struct ExecutionStats {
     pub avg_max_dd: f64,
     /// 盈亏比（平均盈利 / |平均亏损|）
     pub win_loss_ratio: f64,
+}
+
+/// §A.9 上一交易日推荐：仅展示已有 T+1 outcome 回写的票，用于在
+/// 「AI 精选」卡下方提供「昨日推荐 → 今日卖点」参考。
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PreviousPick {
+    pub date: String,
+    pub code: String,
+    pub name: String,
+    pub rank: usize,
+    /// 推荐日的收盘价（meta.close），用于反推卖出价
+    #[serde(default)]
+    pub close: Option<f64>,
+    /// 真实执行买入价（次日开盘价 = meta.outcome.t1_open_basis）
+    /// 如果回写里有，反推卖点更准
+    #[serde(default)]
+    pub t1_open: Option<f64>,
+    /// T+1 收盘价（如果已回写）
+    #[serde(default)]
+    pub t1_close: Option<f64>,
+    /// T+1 收益（%）
+    #[serde(default)]
+    pub t1_pct: Option<f64>,
+    /// T+1 真实执行收益（%）
+    #[serde(default)]
+    pub t1_real_pct: Option<f64>,
+    /// 推荐日开盘 vs 收盘的偏移率（%），用于推断缺口
+    #[serde(default)]
+    pub entry_gap: Option<f64>,
+    /// §A.9 卖出价区间下界（基于 t1_close / t1_open × sell_zone_factor ±1.5%）
+    #[serde(default)]
+    pub sell_price_low: Option<f64>,
+    /// §A.9 卖出价区间上界
+    #[serde(default)]
+    pub sell_price_high: Option<f64>,
+    /// §A.9 卖出价基准价
+    #[serde(default)]
+    pub sell_basis_price: Option<f64>,
+    /// §A.9 卖出价基准类型："t1_close"（T+1 收盘价）/ "t1_open"（真实执行买入价）
+    #[serde(default)]
+    pub sell_basis_kind: Option<String>,
+    /// 推荐时的 entry_timing（today_close / next_session_open / ...）
+    #[serde(default)]
+    pub entry_timing: Option<String>,
+    /// 推荐时的 entry_label
+    #[serde(default)]
+    pub entry_label: Option<String>,
+    /// 推荐时附带的 score / reasons 便于复用 UI
+    #[serde(default)]
+    pub reasons: Vec<String>,
 }
 
 /// `POST /api/v1/picks/run` 可选 body：客户端透传 AI 配置做精排。

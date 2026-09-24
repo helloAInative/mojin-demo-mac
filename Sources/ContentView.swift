@@ -2929,6 +2929,8 @@ struct ContentView: View {
                         }
                         // 尾盘买进专项：仅当日、未涨停、entry_timing=today_close
                         tailBuySection(doc)
+                        // §A.9 上一交易日推荐 → 今日卖点
+                        previousPicksSection(doc)
                     }
                 } else if !store.picksHint.isEmpty {
                     Text(store.picksHint)
@@ -3191,6 +3193,112 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    /// §A.9 上一交易日推荐：已在 daily_pick 表中回写 T+1 outcome 的票，
+    /// 用于在「AI 精选」卡下方展示「昨日推荐 → 今日卖点」。
+    @ViewBuilder
+    private func previousPicksSection(_ doc: GatewayPicksDocument) -> some View {
+        if let prev = doc.previousPicks, !prev.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Divider().padding(.vertical, 2)
+                HStack(spacing: 6) {
+                    Image(systemName: "calendar.badge.clock")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.indigo)
+                    Text("上一交易日推荐 → 今日卖出参考")
+                        .font(.system(size: 10, weight: .bold))
+                    Text("\(prev.first?.date ?? "") · \(prev.count) 只")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+                ForEach(prev) { p in
+                    previousPickRow(p)
+                }
+            }
+        }
+    }
+
+    /// §A.9 上一交易日推荐行：显示推荐日 → 今日卖点区间
+    private func previousPickRow(_ prev: GatewayPreviousPick) -> some View {
+        Button {
+            if !settings.symbols.contains(where: { $0.code == prev.code }) {
+                _ = settings.addSymbol(code: prev.code, name: prev.name, group: "观察")
+            }
+            store.switchSymbol(prev.code)
+            tab = .watch
+        } label: {
+            HStack(alignment: .top, spacing: 8) {
+                Text("#\(prev.rank)")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(Color.indigo)
+                    .frame(width: 20, alignment: .leading)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        Text(prev.name)
+                            .font(.system(size: 10, weight: .semibold))
+                            .lineLimit(1)
+                        if let t1Pct = prev.t1Pct {
+                            Text(String(format: "T+1 %@%.1f%%", t1Pct >= 0 ? "+" : "", t1Pct))
+                                .font(.system(size: 9, weight: .semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(t1Pct >= 0 ? trendUp : trendDown)
+                        }
+                        if let real = prev.t1RealPct {
+                            Text(String(format: "实 %@%.1f%%", real >= 0 ? "+" : "", real))
+                                .font(.system(size: 9))
+                                .monospacedDigit()
+                                .foregroundStyle(real >= 0 ? trendUp : trendDown)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    HStack(spacing: 4) {
+                        if let entryLabel = prev.entryLabel {
+                            Text(entryLabel)
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(.indigo)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Color.indigo.opacity(0.12), in: Capsule())
+                        }
+                        if let basisKind = prev.sellBasisKind {
+                            Text(basisKind == "actual_t1_open" ? "按次日开盘实际价" : "按 T+1 收盘")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    if let sLow = prev.sellPriceLow,
+                       let sHigh = prev.sellPriceHigh {
+                        HStack(spacing: 6) {
+                            Image(systemName: "target")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.secondary)
+                            Text("卖")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(.orange)
+                            Text(String(format: "%.2f–%.2f", sLow, sHigh))
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .monospacedDigit()
+                                .foregroundStyle(.primary)
+                            if let basis = prev.sellBasisPrice {
+                                Text(String(format: "基准 %.2f", basis))
+                                    .font(.system(size: 8))
+                                    .monospacedDigit()
+                                    .foregroundStyle(.tertiary)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .help("卖出价 = 推荐基准价 × (1 ± 1.5%)；封板票基准是次日开盘实际价，普通票基准是 T+1 收盘")
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private func autoWeightHelp(_ weight: GatewayPick.AutoWeight?) -> String {

@@ -1117,6 +1117,93 @@ pub async fn fetch_sell_zone_basis(db: &SqlitePool, code: &str) -> Option<Value>
     }))
 }
 
+/// §A.9 上一交易日推荐：拉近 30 天内最近一次生成且已回写 T+1 outcome 的 picks，
+/// 给前端展示「昨日推荐 → 今日卖点」用。
+///
+/// 卖出价基准：
+///   - 推荐时 entry_timing=next_session_open → 用 t1_open（真实开盘价）+0.5% 浮动
+///   - 推荐时 entry_timing=today_close / next_session_pullback → 用 t1_close × 1.0
+///
+/// 卖出价区间 ±1.5%（与 build_trade_plan 卖区间一致）
+pub async fn fetch_previous_picks(
+    db: &SqlitePool,
+    today: NaiveDate,
+) -> Result<Vec<crate::model::PreviousPick>, sqlx::Error> {
+    // 拉最近 30 天内已回写 T+1 outcome 的「距 today 最近一天」的 daily_pick
+    let since = (today - Duration::days(30)).format("%Y-%m-%d").to_string();
+    // 取最近的 1 个有 outcome 的 date
+    let latest: Option<(String,)> = sqlx::query_as(
+        "SELECT date FROM daily_pick \
+         WHERE date >= ? AND json_extract(meta,'$.outcome.t1_pct') IS NOT NULL \
+         ORDER BY date DESC LIMIT 1",
+    )
+    .bind(&since)
+    .fetch_optional(db)
+    .await?;
+    let Some((latest_date,)) = latest else {
+        return Ok(Vec::new());
+    };
+    let rows: Vec<(String, String, String, i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT date, code, name, rank, reasons, meta FROM daily_pick \
+         WHERE date = ? AND json_extract(meta,'$.outcome.t1_pct') IS NOT NULL \
+         ORDER BY rank ASC",
+    )
+    .bind(&latest_date)
+    .fetch_all(db)
+    .await?;
+    let mut out: Vec<crate::model::PreviousPick> = Vec::new();
+    for (date, code, name, rank, reasons, meta_json) in rows {
+        let meta: serde_json::Value = match meta_json {
+            Some(s) => serde_json::from_str(&s).unwrap_or(serde_json::json!({})),
+            None => continue,
+        };
+        let close = meta["close"].as_f64();
+        let outcome = &meta["outcome"];
+        let t1_pct = outcome["t1_pct"].as_f64();
+        let t1_real_pct = outcome["t1_real"].as_f64();
+        let t1_open = outcome["t1_open_basis"].as_f64();
+        let t1_close = outcome["t1_close"].as_f64();
+        let entry_gap = outcome["entry_gap"].as_f64();
+        let entry_timing = meta["plan"]["entry_timing"].as_str().map(String::from);
+        let entry_label = meta["plan"]["entry_label"].as_str().map(String::from);
+        let reasons_vec: Vec<String> = serde_json::from_str(&reasons).unwrap_or_default();
+        // §A.9 卖出价区间
+        let (basis_price, basis_kind) = if matches!(entry_timing.as_deref(), Some("next_session_open")) {
+            if let Some(open) = t1_open {
+                (Some(open * 1.005), Some("actual_t1_open".to_string()))
+            } else {
+                (t1_close.or(close), Some("t1_close".to_string()))
+            }
+        } else {
+            (t1_close.or(close), Some("t1_close".to_string()))
+        };
+        let (sell_low, sell_high) = match basis_price {
+            Some(p) => (round_price(p * 0.985), round_price(p * 1.015)),
+            None => (0.0, 0.0),
+        };
+        out.push(crate::model::PreviousPick {
+            date,
+            code,
+            name,
+            rank: rank as usize,
+            close,
+            t1_open,
+            t1_close,
+            t1_pct,
+            t1_real_pct,
+            entry_gap,
+            sell_price_low: if sell_low > 0.0 { Some(sell_low) } else { None },
+            sell_price_high: if sell_high > 0.0 { Some(sell_high) } else { None },
+            sell_basis_price: basis_price,
+            sell_basis_kind: basis_kind,
+            entry_timing,
+            entry_label,
+            reasons: reasons_vec,
+        });
+    }
+    Ok(out)
+}
+
 /// 生成某基准日推荐。`ai` 为客户端透传配置（None = 纯量化，调度器路径）。
 /// 幂等：同日重复生成 DELETE + INSERT 全量刷新。
 pub async fn generate_picks(
@@ -1695,6 +1782,7 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
             },
             market: serde_json::Value::Null,
             execute_hint: String::new(),
+            previous_picks: Vec::new(),
         });
     }
     let rows: Vec<(String, String, String, i64, f64, String, String, String)> = sqlx::query_as(
@@ -1892,6 +1980,12 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
         .first()
         .and_then(|p| p.meta.get("us").cloned())
         .unwrap_or(serde_json::Value::Null);
+    let previous_picks = fetch_previous_picks(
+        db,
+        NaiveDate::parse_from_str(&date_key, "%Y-%m-%d").unwrap_or_else(|_| Utc::now().date_naive()),
+    )
+    .await
+    .unwrap_or_default();
     Ok(PicksDocument {
         date: date_key,
         picks,
@@ -1931,6 +2025,7 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
         },
         market,
         execute_hint: String::new(),
+        previous_picks,
     })
 }
 
