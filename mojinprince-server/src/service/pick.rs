@@ -984,6 +984,10 @@ fn build_trade_plan(
     tags: &[String],
     has_position: bool,
     is_limit_up: bool,
+    close: f64,
+    sell_zone: Option<(f64, f64)>,
+    buy_zone_low: f64,
+    buy_zone_high: f64,
 ) -> Value {
     let momentum = tags.iter().any(|tag| {
         matches!(
@@ -1024,6 +1028,9 @@ fn build_trade_plan(
         "中线" => "T+1 先验证强弱，趋势未破可观察 3-10 个交易日",
         _ => "T+1 为主；次日冲高或收盘转弱时评估退出",
     };
+    // §A.9 买入价区间：现价 ±2%；封板票以封板价 ±2% 作为次日开盘预期买入区
+    // §A.9 卖出价区间：基于 T+1 历史均值 × 胜率因子 ±1.5%（无数据时按 1.5% 期望收益推算）
+    let (sell_price_low, sell_price_high) = sell_zone.unwrap_or((close * 1.012, close * 1.022));
     serde_json::json!({
         "signal_date": date.format("%Y-%m-%d").to_string(),
         "target": "T+1",
@@ -1035,7 +1042,79 @@ fn build_trade_plan(
         "has_base_position": has_position,
         "is_limit_up": is_limit_up,
         "exit_rule": exit_rule,
+        "buy_price_low": round_price(buy_zone_low),
+        "buy_price_high": round_price(buy_zone_high),
+        "sell_price_low": round_price(sell_price_low),
+        "sell_price_high": round_price(sell_price_high),
+        "buy_basis_close": round_price(close),
     })
+}
+
+/// §A.9 价格取整：A 股最小报价 0.01 元，按 0.01 取整便于前端展示。
+fn round_price(p: f64) -> f64 {
+    (p * 100.0).round() / 100.0
+}
+
+/// §A.9 卖出价区间计算器：基于该票近 30 天 outcome.t1_pct 均值与胜率。
+///
+///  sell_mid = close × (1 + avg_t1_pct × win_rate_factor)
+///  win_rate_factor = max(0.5, observed_win_rate)  // 0.5 是「50% 期望收益」的下限
+///  返回 (sell_low = sell_mid × 0.985, sell_high = sell_mid × 1.015)
+///  样本 < 3 时 fallback：sell_mid = close × 1.012（市场平均 T+1 收益 1.2%）。
+pub async fn fetch_sell_zone(
+    db: &SqlitePool,
+    code: &str,
+    close: f64,
+) -> Option<(f64, f64)> {
+    if close <= 0.0 {
+        return None;
+    }
+    let basis = fetch_sell_zone_basis(db, code).await;
+    let Some(basis) = basis else {
+        let sell_mid = close * 1.012;
+        return Some((round_price(sell_mid * 0.985), round_price(sell_mid * 1.015)));
+    };
+    let samples = basis["samples"].as_i64().unwrap_or(0);
+    if samples == 0 {
+        let sell_mid = close * 1.012;
+        return Some((round_price(sell_mid * 0.985), round_price(sell_mid * 1.015)));
+    }
+    let avg_pct = basis["avg_t1_pct"].as_f64().unwrap_or(0.0);
+    let win_rate = basis["win_rate"].as_f64().unwrap_or(0.5);
+    let factor = ((avg_pct / 100.0) * win_rate).clamp(-0.05, 0.05);
+    let sell_mid = close * (1.0 + factor);
+    Some((round_price(sell_mid * 0.985), round_price(sell_mid * 1.015)))
+}
+
+/// §A.9 卖出区间基础数据：直接返回 {samples, win_rate, avg_t1_pct, win_rate_factor}。
+///  样本 < 3 视为无效（返回 null），调用方按默认 1.2% 推算。
+pub async fn fetch_sell_zone_basis(db: &SqlitePool, code: &str) -> Option<Value> {
+    let since = (Utc::now().date_naive() - Duration::days(30))
+        .format("%Y-%m-%d")
+        .to_string();
+    let rows: Vec<f64> = sqlx::query_scalar(
+        "SELECT CAST(json_extract(meta,'$.outcome.t1_pct') AS REAL) FROM daily_pick \
+         WHERE code = ? AND date >= ? AND json_extract(meta,'$.outcome.t1_pct') IS NOT NULL",
+    )
+    .bind(code)
+    .bind(&since)
+    .fetch_all(db)
+    .await
+    .ok()?;
+    if rows.len() < 3 {
+        return None;
+    }
+    let n = rows.len() as i64;
+    let avg = rows.iter().sum::<f64>() / rows.len() as f64;
+    let wins = rows.iter().filter(|p| **p > 0.0).count() as f64;
+    let win_rate_raw = wins / rows.len() as f64;
+    let win_rate_factor = win_rate_raw.max(0.5);
+    Some(serde_json::json!({
+        "samples": n,
+        "win_rate": win_rate_raw,
+        "avg_t1_pct": avg,
+        "win_rate_factor": win_rate_factor,
+    }))
 }
 
 /// 生成某基准日推荐。`ai` 为客户端透传配置（None = 纯量化，调度器路径）。
@@ -1155,6 +1234,25 @@ pub async fn generate_picks(
     };
     let mut boosted: Vec<(Candidate, f64, Vec<String>)> = Vec::new();
     let mut negative_signals_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    // §A.9 卖出价区间：基于该票近 30 天 outcome.t1_pct 算 sell_zone_map / sell_zone_basis_map
+    let mut sell_zone_map: HashMap<String, (f64, f64)> = HashMap::new();
+    let mut sell_zone_basis_map: HashMap<String, Value> = HashMap::new();
+    for (candidate, _tech) in &scored {
+        let zone = fetch_sell_zone(&state.db, &candidate.code, candidate.price).await;
+        if let Some((low, high)) = zone {
+            sell_zone_map.insert(candidate.code.clone(), (low, high));
+        }
+        // 同步抓基础信息（样本 / 胜率 / 均值）便于 meta 透出
+        let basis = fetch_sell_zone_basis(&state.db, &candidate.code).await;
+        sell_zone_basis_map.insert(
+            candidate.code.clone(),
+            basis.unwrap_or_else(|| {
+                serde_json::json!({
+                    "samples": 0, "win_rate": 0.0, "avg_t1_pct": 0.0, "win_rate_factor": 0.5
+                })
+            }),
+        );
+    }
     for (candidate, tech) in &scored {
         let mut score = tech.score;
         let mut tags = tech.tags.clone();
@@ -1357,6 +1455,10 @@ pub async fn generate_picks(
                 "minimum_samples": 30,
                 "lookback_days": 30,
             })),
+            // §A.9 卖出价区间：基于该票近 30 天 outcome.t1_pct 均值与胜率
+            "sell_zone_basis": sell_zone_basis_map.get(&candidate.code).cloned().unwrap_or(serde_json::json!({
+                "samples": 0, "win_rate": 0.0, "avg_t1_pct": 0.0, "win_rate_factor": 0.5
+            })),
             "negative_signals": negative_signals_map
                 .get(&candidate.code)
                 .map(|signals| {
@@ -1368,7 +1470,17 @@ pub async fn generate_picks(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default(),
-            "plan": build_trade_plan(date, now_cn, tags, has_position, plan_limit_up),
+            "plan": build_trade_plan(
+                date,
+                now_cn,
+                tags,
+                has_position,
+                plan_limit_up,
+                candidate.price,
+                sell_zone_map.get(&candidate.code).copied(),
+                candidate.price * 0.98,
+                candidate.price * 1.02,
+            ),
         });
         sqlx::query(
             "INSERT INTO daily_pick(date, code, name, rank, score, reasons, ai_note, meta, created_at) \
@@ -2196,28 +2308,89 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         let tz = FixedOffset::east_opt(8 * 3600).unwrap();
         let date = NaiveDate::from_ymd_opt(2026, 9, 22).unwrap();
         let before_close = tz.with_ymd_and_hms(2026, 9, 22, 14, 46, 0).unwrap();
-        let short = build_trade_plan(date, before_close, &["放量".into()], false, false);
+        let short = build_trade_plan(
+            date,
+            before_close,
+            &["放量".into()],
+            false,
+            false,
+            10.0,
+            None,
+            9.8,
+            10.2,
+        );
         assert_eq!(short["entry_timing"], "today_close");
         assert_eq!(short["strategy"], "短线");
         assert_eq!(short["target"], "T+1");
         assert_eq!(short["entry_label"], "今日尾盘");
+        // §A.9 价格区间：close=10 套 ±2% → [9.80, 10.20]；无 sell_zone 数据 fallback 1.2%
+        assert!((short["buy_price_low"].as_f64().unwrap() - 9.80).abs() < 1e-9);
+        assert!((short["buy_price_high"].as_f64().unwrap() - 10.20).abs() < 1e-9);
+        assert!((short["buy_basis_close"].as_f64().unwrap() - 10.00).abs() < 1e-9);
+        let sell_low = short["sell_price_low"].as_f64().unwrap();
+        let sell_high = short["sell_price_high"].as_f64().unwrap();
+        assert!(sell_low > 10.07 && sell_low < 10.18, "sell_low={sell_low}");
+        assert!(sell_high > sell_low, "sell_high={sell_high}");
 
-        let with_base = build_trade_plan(date, before_close, &["放量".into()], true, false);
+        let with_base = build_trade_plan(
+            date,
+            before_close,
+            &["放量".into()],
+            true,
+            false,
+            20.0,
+            Some((21.0, 21.5)),
+            19.6,
+            20.4,
+        );
         assert_eq!(with_base["strategy"], "做T");
         assert_eq!(with_base["has_base_position"], true);
+        // sell_zone 显式提供时直接采纳
+        assert!((with_base["sell_price_low"].as_f64().unwrap() - 21.0).abs() < 1e-9);
+        assert!((with_base["sell_price_high"].as_f64().unwrap() - 21.5).abs() < 1e-9);
 
         let after_close = tz.with_ymd_and_hms(2026, 9, 22, 15, 10, 0).unwrap();
-        let late = build_trade_plan(date, after_close, &["均线多头".into()], false, false);
+        let late = build_trade_plan(
+            date,
+            after_close,
+            &["均线多头".into()],
+            false,
+            false,
+            30.0,
+            None,
+            29.4,
+            30.6,
+        );
         assert_eq!(late["entry_timing"], "next_session_pullback");
         assert_eq!(late["strategy"], "中线");
 
         // 今日已涨停：不论窗口是否 14:45 前，强制「次日开盘」
-        let locked = build_trade_plan(date, before_close, &["放量".into()], false, true);
+        let locked = build_trade_plan(
+            date,
+            before_close,
+            &["放量".into()],
+            false,
+            true,
+            42.0,
+            None,
+            41.16,
+            42.84,
+        );
         assert_eq!(locked["entry_timing"], "next_session_open");
         assert_eq!(locked["entry_label"], "次日开盘");
         assert_eq!(locked["entry_window"], "09:30-09:35");
         assert_eq!(locked["is_limit_up"], true);
-        let locked_late = build_trade_plan(date, after_close, &["放量".into()], false, true);
+        let locked_late = build_trade_plan(
+            date,
+            after_close,
+            &["放量".into()],
+            false,
+            true,
+            42.0,
+            None,
+            41.16,
+            42.84,
+        );
         assert_eq!(locked_late["entry_label"], "次日开盘");
     }
 

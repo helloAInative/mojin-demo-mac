@@ -3042,6 +3042,48 @@ struct ContentView: View {
                             .monospacedDigit()
                             .foregroundStyle(.tertiary)
                     }
+                    // §A.9 买点 / 卖点价格区间：直接从服务端 meta.plan 透出
+                    if let plan = pick.meta.plan,
+                       let bLow = plan.buyPriceLow,
+                       let bHigh = plan.buyPriceHigh,
+                       let sLow = plan.sellPriceLow,
+                       let sHigh = plan.sellPriceHigh {
+                        HStack(spacing: 6) {
+                            Image(systemName: "scope")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.secondary)
+                            Text("买")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(.green)
+                            Text(String(format: "%.2f–%.2f", bLow, bHigh))
+                                .font(.system(size: 9, design: .monospaced))
+                                .monospacedDigit()
+                                .foregroundStyle(.primary)
+                            Text("卖")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(.orange)
+                            Text(String(format: "%.2f–%.2f", sLow, sHigh))
+                                .font(.system(size: 9, design: .monospaced))
+                                .monospacedDigit()
+                                .foregroundStyle(.primary)
+                            Spacer(minLength: 0)
+                            if let basis = pick.meta.sellZoneBasis,
+                               basis.samples > 0 {
+                                Text(String(format: "%d 历史样本 · %+.1f%% T+1 均值", basis.samples, basis.avgT1Pct))
+                                    .font(.system(size: 8))
+                                    .foregroundStyle(.tertiary)
+                                    .help(
+                                        "基于该票近 30 天已回写 outcome.t1_pct；样本 < 30 时仅作方向参考"
+                                    )
+                            } else {
+                                Text("默认 1.2% T+1 期望")
+                                    .font(.system(size: 8))
+                                    .foregroundStyle(.tertiary)
+                                    .help("无历史 outcome，按市场平均 T+1 收益 1.2% 推算")
+                            }
+                        }
+                        .padding(.top, 1)
+                    }
                 }
             }
             .padding(.vertical, 2)

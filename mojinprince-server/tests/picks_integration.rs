@@ -698,3 +698,157 @@ async fn list_picks_exposes_wilson_interval_and_low_sample_flag() {
     let r_low = exec["t1_real_win_rate_low"].as_f64().unwrap();
     assert!(r_low > 0.0, "真实执行区间下界应 > 0");
 }
+
+#[actix_web::test]
+async fn picks_run_attaches_buy_and_sell_price_zones() {
+    let upstream = MockServer::start();
+    upstream.mock(|when, then| {
+        when.method(GET).path("/api/qt/clist/get");
+        then.status(200).json_body(json!({
+            "data": {"diff": [
+                {"f12": "300623", "f14": "捷捷微电", "f2": 35.11, "f3": 2.8, "f100": "半导体"}
+            ]}
+        }));
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/appstock/app/fqkline/get");
+        then.status(200).json_body(json!({
+            "data": {"sz300623": {"qfqday": zigzag_bars()}}
+        }));
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/q=usDJI,usIXIC");
+        then.status(200).body(
+            "v_usDJI=\"200~DJI~.DJI~102.0~100.0~102.5~1\";\nv_usIXIC=\"200~IXIC~.IXIC~102.0~100.0~102.5~1\"",
+        );
+    });
+    // 实时校准上游不通 → fallback snapshot
+    upstream.mock(|when, then| {
+        when.method(GET)
+            .path("/api/qt/stock/get")
+            .query_param("secid", "0.300623");
+        then.status(500);
+    });
+
+    let mut state = fresh_state().await;
+    let db = state.db.clone();
+    // 给 sz300623 灌 5 条历史 outcome (t1_pct ≈ 1.5% 平均)，让 sell_zone 走历史路径
+    for i in 0..5i64 {
+        let date = format!("2026-09-{:02}", 1 + i);
+        sqlx::query(
+            "INSERT INTO daily_pick(date, code, name, rank, score, reasons, ai_note, meta, created_at) \
+             VALUES(?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&date)
+        .bind("sz300623")
+        .bind("捷捷微电")
+        .bind(1)
+        .bind(80.0)
+        .bind("[]")
+        .bind("")
+        .bind(json!({"outcome": {"t1_pct": 1.5}}).to_string())
+        .bind(0)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    state.pick_ranking.base_url = upstream.base_url();
+    state.day_k.base_url = upstream.base_url();
+    state.us_index.base_url = upstream.base_url();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::pick::configure)),
+    )
+    .await;
+
+    let doc: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/picks/run")
+            .to_request(),
+    )
+    .await;
+    let pick = &doc["picks"][0];
+    let plan = &pick["meta"]["plan"];
+    // §A.9 买点：close=35.11 ±2% → [34.41, 35.81]
+    let buy_low = plan["buy_price_low"].as_f64().unwrap();
+    let buy_high = plan["buy_price_high"].as_f64().unwrap();
+    assert!((buy_low - 34.41).abs() < 0.05, "buy_low={buy_low}");
+    assert!((buy_high - 35.81).abs() < 0.05, "buy_high={buy_high}");
+    assert!((plan["buy_basis_close"].as_f64().unwrap() - 35.11).abs() < 0.02);
+    // §A.9 卖点：基于 5 条历史 t1_pct=1.5% (samples=5) + win_rate=1.0
+    //   factor = (1.5/100)*1.0 = 0.015 → sell_mid = 35.11 * 1.015 = 35.6366
+    //   sell_low = 35.6366 * 0.985 = 35.10；sell_high = 35.6366 * 1.015 = 36.17
+    let sell_low = plan["sell_price_low"].as_f64().unwrap();
+    let sell_high = plan["sell_price_high"].as_f64().unwrap();
+    assert!(sell_low > 35.0 && sell_low < 35.20, "sell_low={sell_low}");
+    assert!(sell_high > 36.0 && sell_high < 36.30, "sell_high={sell_high}");
+    assert!(sell_high > sell_low, "卖区间必须 high > low");
+    // meta.sell_zone_basis 透出供前端回溯
+    let basis = &pick["meta"]["sell_zone_basis"];
+    assert_eq!(basis["samples"].as_i64().unwrap(), 5);
+    assert!((basis["win_rate"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+}
+
+#[actix_web::test]
+async fn picks_run_falls_back_to_default_sell_zone_when_no_history() {
+    let upstream = MockServer::start();
+    upstream.mock(|when, then| {
+        when.method(GET).path("/api/qt/clist/get");
+        then.status(200).json_body(json!({
+            "data": {"diff": [
+                {"f12": "300623", "f14": "捷捷微电", "f2": 35.11, "f3": 2.8, "f100": "半导体"}
+            ]}
+        }));
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/appstock/app/fqkline/get");
+        then.status(200).json_body(json!({
+            "data": {"sz300623": {"qfqday": zigzag_bars()}}
+        }));
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/q=usDJI,usIXIC");
+        then.status(200).body(
+            "v_usDJI=\"200~DJI~.DJI~102.0~100.0~102.5~1\";\nv_usIXIC=\"200~IXIC~.IXIC~102.0~100.0~102.5~1\"",
+        );
+    });
+    upstream.mock(|when, then| {
+        when.method(GET)
+            .path("/api/qt/stock/get")
+            .query_param("secid", "0.300623");
+        then.status(500);
+    });
+
+    let mut state = fresh_state().await;
+    state.pick_ranking.base_url = upstream.base_url();
+    state.day_k.base_url = upstream.base_url();
+    state.us_index.base_url = upstream.base_url();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::pick::configure)),
+    )
+    .await;
+
+    let doc: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/picks/run")
+            .to_request(),
+    )
+    .await;
+    let pick = &doc["picks"][0];
+    let plan = &pick["meta"]["plan"];
+    // 无历史 → 默认 1.2% 期望收益 → sell_mid = 35.11 * 1.012 = 35.5313
+    // sell_low ≈ 35.0、sell_high ≈ 36.06
+    let sell_low = plan["sell_price_low"].as_f64().unwrap();
+    let sell_high = plan["sell_price_high"].as_f64().unwrap();
+    assert!(sell_low > 34.9 && sell_low < 35.2, "无历史 sell_low={sell_low}");
+    assert!(sell_high > 35.9 && sell_high < 36.2, "无历史 sell_high={sell_high}");
+    // samples = 0
+    assert_eq!(pick["meta"]["sell_zone_basis"]["samples"].as_i64().unwrap(), 0);
+}

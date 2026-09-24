@@ -239,12 +239,37 @@ struct GatewayPick: Codable, Equatable, Identifiable {
         var plan: TradePlan?
         /// 今日已涨停（T 日买不进，需次日开盘）
         var isLimitUp: Bool?
+        /// §A.9 卖出价区间基础数据：基于该票近 30 天 outcome.t1_pct
+        var sellZoneBasis: SellZoneBasis?
+        /// §A 负面信号细分（减持/问询/立案/...）
+        var negativeSignals: [NegativeSignal]?
 
         enum CodingKeys: String, CodingKey {
             case close, pct, industry, outcome, plan
             case autoWeight = "auto_weight"
             case isLimitUp = "is_limit_up"
+            case sellZoneBasis = "sell_zone_basis"
+            case negativeSignals = "negative_signals"
         }
+    }
+
+    struct SellZoneBasis: Codable, Equatable {
+        var samples: Int
+        var winRate: Double?
+        var avgT1Pct: Double?
+        var winRateFactor: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case samples
+            case winRate = "win_rate"
+            case avgT1Pct = "avg_t1_pct"
+            case winRateFactor = "win_rate_factor"
+        }
+    }
+
+    struct NegativeSignal: Codable, Equatable {
+        var category: String
+        var title: String
     }
 
     struct TradePlan: Codable, Equatable {
@@ -257,6 +282,16 @@ struct GatewayPick: Codable, Equatable, Identifiable {
         var strategy: String?
         var hasBasePosition: Bool?
         var exitRule: String?
+        /// §A.9 买入价下界（现价 ±2%）
+        var buyPriceLow: Double?
+        /// §A.9 买入价上界
+        var buyPriceHigh: Double?
+        /// §A.9 卖出价下界（基于 T+1 历史均值 × 胜率因子 ±1.5%）
+        var sellPriceLow: Double?
+        /// §A.9 卖出价上界
+        var sellPriceHigh: Double?
+        /// §A.9 买入价基准（现价 close，用于回溯）
+        var buyBasisClose: Double?
 
         enum CodingKeys: String, CodingKey {
             case target, objective, strategy
@@ -266,6 +301,11 @@ struct GatewayPick: Codable, Equatable, Identifiable {
             case entryWindow = "entry_window"
             case hasBasePosition = "has_base_position"
             case exitRule = "exit_rule"
+            case buyPriceLow = "buy_price_low"
+            case buyPriceHigh = "buy_price_high"
+            case sellPriceLow = "sell_price_low"
+            case sellPriceHigh = "sell_price_high"
+            case buyBasisClose = "buy_basis_close"
         }
     }
 
