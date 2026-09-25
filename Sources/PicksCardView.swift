@@ -730,9 +730,25 @@ struct PicksCardView: View {
                                 .monospacedDigit()
                                 .foregroundStyle(.tertiary)
                         }
+                        if let stop = prev.riskStopPrice {
+                            Text(String(format: "风险线 %.2f", stop))
+                                .font(.system(size: UITokens.microSize, weight: .semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(UITokens.color(.danger))
+                        }
                         Spacer(minLength: 0)
                     }
-                    .help("卖出价按真实/计划买入成本计算，最低覆盖 5% 盈利目标并预留约 0.2% 成本；不使用 T+1 收盘价事后反推")
+                    .help("目标卖区按真实执行成本计算，最低覆盖 5% 盈利目标并预留约 0.2% 成本；风险线单独展示，不伪装成盈利卖点")
+                    if let action = prev.sellActionLabel {
+                        let signal: UITokens.Signal = {
+                            switch prev.sellAction {
+                            case "take_profit": return .buy
+                            case "risk_exit", "risk_control", "entry_invalid": return .danger
+                            default: return .observe
+                            }
+                        }()
+                        pill(text: action, signal: signal)
+                    }
                 }
             }
             .padding(.vertical, 2)
