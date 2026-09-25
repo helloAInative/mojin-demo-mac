@@ -199,6 +199,32 @@ enum FontSizePref: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// §I.4 盯盘密度模式：盘中默认专注，收盘后默认全量，用户可手动锁定。
+/// `auto` 表示按当前是否为交易时段自动切换；
+/// `focus` 仅报价头 / 分时 / 价位 / 持仓盈亏；`standard` 为现状；`full` 含资讯研报逐笔。
+enum WatchDensity: String, Codable, CaseIterable, Identifiable {
+    case auto = "自动"
+    case focus = "专注"
+    case standard = "标准"
+    case full = "全量"
+    var id: String { rawValue }
+
+    /// 在 `auto` 模式下根据当前北京时间判定盘内 / 盘外。
+    static func resolve(_ mode: WatchDensity) -> WatchDensity {
+        if mode != .auto { return mode }
+        let cn = TimeZone(identifier: "Asia/Shanghai") ?? .current
+        let parts = Calendar(identifier: .gregorian).dateComponents(in: cn, from: Date())
+        let weekday = parts.weekday ?? 1  // 1=周日
+        if (2...6).contains(weekday) {
+            let m = (parts.hour ?? 0) * 60 + (parts.minute ?? 0)
+            let open = 9 * 60 + 30
+            let close = 15 * 60
+            return (open...close).contains(m) ? .focus : .full
+        }
+        return .full
+    }
+}
+
 @MainActor
 final class AppSettings: ObservableObject {
     static let shared = AppSettings()
@@ -232,6 +258,8 @@ final class AppSettings: ObservableObject {
     @Published var boardShowBJ50: Bool = false
     @Published var marketGatewayEnabled: Bool = true
     @Published var marketServerURL: String = "http://127.0.0.1:8732"
+    /// §I.4 盯盘密度模式
+    @Published var watchDensity: WatchDensity = .auto
 
     private let defaults = UserDefaults.standard
     private enum Key {
@@ -260,6 +288,7 @@ final class AppSettings: ObservableObject {
         static let boardBJ50 = "mojin.boardBJ50"
         static let marketGatewayEnabled = "mojin.marketGatewayEnabled"
         static let marketServerURL = "mojin.marketServerURL"
+        static let watchDensity = "mojin.watchDensity"
     }
 
     static let defaultSymbol = WatchSymbol(code: "sz300623", name: "捷捷微电", pinned: true)
@@ -329,6 +358,7 @@ final class AppSettings: ObservableObject {
         boardShowBJ50 = defaults.object(forKey: Key.boardBJ50) as? Bool ?? false
         marketGatewayEnabled = defaults.object(forKey: Key.marketGatewayEnabled) as? Bool ?? true
         marketServerURL = defaults.string(forKey: Key.marketServerURL) ?? "http://127.0.0.1:8732"
+        watchDensity = WatchDensity(rawValue: defaults.string(forKey: Key.watchDensity) ?? "") ?? .auto
         if levelsByCode[currentCode] == nil {
             levelsByCode[currentCode] = Self.defaultLevels
         }
@@ -367,6 +397,7 @@ final class AppSettings: ObservableObject {
         defaults.set(boardShowBJ50, forKey: Key.boardBJ50)
         defaults.set(marketGatewayEnabled, forKey: Key.marketGatewayEnabled)
         defaults.set(marketServerURL, forKey: Key.marketServerURL)
+        defaults.set(watchDensity.rawValue, forKey: Key.watchDensity)
         NotifyGovernor.shared.configure(notifyConfig)
     }
 
@@ -761,6 +792,7 @@ final class AppSettings: ObservableObject {
 
     func setAlertsEnabled(_ on: Bool) { alertsEnabled = on; save() }
     func setMenuBarOnly(_ on: Bool) { menuBarOnly = on; save() }
+    func setWatchDensity(_ d: WatchDensity) { watchDensity = d; save() }
     func setOpenCloseBrief(_ on: Bool) { openCloseBrief = on; save() }
     func setTheme(_ t: AppTheme) { theme = t; save() }
     func setMenuBarFormat(_ f: MenuBarFormat) { menuBarFormat = f; save() }

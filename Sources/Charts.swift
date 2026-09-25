@@ -1229,7 +1229,9 @@ struct AccuracyTrendChart: View {
                         .onChanged { value in
                             hoverIndex = index(atX: value.location.x, in: geo.size)
                         }
-                        .onEnded { _ in hoverIndex = nil }
+                        .onEnded { _ in
+                            hoverIndex = nil
+                        }
                 )
 
                 if let i = hoverIndex, i < days.count, i >= 0 {
@@ -1390,7 +1392,9 @@ struct DayChart: View {
                         .onChanged { value in
                             hoverIndex = index(atX: value.location.x, in: geo.size)
                         }
-                        .onEnded { _ in hoverIndex = nil }
+                        .onEnded { _ in
+                            hoverIndex = nil
+                        }
                 )
 
                 if let i = hoverIndex, i < view.count {

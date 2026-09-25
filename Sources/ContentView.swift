@@ -704,7 +704,7 @@ struct ContentView: View {
                 if reverseCountdown == 0 { reverseCheckTicketID = nil }
             }
         }
-        // E.3 快捷键：⌘1–6 切 tab、⌘R 立即分析、⌘T 委托条
+        // E.3 + §I.8：⌘1–6 切 tab、⌘R 立即分析、⌘T 委托条、⌘↵ 跳首只推荐、Esc 收折
         .background(KeyboardCatcher(onKey: { combo in
             switch combo {
             case "cmd1": tab = .watch
@@ -717,6 +717,20 @@ struct ContentView: View {
             case "cmdT":
                 store.syncTicketFromMarket(forcePrice: true)
                 tab = .trade
+            case "enter":
+                // ⌘↵ / 单独 ↵ 跳 Top 1（仅复盘页）
+                if tab == .review,
+                   let first = store.picksDoc?.picks.first {
+                    store.switchSymbol(first.code)
+                    tab = .watch
+                }
+            case "esc":
+                // Esc：优先关反向校验倒计时，再关分时详情，再清 chip 标记
+                if reverseCheckTicketID != nil {
+                    reverseCheckTicketID = nil
+                } else if showMinuteDetail {
+                    showMinuteDetail = false
+                }
             default: break
             }
         }))
@@ -836,16 +850,26 @@ struct ContentView: View {
     }
 
     private var watchTab: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
-                boardIndexStrip
+        let density = WatchDensity.resolve(settings.watchDensity)
+        return ScrollView {
+            VStack(alignment: .leading, spacing: UITokens.stackNormal) {
+                densityChip(density)
+                if density != .focus {
+                    boardIndexStrip
+                }
                 positionRow
-                stopTakeAdviceRow
-                ohlc
+                if density == .full {
+                    stopTakeAdviceRow
+                    ohlc
+                }
                 minutePanel
-                indicatorPanel
+                if density == .full {
+                    indicatorPanel
+                }
                 levels
-                codeInfoPanel
+                if density == .full {
+                    codeInfoPanel
+                }
                 Button {
                     store.syncTicketFromMarket(forcePrice: true)
                     tab = .trade
@@ -859,15 +883,63 @@ struct ContentView: View {
                              : "去填写")
                             .foregroundStyle(.secondary)
                     }
-                    .font(.system(size: 11, weight: .semibold))
-                    .padding(8)
+                    .font(.system(size: UITokens.bodySize, weight: .semibold))
+                    .padding(UITokens.stackNormal)
                     .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
                 }
                 .buttonStyle(.plain)
             }
-            .padding(.bottom, 4)
+            .padding(.bottom, UITokens.stackTight)
         }
         .onAppear { store.ensureCodeInfo() }
+    }
+
+    /// §I.4 密度切换胶囊：自动按盘内盘外判定，可手动锁定。
+    private func densityChip(_ current: WatchDensity) -> some View {
+        HStack(spacing: UITokens.stackTight) {
+            Image(systemName: current == .focus ? "scope" : (current == .standard ? "rectangle.split.3x1" : "square.grid.2x2"))
+                .font(.system(size: UITokens.metaSize))
+                .foregroundStyle(current == .focus ? UITokens.color(.buy) : (current == .full ? UITokens.color(.observe) : .secondary))
+            Text(densityLabel(current))
+                .font(.system(size: UITokens.metaSize, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Spacer()
+            ForEach(WatchDensity.allCases) { mode in
+                let isActive = settings.watchDensity == mode
+                Button {
+                    settings.setWatchDensity(mode)
+                } label: {
+                    Text(mode.rawValue)
+                        .font(.system(size: UITokens.microSize, weight: .semibold))
+                        .foregroundStyle(isActive ? .white : .secondary)
+                        .padding(.horizontal, UITokens.pillHPad)
+                        .padding(.vertical, 1)
+                        .background(isActive ? Color.accentColor : Color.secondary.opacity(0.12), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .help(densityHelp(mode))
+            }
+        }
+    }
+
+    private func densityLabel(_ resolved: WatchDensity) -> String {
+        switch (settings.watchDensity, resolved) {
+        case (.auto, .focus): return "盘中自动 · 专注"
+        case (.auto, .standard): return "盘前盘后 · 标准"
+        case (.auto, .full): return "盘外自动 · 全量"
+        case (.focus, _): return "专注：报价 + 分时 + 价位 + 持仓"
+        case (.standard, _): return "标准：增加指数条"
+        case (.full, _): return "全量：含资讯 · 研报 · 止损卡 · OHLC"
+        }
+    }
+
+    private func densityHelp(_ mode: WatchDensity) -> String {
+        switch mode {
+        case .auto: return "自动：盘中 09:30–15:00 切专注，其余时段全量"
+        case .focus: return "专注：仅报价头 / 分时 / 价位 / 持仓盈亏；盘中极速决策"
+        case .standard: return "标准：增加指数条"
+        case .full: return "全量：含资讯 · 研报 · 止损卡 · OHLC · 指标"
+        }
     }
 
     /// §F.3–F.4：当前标的的概念板块 / 机构研报 / 近期新闻（走网关，点击打开东财原文）。
@@ -1862,39 +1934,46 @@ struct ContentView: View {
     }
 
     private var minutePanel: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: UITokens.stackTight) {
             HStack {
-                Text("分时").font(.system(size: 10, weight: .bold)).foregroundStyle(.secondary)
+                Text("分时").font(.system(size: UITokens.bodySize, weight: .bold)).foregroundStyle(.secondary)
                 Spacer()
                 Text(store.minutes.isEmpty
                      ? (store.liveOK ? "暂无分时" : "等待分时…")
                      : "\(store.minutes.count) 点 · 拖动")
-                    .font(.system(size: 10))
+                    .font(.system(size: UITokens.bodySize))
                     .foregroundStyle(.secondary)
-                Button(showTicks ? "收起逐笔" : "逐笔") {
-                    showTicks.toggle()
-                    if showTicks, store.ticks.isEmpty {
-                        Task { await store.loadTicks() }
+                // §I.5 图表图例治理 — 集中到图显菜单，避免按钮横排膨胀
+                Menu {
+                    Button(showTicks ? "收起逐笔" : "展开逐笔") {
+                        showTicks.toggle()
+                        if showTicks, store.ticks.isEmpty {
+                            Task { await store.loadTicks() }
+                        }
                     }
-                }
-                .controlSize(.mini)
-                .help("B.4：分时下方逐笔分钟柱（净买红/净卖绿），点击柱下钻该分钟逐笔明细")
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        minuteChartExpanded.toggle()
+                    Button(minuteChartExpanded ? "收起分时" : "放大分时") {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            minuteChartExpanded.toggle()
+                        }
                     }
+                    if store.tickBusy { Text("正在拉逐笔…") }
                 } label: {
-                    Label(minuteChartExpanded ? "收起" : "放大",
-                          systemImage: minuteChartExpanded
-                          ? "arrow.down.right.and.arrow.up.left"
-                          : "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: 9, weight: .semibold))
+                    Label("图显", systemImage: "slider.horizontal.3")
+                        .font(.system(size: UITokens.metaSize, weight: .semibold))
                 }
-                .buttonStyle(.borderless)
-                .controlSize(.mini)
-                .help(minuteChartExpanded ? "收起分时图" : "放大分时图")
-                if store.tickBusy { ProgressView().controlSize(.mini) }
+                .menuStyle(.borderlessButton)
+                .frame(width: 70)
+                .help("分时 / 逐笔的显隐与放大")
             }
+            // §I.5 统一图例：均价 + 昨收 + 阻力 / 支撑 四件套，与价位线同色
+            HStack(spacing: UITokens.stackNormal) {
+                legendDot(color: UITokens.color(.observe), text: "均价")
+                legendDot(color: .secondary.opacity(0.6), text: "昨收", dashed: true)
+                legendDot(color: trendUp, text: "阻力")
+                legendDot(color: trendDown, text: "支撑")
+                Spacer(minLength: 0)
+            }
+            .font(.system(size: UITokens.microSize))
             if showTicks {
                 Text(store.tickHint)
                     .font(.system(size: 9))
@@ -1992,6 +2071,23 @@ struct ContentView: View {
             minuteStat("涨幅", value: price > 0 ? String(format: "%+.2f%%", pct) : "--", color: pctColor(pct))
             minuteStat("均价", value: average > 0 ? String(format: "%.2f", average) : "--", color: Color(red: 1, green: 0.84, blue: 0.04))
             minuteStat("振幅", value: amplitude > 0 ? String(format: "%.2f%%", amplitude) : "--", color: .primary)
+        }
+    }
+
+    /// §I.5 图表图例小项：色点（实线 / 虚线）+ 短名，与价位线同色保持视觉一致。
+    private func legendDot(color: Color, text: String, dashed: Bool = false) -> some View {
+        HStack(spacing: 3) {
+            if dashed {
+                Path { p in
+                    p.move(to: CGPoint(x: 0, y: 4))
+                    p.addLine(to: CGPoint(x: 10, y: 4))
+                }
+                .stroke(color, style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
+                .frame(width: 10, height: 8)
+            } else {
+                Capsule().fill(color).frame(width: 10, height: 3)
+            }
+            Text(text).foregroundStyle(.secondary)
         }
     }
 
@@ -2151,202 +2247,16 @@ struct ContentView: View {
     }
 
     /// B.6：自选股热力图——按当日涨跌幅着色的 4 列格子，一眼看全场强弱。
-    @ViewBuilder private var watchHeatmap: some View {
-        let cells = settings.symbols.compactMap { symbol -> WatchHeatCell? in
-            let quote = store.watchQuotes[symbol.code]
-            guard let quote, quote.price > 0, quote.prev > 0 else { return nil }
-            return WatchHeatCell(code: symbol.code, name: symbol.name, pct: quote.pct)
-        }
-        if !cells.isEmpty {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("自选热力 · \(cells.count) 只有报价")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(.secondary)
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 4), spacing: 4) {
-                    ForEach(cells) { cell in
-                        Button {
-                            store.switchSymbol(cell.code)
-                            tab = .watch
-                        } label: {
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(cell.name)
-                                    .font(.system(size: 9, weight: .semibold))
-                                    .lineLimit(1)
-                                Text(String(format: "%@%.2f%%", cell.pct >= 0 ? "+" : "", cell.pct))
-                                    .font(.system(size: 11, weight: .bold, design: .rounded))
-                                    .monospacedDigit()
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 4)
-                            .background(heatColor(cell.pct), in: RoundedRectangle(cornerRadius: 5))
-                            .help("\(cell.name) \(cell.code) · 点击去盯盘")
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .padding(8)
-            .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
-        }
-    }
-
-    /// 涨跌幅 → 背景色（A 股红涨绿跌；±3% 封顶梯度，中性灰）。
-    private func heatColor(_ pct: Double) -> Color {
-        let clamped = max(min(pct, 3.0), -3.0) / 3.0
-        if clamped > 0.02 {
-            return Color(red: 1, green: 0.27, blue: 0.23).opacity(0.15 + 0.45 * clamped)
-        }
-        if clamped < -0.02 {
-            return Color(red: 0.2, green: 0.84, blue: 0.29).opacity(0.15 + 0.45 * (-clamped))
-        }
-        return Color.primary.opacity(0.06)
-    }
-
-    /// 多标的组合视图（ROI #10）：持仓聚合 + 每只一行，点击跳盯盘。
-    @ViewBuilder private var portfolioCard: some View {
-        let portfolio = store.portfolio
-        if !portfolio.rows.isEmpty {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 6) {
-                    Text("持仓组合 · \(portfolio.rows.count) 只")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    if portfolio.summary.cost > 0 || portfolio.summary.market > 0 {
-                        Text(String(format: "总市值 ¥%.0f", portfolio.summary.market))
-                            .font(.system(size: 10, weight: .semibold))
-                            .monospacedDigit()
-                        Text(String(format: "%@¥%.0f（%+.1f%%）",
-                                     portfolio.summary.pnl >= 0 ? "浮盈 +" : "浮亏 ",
-                                     abs(portfolio.summary.pnl),
-                                     portfolio.summary.pnlPct))
-                            .font(.system(size: 10, weight: .semibold))
-                            .monospacedDigit()
-                            .foregroundStyle(pctColor(portfolio.summary.pnlPct))
-                    }
-                }
-                HStack(spacing: 6) {
-                    if portfolio.summary.dayPnl != 0 {
-                        Text(String(format: "今日 %@¥%.0f",
-                                    portfolio.summary.dayPnl >= 0 ? "+" : "−",
-                                    abs(portfolio.summary.dayPnl)))
-                            .font(.system(size: 9, weight: .semibold))
-                            .monospacedDigit()
-                            .foregroundStyle(pctColor(portfolio.summary.dayPnl))
-                    }
-                    if portfolio.summary.unquoted > 0 {
-                        Text("\(portfolio.summary.unquoted) 只无报价（点行去盯盘拉行情）")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                }
-                ForEach(portfolio.rows) { row in
-                    Button {
-                        store.switchSymbol(row.code)
-                        tab = .watch
-                    } label: {
-                        portfolioRowView(row, totalMarket: portfolio.summary.market)
-                    }
-                    .buttonStyle(.plain)
-                    .help(rowTooltip(row))
-                }
-            }
-            .padding(8)
-            .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
-        }
-    }
-
-    private func portfolioRowView(_ row: PortfolioRow, totalMarket: Double) -> some View {
-        HStack(spacing: 6) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text(row.name.isEmpty ? row.code : row.name)
-                    .font(.system(size: 10, weight: .semibold))
-                    .lineLimit(1)
-                HStack(spacing: 3) {
-                    if row.hasStop {
-                        Image(systemName: "shield.lefthalf.filled")
-                            .font(.system(size: 7))
-                            .foregroundStyle(trendUp)
-                    }
-                    if row.hasTake {
-                        Image(systemName: "flag.fill")
-                            .font(.system(size: 7))
-                            .foregroundStyle(trendDown)
-                    }
-                    Text(String(format: "%.0f 股", row.shares))
-                        .font(.system(size: 8))
-                        .foregroundStyle(.secondary)
-                }
-            }
-            Spacer(minLength: 0)
-            VStack(alignment: .trailing, spacing: 1) {
-                if row.quoted {
-                    Text(String(format: "%.2f", row.price))
-                        .font(.system(size: 11, weight: .bold, design: .rounded))
-                        .monospacedDigit()
-                    Text(String(format: "%@%.2f%%", row.dayPct >= 0 ? "+" : "", row.dayPct))
-                        .font(.system(size: 8))
-                        .monospacedDigit()
-                        .foregroundStyle(row.prev > 0 ? pctColor(row.dayPct) : .secondary)
-                } else {
-                    Text("无报价")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.secondary)
-                    Text(row.cost > 0 ? String(format: "成本 %.3f", row.cost) : "未填成本")
-                        .font(.system(size: 8))
-                        .foregroundStyle(.secondary)
-                }
-            }
-            VStack(alignment: .trailing, spacing: 1) {
-                if row.quoted && row.cost > 0 {
-                    Text(String(format: "%@¥%.0f", row.pnl >= 0 ? "+" : "−", abs(row.pnl)))
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .monospacedDigit()
-                        .foregroundStyle(pctColor(row.pnl))
-                    Text(String(format: "%+.1f%%", row.pnlPct))
-                        .font(.system(size: 8))
-                        .monospacedDigit()
-                        .foregroundStyle(pctColor(row.pnl))
-                } else {
-                    Text("—").font(.system(size: 10)).foregroundStyle(.secondary)
-                }
-            }
-            // 市值占比条（占组合总市值）
-            ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(Color.primary.opacity(0.1))
-                    .frame(width: 54, height: 4)
-                if row.quoted, totalMarket > 0 {
-                    let weight = min(row.market / totalMarket, 1)
-                    Capsule()
-                        .fill(Color.accentColor.opacity(0.75))
-                        .frame(width: 54 * weight, height: 4)
-                }
-            }
-            .help(row.quoted && totalMarket > 0
-                  ? String(format: "市值 ¥%.0f · 占组合 %.0f%%", row.market, row.market / totalMarket * 100)
-                  : "无报价")
-        }
-        .contentShape(Rectangle())
-    }
-
-    private func rowTooltip(_ row: PortfolioRow) -> String {
-        var text = "\(row.name) \(row.code) · 成本 \(row.cost > 0 ? String(format: "%.3f", row.cost) : "未填") · \(Int(row.shares)) 股"
-        if row.hasStop, let note = settings.positions[row.code], note.stopLoss > 0 {
-            text += String(format: " · 止损 %.2f", note.stopLoss)
-        }
-        if row.hasTake, let note = settings.positions[row.code], note.takeProfit > 0 {
-            text += String(format: " · 止盈 %.2f", note.takeProfit)
-        }
-        return text + "\n点击去盯盘"
-    }
-
     private var listTab: some View {
         VStack(alignment: .leading, spacing: 8) {
-            watchHeatmap
-            portfolioCard
+            WatchHeatmapView(settings: settings, store: store) { code in
+                store.switchSymbol(code)
+                tab = .watch
+            }
+            PortfolioCardView(settings: settings, store: store) { code in
+                store.switchSymbol(code)
+                tab = .watch
+            }
             GroupBox {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("自定义添加")
@@ -2791,532 +2701,6 @@ struct ContentView: View {
         .frame(minHeight: 280, alignment: .top)
     }
 
-    /// A 股池尾盘智能推荐：14:45 产出，主目标 T+1 正收益。
-    private var picksCard: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("尾盘智能推荐 · 目标 T+1")
-                        .font(.system(size: 10, weight: .bold))
-                    if let doc = store.picksDoc, !doc.picks.isEmpty {
-                        Text(doc.date)
-                            .font(.system(size: 9))
-                            .foregroundStyle(.tertiary)
-                    }
-                    Spacer()
-                    if store.picksBusy {
-                        ProgressView().controlSize(.mini)
-                    }
-                    Button("AI 精排") {
-                        Task { await store.runPicks() }
-                    }
-                    .controlSize(.mini)
-                    .disabled(store.picksBusy)
-                    .help("重新生成当日推荐：涨幅榜 → 量化 → 研报/新闻 → AI 精排；通常需要 30–120 秒（AI 未配置则纯量化）")
-                    Button("刷新") {
-                        Task { await store.loadPicks() }
-                    }
-                    .controlSize(.mini)
-                    .disabled(store.picksBusy)
-                }
-                if let doc = store.picksDoc {
-                    if doc.picks.isEmpty {
-                        Text("暂无推荐。工作日 14:45 自动生成尾盘候选，或点「AI 精排」立即刷新。")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.tertiary)
-                    } else {
-                        HStack(spacing: 8) {
-                            if doc.samples > 0 {
-                                // §A.8 置信区间：样本不足时显示 ⚠️ + Wilson 95% 区间，避免误读「70% 胜率」
-                                let lowPct = doc.t1WinRateLow * 100
-                                let highPct = doc.t1WinRateHigh * 100
-                                let intervalLabel = String(format: "[%.0f–%.0f%%]", lowPct, highPct)
-                                let warningIcon = doc.t1SamplesSufficient ? "" : "⚠️ "
-                                let warningColor: Color = doc.t1SamplesSufficient ? .secondary : .orange
-                                Text("\(warningIcon)T+1 胜率 \(String(format: "%.0f", doc.t1WinRate * 100))%\(intervalLabel) · \(doc.samples) 样本 · 平均 \(String(format: "%+.1f", doc.avgT1Pct))%")
-                                    .font(.system(size: 9, weight: .semibold))
-                                    .foregroundStyle(doc.t1WinRate >= 0.5 ? .green : .orange)
-                                    .help("尾盘推荐基准价 vs 下一交易日收盘；近 30 天口径。区间为 Wilson 95% 置信区间，样本 < 30 时区间很宽，不可作为稳定指标。")
-                                if doc.t5Samples > 0 {
-                                    let t5Low = doc.t5WinRateLow * 100
-                                    let t5High = doc.t5WinRateHigh * 100
-                                    let t5Interval = String(format: "[%.0f–%.0f%%]", t5Low, t5High)
-                                    Text("T+5 \(String(format: "%.0f", doc.t5WinRate * 100))%\(t5Interval) · \(doc.t5Samples) 样本")
-                                        .font(.system(size: 8))
-                                        .foregroundStyle(.tertiary)
-                                        .help("T+5 中线参考 · Wilson 95% 区间")
-                                }
-                                if !doc.t1SamplesSufficient {
-                                    Text("⚠️ 样本不足 \(doc.samples)，胜率仅供方向参考")
-                                        .font(.system(size: 8, weight: .semibold))
-                                        .foregroundStyle(warningColor)
-                                }
-                            } else {
-                                Text("T+1 样本积累中（下一交易日收盘后回写）")
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(.tertiary)
-                            }
-                            if let hint = doc.executeHint, !hint.isEmpty {
-                        Text(hint)
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(Color.orange)
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(Color.orange.opacity(0.12), in: Capsule())
-                            .help("推荐基于当日行情；涨停已过滤，确保有买入窗口")
-                    }
-                    if let exec = doc.execution, doc.samples > 0 {
-                        HStack(spacing: 8) {
-                            // 真实执行：同上，T+1 真实胜率也加区间提示
-                            let execInterval = String(format: "[%.0f–%.0f%%]",
-                                                      exec.t1RealWinRateLow * 100,
-                                                      exec.t1RealWinRateHigh * 100)
-                            Text(String(format: "真实执行(次日开盘): 胜率 %.0f%%%@ · 溢价 %+.1f%%",
-                                        exec.t1RealWinRate * 100, execInterval, exec.avgEntryGap))
-                                .font(.system(size: 9))
-                                .monospacedDigit()
-                                .foregroundStyle(exec.t1RealWinRate >= 0.5 ? .green : .orange)
-                                .help("Wilson 95% 区间；样本 < 30 时只看方向，不看数字")
-                            if exec.avgMaxDd < 0 {
-                                Text(String(format: "最大回撤 %.1f%%", exec.avgMaxDd))
-                                    .font(.system(size: 9))
-                                    .monospacedDigit()
-                                    .foregroundStyle(.orange)
-                            }
-                            if exec.winLossRatio > 0 {
-                                Text(String(format: "盈亏比 %.1f", exec.winLossRatio))
-                                    .font(.system(size: 9))
-                                    .monospacedDigit()
-                                    .foregroundStyle(exec.winLossRatio >= 2 ? .green : .secondary)
-                            }
-                            Spacer()
-                        }
-                        .help("次日开盘实际买入价 vs 推荐日收盘价的统计——更贴近真实收益")
-                    }
-                    if let ixic = doc.market?.ixic {
-                                Text(String(format: "隔夜纳指 %+.1f%%", ixic))
-                                    .font(.system(size: 9))
-                                    .monospacedDigit()
-                                    .foregroundStyle(ixic >= 0 ? trendUp : trendDown)
-                                    .help("隔夜美股情绪（道指/纳指），影响当日推荐的全局分")
-                            }
-                        }
-                        // 标签级回测：哪个因子真的有效
-                        if !doc.tags.isEmpty {
-                            HStack(spacing: 4) {
-                                ForEach(doc.tags.prefix(5)) { t in
-                                    Text(String(format: "%@ %.0f%%", t.tag, t.winRate * 100))
-                                        .font(.system(size: 8))
-                                        .monospacedDigit()
-                                        .foregroundStyle(t.winRate >= 0.5 ? .green : .orange)
-                                        .padding(.horizontal, 4)
-                                        .padding(.vertical, 1)
-                                        .background(
-                                            (t.winRate >= 0.5 ? Color.green : Color.orange)
-                                                .opacity(0.1), in: Capsule())
-                                        .help("该标签近 30 天 T+1 胜率 · \(t.samples) 样本")
-                                }
-                                Spacer(minLength: 0)
-                            }
-                        }
-                        if doc.picks.contains(where: { abs($0.meta.autoWeight?.adjustment ?? 0) >= 0.05 }) {
-                            Label("已启用复盘学习调权（近30天 · 单标签≥30样本）",
-                                  systemImage: "brain.head.profile")
-                                .font(.system(size: 8, weight: .semibold))
-                                .foregroundStyle(.purple)
-                        }
-                        ForEach(doc.picks) { pick in
-                            pickRow(pick)
-                        }
-                        // 尾盘买进专项：仅当日、未涨停、entry_timing=today_close
-                        tailBuySection(doc)
-                        // §A.9 上一交易日推荐 → 今日卖点
-                        previousPicksSection(doc)
-                    }
-                } else if !store.picksHint.isEmpty {
-                    Text(store.picksHint)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                } else {
-                    Text("点「AI 精排」生成，或等收盘后自动产出")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                }
-                if !store.picksHint.isEmpty, store.picksDoc?.picks.isEmpty == false {
-                    Text(store.picksHint)
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            .padding(4)
-        }
-    }
-
-    private func pickRow(_ pick: GatewayPick) -> some View {
-        Button {
-            if !settings.symbols.contains(where: { $0.code == pick.code }) {
-                _ = settings.addSymbol(code: pick.code, name: pick.name, group: "观察")
-            }
-            store.switchSymbol(pick.code)
-            tab = .watch
-        } label: {
-            HStack(alignment: .top, spacing: 8) {
-                Text("#\(pick.rank)")
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(Color.accentColor)
-                    .frame(width: 20, alignment: .leading)
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 4) {
-                        Text(pick.name)
-                            .font(.system(size: 10, weight: .semibold))
-                            .lineLimit(1)
-                        if let industry = pick.meta.industry, !industry.isEmpty {
-                            Text(industry)
-                                .font(.system(size: 8))
-                                .foregroundStyle(.tertiary)
-                                .lineLimit(1)
-                        }
-                        Spacer(minLength: 0)
-                        if let pct = pick.meta.pct {
-                            Text(String(format: "%@%.1f%%", pct >= 0 ? "+" : "", pct))
-                                .font(.system(size: 10, weight: .semibold))
-                                .monospacedDigit()
-                                .foregroundStyle(pct >= 0 ? trendUp : trendDown)
-                        }
-                    }
-                    HStack(spacing: 4) {
-                        let entry = pickEntryStatus(pick)
-                        Text(entry.text)
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(entry.color)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(entry.color.opacity(0.12), in: Capsule())
-                        let strategy = pick.meta.plan?.strategy ?? "短线"
-                        Text(strategy)
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(strategyColor(strategy))
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(strategyColor(strategy).opacity(0.12), in: Capsule())
-                        Text(pickTargetLabel(pick))
-                            .font(.system(size: 8, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                        Spacer(minLength: 0)
-                        if let window = pick.meta.plan?.entryWindow, entry.text.contains("尾盘") {
-                            Text(window)
-                                .font(.system(size: 8, design: .monospaced))
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                    HStack(spacing: 4) {
-                        ForEach(pick.reasons.prefix(3), id: \.self) { tag in
-                            Text(tag)
-                                .font(.system(size: 8))
-                                .foregroundStyle(Color.accentColor.opacity(0.9))
-                                .padding(.horizontal, 4)
-                                .padding(.vertical, 1)
-                                .background(Color.accentColor.opacity(0.1), in: Capsule())
-                        }
-                        if let t1 = pick.meta.outcome?.t1Pct {
-                            Text(String(format: "T+1 %+.1f%%", t1))
-                                .font(.system(size: 8))
-                                .monospacedDigit()
-                                .foregroundStyle(t1 >= 0 ? trendUp : trendDown)
-                        }
-                        if let adjustment = pick.meta.autoWeight?.adjustment,
-                           abs(adjustment) >= 0.05 {
-                            Text(String(format: "学习 %@%.1f", adjustment >= 0 ? "+" : "", adjustment))
-                                .font(.system(size: 8, weight: .semibold))
-                                .monospacedDigit()
-                                .foregroundStyle(adjustment >= 0 ? Color.purple : Color.orange)
-                                .padding(.horizontal, 4)
-                                .padding(.vertical, 1)
-                                .background(
-                                    (adjustment >= 0 ? Color.purple : Color.orange).opacity(0.1),
-                                    in: Capsule()
-                                )
-                                .help(autoWeightHelp(pick.meta.autoWeight))
-                        }
-                        Spacer(minLength: 0)
-                        Text(String(format: "%.0f分", pick.score))
-                            .font(.system(size: 8))
-                            .monospacedDigit()
-                            .foregroundStyle(.tertiary)
-                    }
-                    // §A.9 买点 / 卖点价格区间：直接从服务端 meta.plan 透出
-                    if let plan = pick.meta.plan,
-                       let bLow = plan.buyPriceLow,
-                       let bHigh = plan.buyPriceHigh,
-                       let sLow = plan.sellPriceLow,
-                       let sHigh = plan.sellPriceHigh {
-                        HStack(spacing: 6) {
-                            Image(systemName: "scope")
-                                .font(.system(size: 9))
-                                .foregroundStyle(.secondary)
-                            Text("买")
-                                .font(.system(size: 8, weight: .bold))
-                                .foregroundStyle(.green)
-                            Text(String(format: "%.2f–%.2f", bLow, bHigh))
-                                .font(.system(size: 9, design: .monospaced))
-                                .monospacedDigit()
-                                .foregroundStyle(.primary)
-                            Text("卖")
-                                .font(.system(size: 8, weight: .bold))
-                                .foregroundStyle(.orange)
-                            Text(String(format: "%.2f–%.2f", sLow, sHigh))
-                                .font(.system(size: 9, design: .monospaced))
-                                .monospacedDigit()
-                                .foregroundStyle(.primary)
-                            Spacer(minLength: 0)
-                            if let basis = pick.meta.sellZoneBasis,
-                               basis.samples > 0 {
-                                Text(String(format: "%d 历史样本 · %+.1f%% T+1 均值", basis.samples, basis.avgT1Pct))
-                                    .font(.system(size: 8))
-                                    .foregroundStyle(.tertiary)
-                                    .help(
-                                        "基于该票近 30 天已回写 outcome.t1_pct；样本 < 30 时仅作方向参考"
-                                    )
-                            } else {
-                                Text("默认 1.2% T+1 期望")
-                                    .font(.system(size: 8))
-                                    .foregroundStyle(.tertiary)
-                                    .help("无历史 outcome，按市场平均 T+1 收益 1.2% 推算")
-                            }
-                        }
-                        .padding(.top, 1)
-                    }
-                }
-            }
-            .padding(.vertical, 2)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(pickHelp(pick))
-    }
-
-    private var todayCNDateKey: String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: Date())
-    }
-
-    private func pickEntryStatus(_ pick: GatewayPick) -> (text: String, color: Color) {
-        guard pick.date == todayCNDateKey else {
-            return ("上一交易日推荐", .secondary)
-        }
-        let calendar = Calendar(identifier: .gregorian)
-        let cn = TimeZone(identifier: "Asia/Shanghai") ?? .current
-        let parts = calendar.dateComponents(in: cn, from: Date())
-        let minute = (parts.hour ?? 0) * 60 + (parts.minute ?? 0)
-        if minute < 15 * 60 {
-            return ("今日尾盘", .green)
-        }
-        if pick.meta.plan?.entryTiming == "next_session_pullback" {
-            return ("明日回踩", .orange)
-        }
-        return ("今日已收盘", .orange)
-    }
-
-    private func strategyColor(_ strategy: String) -> Color {
-        switch strategy {
-        case "做T": return .purple
-        case "中线": return .blue
-        default: return .orange
-        }
-    }
-
-    private func pickTargetLabel(_ pick: GatewayPick) -> String {
-        if pick.date == todayCNDateKey { return "目标：下一交易日上涨" }
-        if pick.meta.outcome?.t1Pct != nil { return "T+1 已验证" }
-        return "目标：下一交易日 T+1"
-    }
-
-    private func pickHelp(_ pick: GatewayPick) -> String {
-        let plan = pick.meta.plan
-        let entry = pickEntryStatus(pick).text
-        let strategy = plan?.strategy ?? "短线"
-        let exit = plan?.exitRule ?? "T+1 观察，不承诺次日上涨"
-        return "\(pick.name) \(pick.code) · \(entry) · \(strategy)\n目标：T+1 收盘正收益（概率筛选，非保证）\n计划：\(exit)\n\(pick.reasons.joined(separator: " / ")) · 综合分 \(Int(pick.score))\(pick.aiNote.isEmpty ? "" : "\nAI：\(pick.aiNote)")\n\(autoWeightHelp(pick.meta.autoWeight))\n点击加入自选并去盯盘（仅关注建议，不构成投资建议）"
-    }
-
-    /// 尾盘买进专项清单：仅展示今日可买入窗口（14:45-14:57）的票，
-    /// 涨停股归到另一行（次盘新股、需次日开盘）。
-    @ViewBuilder
-    private func tailBuySection(_ doc: GatewayPicksDocument) -> some View {
-        let today = doc.tailBuyPicks
-        let nextOpen = doc.nextOpenPicks
-        if today.isEmpty && nextOpen.isEmpty { EmptyView() } else {
-            VStack(alignment: .leading, spacing: 4) {
-                Divider().padding(.vertical, 2)
-                HStack(spacing: 6) {
-                    Image(systemName: "clock.badge.checkmark")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.green)
-                    Text("尾盘买进清单")
-                        .font(.system(size: 10, weight: .bold))
-                    Text("仅当日未涨停 · \(today.count) 只")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.secondary)
-                    if !nextOpen.isEmpty {
-                        Text("· 已涨停 \(nextOpen.count) 只 → 次日开盘")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.orange)
-                    }
-                    Spacer(minLength: 0)
-                }
-                if today.isEmpty {
-                    Text("今日 Top\(doc.picks.count) 全部已涨停或错过尾盘窗口 —— 参看下方「次日开盘」")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
-                } else {
-                    ForEach(today) { pick in
-                        pickRow(pick)
-                    }
-                }
-                if !nextOpen.isEmpty {
-                    HStack(spacing: 4) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.orange)
-                        Text("次盘新股 · 09:30-09:35 集合竞价优先")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(.orange)
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.top, 2)
-                    ForEach(nextOpen) { pick in
-                        pickRow(pick)
-                    }
-                }
-            }
-        }
-    }
-
-    /// §A.9 上一交易日推荐：已在 daily_pick 表中回写 T+1 outcome 的票，
-    /// 用于在「AI 精选」卡下方展示「昨日推荐 → 今日卖点」。
-    @ViewBuilder
-    private func previousPicksSection(_ doc: GatewayPicksDocument) -> some View {
-        if let prev = doc.previousPicks, !prev.isEmpty {
-            VStack(alignment: .leading, spacing: 4) {
-                Divider().padding(.vertical, 2)
-                HStack(spacing: 6) {
-                    Image(systemName: "calendar.badge.clock")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.indigo)
-                    Text("上一交易日推荐 → 今日卖出参考")
-                        .font(.system(size: 10, weight: .bold))
-                    Text("\(prev.first?.date ?? "") · \(prev.count) 只")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 0)
-                }
-                ForEach(prev) { p in
-                    previousPickRow(p)
-                }
-            }
-        }
-    }
-
-    /// §A.9 上一交易日推荐行：显示推荐日 → 今日卖点区间
-    private func previousPickRow(_ prev: GatewayPreviousPick) -> some View {
-        Button {
-            if !settings.symbols.contains(where: { $0.code == prev.code }) {
-                _ = settings.addSymbol(code: prev.code, name: prev.name, group: "观察")
-            }
-            store.switchSymbol(prev.code)
-            tab = .watch
-        } label: {
-            HStack(alignment: .top, spacing: 8) {
-                Text("#\(prev.rank)")
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(Color.indigo)
-                    .frame(width: 20, alignment: .leading)
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 4) {
-                        Text(prev.name)
-                            .font(.system(size: 10, weight: .semibold))
-                            .lineLimit(1)
-                        if let t1Pct = prev.t1Pct {
-                            Text(String(format: "T+1 %@%.1f%%", t1Pct >= 0 ? "+" : "", t1Pct))
-                                .font(.system(size: 9, weight: .semibold))
-                                .monospacedDigit()
-                                .foregroundStyle(t1Pct >= 0 ? trendUp : trendDown)
-                        }
-                        if let real = prev.t1RealPct {
-                            Text(String(format: "实 %@%.1f%%", real >= 0 ? "+" : "", real))
-                                .font(.system(size: 9))
-                                .monospacedDigit()
-                                .foregroundStyle(real >= 0 ? trendUp : trendDown)
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    HStack(spacing: 4) {
-                        if let entryLabel = prev.entryLabel {
-                            Text(entryLabel)
-                                .font(.system(size: 8, weight: .bold))
-                                .foregroundStyle(.indigo)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 1)
-                                .background(Color.indigo.opacity(0.12), in: Capsule())
-                        }
-                        if let basisKind = prev.sellBasisKind {
-                            Text(basisKind == "actual_t1_open" ? "按次日开盘实际价" : "按 T+1 收盘")
-                                .font(.system(size: 8))
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    if let sLow = prev.sellPriceLow,
-                       let sHigh = prev.sellPriceHigh {
-                        HStack(spacing: 6) {
-                            Image(systemName: "target")
-                                .font(.system(size: 9))
-                                .foregroundStyle(.secondary)
-                            Text("卖")
-                                .font(.system(size: 8, weight: .bold))
-                                .foregroundStyle(.orange)
-                            Text(String(format: "%.2f–%.2f", sLow, sHigh))
-                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                                .monospacedDigit()
-                                .foregroundStyle(.primary)
-                            if let basis = prev.sellBasisPrice {
-                                Text(String(format: "基准 %.2f", basis))
-                                    .font(.system(size: 8))
-                                    .monospacedDigit()
-                                    .foregroundStyle(.tertiary)
-                            }
-                            Spacer(minLength: 0)
-                        }
-                        .help("卖出价 = 推荐基准价 × (1 ± 1.5%)；封板票基准是次日开盘实际价，普通票基准是 T+1 收盘")
-                    }
-                }
-            }
-            .padding(.vertical, 2)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func autoWeightHelp(_ weight: GatewayPick.AutoWeight?) -> String {
-        guard let weight,
-              let adjustment = weight.adjustment,
-              abs(adjustment) >= 0.05 else {
-            return "历史样本未达自动调权门槛"
-        }
-        let evidence = (weight.tags ?? []).map {
-            String(format: "%@ %d样本/胜率%.0f%%/%@%.1f分",
-                   $0.tag, $0.samples, $0.winRate * 100,
-                   $0.delta >= 0 ? "+" : "", $0.delta)
-        }.joined(separator: "；")
-        return String(format: "复盘学习调权 %@%.1f分\n%@",
-                      adjustment >= 0 ? "+" : "", adjustment,
-                      evidence.isEmpty ? "无可展示标签证据" : evidence)
-    }
-
     /// 历史回放（ROI #12 M2）：选交易日 → 归档分时喂 MinuteChart + 当日信号；导出 .json。
     @ViewBuilder private var replaySection: some View {
         GroupBox {
@@ -3515,8 +2899,15 @@ struct ContentView: View {
                 .padding(4)
             }
 
-            // A 股池智能推荐（复盘页）
-            picksCard
+            // A 股池智能推荐（复盘页）—— §I.1 三层折叠版本
+            PicksCardView(
+                store: store,
+                settings: settings,
+                onOpenSymbol: { code, _ in
+                    store.switchSymbol(code)
+                    tab = .watch
+                }
+            )
 
             // 复盘历史（从后端拉，按 kind 过滤）
             GroupBox {
@@ -4540,6 +3931,68 @@ struct TokenPlanModelPicker: View {
     }
 }
 
+/// §A.11 纸面收盘基准 vs 次日开盘真实成交的累计 T+1 曲线。
+struct PickExecutionCurveView: View {
+    let points: [ExecutionStats.CurvePoint]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 10) {
+                Label("纸面", systemImage: "minus")
+                    .foregroundStyle(.blue)
+                Label("次日开盘", systemImage: "minus")
+                    .foregroundStyle(.orange)
+                Spacer(minLength: 0)
+                if let last = points.last {
+                    Text(String(format: "累计 %+.1f%% / %+.1f%%",
+                                last.paperCumulativePct, last.openCumulativePct))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.system(size: 8, weight: .semibold))
+            Canvas { context, size in
+                let values: [Double] = points.flatMap {
+                    [$0.paperCumulativePct, $0.openCumulativePct]
+                } + [0.0]
+                let rawMin = values.min() ?? 0
+                let rawMax = values.max() ?? 0
+                let spread = max(rawMax - rawMin, 1)
+                let minY = rawMin - spread * 0.12
+                let maxY = rawMax + spread * 0.12
+                func location(_ index: Int, _ value: Double) -> CGPoint {
+                    let x = points.count <= 1 ? size.width / 2 :
+                        CGFloat(index) / CGFloat(points.count - 1) * size.width
+                    let ratio = (value - minY) / max(maxY - minY, 0.001)
+                    return CGPoint(x: x, y: size.height * (1 - ratio))
+                }
+                if minY <= 0, maxY >= 0 {
+                    var zero = Path()
+                    let y = location(0, 0).y
+                    zero.move(to: CGPoint(x: 0, y: y))
+                    zero.addLine(to: CGPoint(x: size.width, y: y))
+                    context.stroke(zero, with: .color(.secondary.opacity(0.25)),
+                                   style: StrokeStyle(lineWidth: 0.7, dash: [3, 3]))
+                }
+                func draw(_ keyPath: KeyPath<ExecutionStats.CurvePoint, Double>, color: Color) {
+                    var path = Path()
+                    for (index, point) in points.enumerated() {
+                        let p = location(index, point[keyPath: keyPath])
+                        if index == 0 { path.move(to: p) } else { path.addLine(to: p) }
+                    }
+                    context.stroke(path, with: .color(color),
+                                   style: StrokeStyle(lineWidth: 1.6, lineJoin: .round))
+                }
+                draw(\.paperCumulativePct, color: .blue)
+                draw(\.openCumulativePct, color: .orange)
+            }
+        }
+        .help("同一批推荐按日等权聚合：蓝线以推荐日收盘为纸面买入基准，橙线以次日真实开盘价为基准")
+    }
+}
+
+// PicksCardView 用 §I.2 上色的执行曲线视图已迁到 Sources/PicksCardView.swift 末尾。
+
 /// E.3：面板内键盘监听（NSViewRepresentable，⌘ 组合不与系统冲突）。
 struct KeyboardCatcher: NSViewRepresentable {
     var onKey: (String) -> Void
@@ -4560,9 +4013,20 @@ struct KeyboardCatcher: NSViewRepresentable {
         override var acceptsFirstResponder: Bool { true }
 
         override func keyDown(with event: NSEvent) {
+            // ⌘ 组合键 → cmd{KEY}
             if event.modifierFlags.contains(.command),
                let key = event.charactersIgnoringModifiers?.uppercased() {
                 onKey?("cmd" + key)
+                return
+            }
+            // §I.8 单键：Esc 收折（关 sheet / dismiss 反向校验） / Enter 跳第一只推荐
+            if event.keyCode == 53 /* Esc */ {
+                onKey?("esc")
+                return
+            }
+            if event.keyCode == 36 /* Return */ || event.keyCode == 76 /* Enter */ {
+                onKey?("enter")
+                return
             }
             super.keyDown(with: event)
         }
