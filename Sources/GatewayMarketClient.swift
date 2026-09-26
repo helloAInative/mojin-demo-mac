@@ -263,6 +263,12 @@ struct GatewayPick: Codable, Equatable, Identifiable {
         var posteriorWinProbability: Double
         var wilsonLow: Double
         var wilsonHigh: Double
+        var meanT1Real: Double?
+        var meanT1RealLow: Double?
+        var meanT1RealHigh: Double?
+        var averageWin: Double?
+        var averageLoss: Double?
+        var payoffRatio: Double?
         var target5pctSamples: Int
         var target5pctPosteriorProbability: Double
         var scope: String
@@ -275,6 +281,12 @@ struct GatewayPick: Codable, Equatable, Identifiable {
             case posteriorWinProbability = "posterior_win_probability"
             case wilsonLow = "wilson_low"
             case wilsonHigh = "wilson_high"
+            case meanT1Real = "mean_t1_real"
+            case meanT1RealLow = "mean_t1_real_low"
+            case meanT1RealHigh = "mean_t1_real_high"
+            case averageWin = "average_win"
+            case averageLoss = "average_loss"
+            case payoffRatio = "payoff_ratio"
             case target5pctSamples = "target_5pct_samples"
             case target5pctPosteriorProbability = "target_5pct_posterior_probability"
             case confidenceTier = "confidence_tier"
@@ -492,6 +504,41 @@ struct GatewayPicksDocument: Decodable, Equatable {
         }
     }
 
+    struct CalibrationQuality: Decodable, Equatable {
+        var status: String
+        var samples: Int
+        var brierScore: Double
+        var expectedCalibrationError: Double
+        var logLoss: Double
+        var auc: Double?
+        var positiveBoostEnabled: Bool
+        var reason: String
+        var bins: [Bin]
+
+        struct Bin: Decodable, Equatable, Identifiable {
+            var lower: Double
+            var upper: Double
+            var samples: Int
+            var averageProbability: Double
+            var observedWinRate: Double
+            var id: Double { lower }
+
+            enum CodingKeys: String, CodingKey {
+                case lower, upper, samples
+                case averageProbability = "average_probability"
+                case observedWinRate = "observed_win_rate"
+            }
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case status, samples, auc, reason, bins
+            case brierScore = "brier_score"
+            case expectedCalibrationError = "expected_calibration_error"
+            case logLoss = "log_loss"
+            case positiveBoostEnabled = "positive_boost_enabled"
+        }
+    }
+
     struct ShadowExperiment: Decodable, Equatable, Identifiable {
         var experimentId: String
         var status: String
@@ -557,6 +604,7 @@ struct GatewayPicksDocument: Decodable, Equatable {
         case tags
         case byRegime = "by_regime"
         case audit, execution, health
+        case calibrationQuality = "calibration_quality"
         case shadowExperiments = "shadow_experiments"
     }
 
@@ -580,6 +628,8 @@ struct GatewayPicksDocument: Decodable, Equatable {
     var audit: Audit?
     /// §A.14 近 10/20 个已完成推荐日的滚动健康度。
     var health: StrategyHealth?
+    /// §A.16 推荐时概率与实际 T+1 结果的样本外一致性。
+    var calibrationQuality: CalibrationQuality?
     var shadowExperiments: [ShadowExperiment]
 
     /// §A.9 上一交易日推荐（已有 T+1 outcome 回写），用于展示「昨日推荐 → 今日卖点」
@@ -748,6 +798,7 @@ struct GatewayPicksDocument: Decodable, Equatable {
         self.execution = nil
         self.audit = nil
         self.health = nil
+        self.calibrationQuality = nil
         self.shadowExperiments = []
         self.previousPicks = nil
     }
@@ -775,6 +826,7 @@ struct GatewayPicksDocument: Decodable, Equatable {
         byRegime = (try? stats.decodeIfPresent([RegimeStat].self, forKey: .byRegime)) ?? []
         audit = try? stats.decodeIfPresent(Audit.self, forKey: .audit)
         health = try? stats.decodeIfPresent(StrategyHealth.self, forKey: .health)
+        calibrationQuality = try? stats.decodeIfPresent(CalibrationQuality.self, forKey: .calibrationQuality)
         shadowExperiments = (try? stats.decodeIfPresent([ShadowExperiment].self, forKey: .shadowExperiments)) ?? []
         market = try? c.decodeIfPresent(MarketInfo.self, forKey: .market)
         executeHint = try? c.decodeIfPresent(String.self, forKey: .executeHint)
