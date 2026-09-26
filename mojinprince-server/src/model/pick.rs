@@ -92,9 +92,37 @@ pub struct PickStats {
     /// §A.14 近 10/20 个已完成推荐日的滚动策略健康度。
     #[serde(default)]
     pub health: StrategyHealth,
+    /// §A.16 已落地概率预测的样本外校准质量。
+    #[serde(default)]
+    pub calibration_quality: CalibrationQuality,
     /// §A.14 生产规则版本与关键阈值清单，用于复现实验。
     #[serde(default)]
     pub audit: PickAudit,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CalibrationQuality {
+    /// reliable / degraded / insufficient
+    pub status: String,
+    pub samples: i64,
+    pub brier_score: f64,
+    pub expected_calibration_error: f64,
+    pub log_loss: f64,
+    pub auc: Option<f64>,
+    /// 只有足量历史预测且质量达标时，概率证据才可产生正向加分。
+    pub positive_boost_enabled: bool,
+    pub reason: String,
+    #[serde(default)]
+    pub bins: Vec<CalibrationBin>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CalibrationBin {
+    pub lower: f64,
+    pub upper: f64,
+    pub samples: i64,
+    pub average_probability: f64,
+    pub observed_win_rate: f64,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, utoipa::ToSchema)]
