@@ -652,6 +652,16 @@ struct PicksCardView: View {
                                     .monospacedDigit()
                                     .foregroundStyle(UITokens.color(signal))
                                     .help("推荐日前 180 天相似标签的真实开盘执行 T+1；Beta(2,2) 后验均值 + Wilson 95% 区间")
+                                    if let mean = calibration.meanT1Real,
+                                       let low = calibration.meanT1RealLow,
+                                       let high = calibration.meanT1RealHigh {
+                                        Text(String(format: "期望 %+.2f%% [%+.2f–%+.2f] · 盈亏比 %.1f",
+                                                    mean, low, high, calibration.payoffRatio ?? 0))
+                                            .font(.system(size: UITokens.microSize, weight: .semibold))
+                                            .monospacedDigit()
+                                            .foregroundStyle(UITokens.color(low > 0 ? .buy : (high < 0 ? .danger : .observe)))
+                                            .help("相似样本真实T+1收益均值及95%区间；收益先截尾到±20%，避免极端值主导")
+                                    }
                                 }
                                 Spacer(minLength: 0)
                                 Text(String(format: "%.0f分", pick.score))
@@ -999,13 +1009,22 @@ struct PicksCardView: View {
         if calibration.samples < 30 {
             return "概率校准：\(calibration.samples) 样本不足，保持中性"
         }
+        let payoff = if let mean = calibration.meanT1Real,
+                        let low = calibration.meanT1RealLow,
+                        let high = calibration.meanT1RealHigh {
+            String(format: "；收益期望 %+.2f%% [%+.2f–%+.2f%%]，盈亏比 %.1f",
+                   mean, low, high, calibration.payoffRatio ?? 0)
+        } else {
+            ""
+        }
         return String(
-            format: "概率校准：后验 %.0f%%，Wilson [%.0f–%.0f%%]，%@环境，%@",
+            format: "概率校准：后验 %.0f%%，Wilson [%.0f–%.0f%%]，%@环境，%@%@",
             calibration.posteriorWinProbability * 100,
             calibration.wilsonLow * 100,
             calibration.wilsonHigh * 100,
             calibration.scope,
-            calibration.confidenceTier
+            calibration.confidenceTier,
+            payoff
         )
     }
 
