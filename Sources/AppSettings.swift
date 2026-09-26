@@ -258,6 +258,8 @@ final class AppSettings: ObservableObject {
     @Published var boardShowBJ50: Bool = false
     @Published var marketGatewayEnabled: Bool = true
     @Published var marketServerURL: String = "http://127.0.0.1:8732"
+    /// §A.13 服务端推荐人工安全阀；打开后所有行情 / AI 请求前硬短路。
+    @Published var smartPicksPaused: Bool = false
     /// §I.4 盯盘密度模式
     @Published var watchDensity: WatchDensity = .auto
 
@@ -288,6 +290,7 @@ final class AppSettings: ObservableObject {
         static let boardBJ50 = "mojin.boardBJ50"
         static let marketGatewayEnabled = "mojin.marketGatewayEnabled"
         static let marketServerURL = "mojin.marketServerURL"
+        static let smartPicksPaused = "mojin.smartPicksPaused"
         static let watchDensity = "mojin.watchDensity"
     }
 
@@ -358,6 +361,7 @@ final class AppSettings: ObservableObject {
         boardShowBJ50 = defaults.object(forKey: Key.boardBJ50) as? Bool ?? false
         marketGatewayEnabled = defaults.object(forKey: Key.marketGatewayEnabled) as? Bool ?? true
         marketServerURL = defaults.string(forKey: Key.marketServerURL) ?? "http://127.0.0.1:8732"
+        smartPicksPaused = defaults.object(forKey: Key.smartPicksPaused) as? Bool ?? false
         watchDensity = WatchDensity(rawValue: defaults.string(forKey: Key.watchDensity) ?? "") ?? .auto
         if levelsByCode[currentCode] == nil {
             levelsByCode[currentCode] = Self.defaultLevels
@@ -397,6 +401,7 @@ final class AppSettings: ObservableObject {
         defaults.set(boardShowBJ50, forKey: Key.boardBJ50)
         defaults.set(marketGatewayEnabled, forKey: Key.marketGatewayEnabled)
         defaults.set(marketServerURL, forKey: Key.marketServerURL)
+        defaults.set(smartPicksPaused, forKey: Key.smartPicksPaused)
         defaults.set(watchDensity.rawValue, forKey: Key.watchDensity)
         NotifyGovernor.shared.configure(notifyConfig)
     }
@@ -423,7 +428,8 @@ final class AppSettings: ObservableObject {
             notifyConfig: notifyConfig,
             aiConfig: aiConfig,
             boardShowHS300: boardShowHS300,
-            boardShowBJ50: boardShowBJ50
+            boardShowBJ50: boardShowBJ50,
+            smartPicksPaused: smartPicksPaused
         )
     }
 
@@ -489,6 +495,7 @@ final class AppSettings: ObservableObject {
         if let value = remote.aiConfig { aiConfig = value }
         if let value = remote.boardShowHS300 { boardShowHS300 = value }
         if let value = remote.boardShowBJ50 { boardShowBJ50 = value }
+        if let value = remote.smartPicksPaused { smartPicksPaused = value }
     }
 
     func setBoardShowHS300(_ on: Bool) {
@@ -504,6 +511,11 @@ final class AppSettings: ObservableObject {
     func setMarketGateway(enabled: Bool, address: String) {
         marketGatewayEnabled = enabled
         marketServerURL = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        save()
+    }
+
+    func setSmartPicksPaused(_ paused: Bool) {
+        smartPicksPaused = paused
         save()
     }
 
