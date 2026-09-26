@@ -259,6 +259,7 @@ struct GatewayPick: Codable, Equatable, Identifiable {
 
     struct Calibration: Codable, Equatable {
         var samples: Int
+        var completedDays: Int?
         var wins: Int
         var posteriorWinProbability: Double
         var wilsonLow: Double
@@ -278,6 +279,7 @@ struct GatewayPick: Codable, Equatable, Identifiable {
 
         enum CodingKeys: String, CodingKey {
             case samples, wins, scope, abstain
+            case completedDays = "completed_days"
             case posteriorWinProbability = "posterior_win_probability"
             case wilsonLow = "wilson_low"
             case wilsonHigh = "wilson_high"
