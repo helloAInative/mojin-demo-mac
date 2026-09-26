@@ -7,8 +7,9 @@
 //! `meta.outcome` 形成命中率闭环。
 use crate::error::AppError;
 use crate::model::pick::{
-    AiRankConfig, DailyPick, HardFilterStat, HealthCurvePoint, HealthWindow, PauseCount, PickAudit,
-    PickStats, PickTagStat, PicksDocument, RegimeStat, ShadowExperimentStat, StrategyHealth,
+    AiRankConfig, CalibrationBin, CalibrationQuality, DailyPick, HardFilterStat, HealthCurvePoint,
+    HealthWindow, PauseCount, PickAudit, PickStats, PickTagStat, PicksDocument, RegimeStat,
+    ShadowExperimentStat, StrategyHealth,
 };
 use crate::model::DayBar;
 use crate::service::ai::{self, ChatMessage};
@@ -1303,6 +1304,310 @@ fn record_tag_outcome(bucket: &mut TagWindowBucket, recent: bool, won: bool) {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CalibrationSample {
+    tags: BTreeSet<String>,
+    regime: Option<String>,
+    won: bool,
+    target_hit_5pct: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CalibrationEvidence {
+    samples: i64,
+    wins: i64,
+    posterior_win_probability: f64,
+    wilson_low: f64,
+    wilson_high: f64,
+    target_samples: i64,
+    target_hits: i64,
+    target_posterior_probability: f64,
+    scope: String,
+    confidence_tier: String,
+    score_delta: f64,
+    abstain: bool,
+    positive_boost_enabled: bool,
+}
+
+impl CalibrationEvidence {
+    fn as_json(&self) -> Value {
+        serde_json::json!({
+            "samples": self.samples,
+            "wins": self.wins,
+            "posterior_win_probability": self.posterior_win_probability,
+            "wilson_low": self.wilson_low,
+            "wilson_high": self.wilson_high,
+            "target_5pct_samples": self.target_samples,
+            "target_5pct_hits": self.target_hits,
+            "target_5pct_posterior_probability": self.target_posterior_probability,
+            "scope": self.scope,
+            "confidence_tier": self.confidence_tier,
+            "score_delta": self.score_delta,
+            "abstain": self.abstain,
+            "positive_boost_enabled": self.positive_boost_enabled,
+            "method": "similar_tags_beta_wilson_v1",
+            "minimum_samples": 30,
+            "similarity_floor": 0.35,
+            "minimum_shared_tags": 2,
+            "prior": "Beta(2,2)",
+        })
+    }
+}
+
+fn calibration_tags(tags: &[String]) -> BTreeSet<String> {
+    tags.iter()
+        .filter(|tag| {
+            !tag.starts_with("T+1达5%率")
+                && !tag.starts_with("影子候选")
+                && !matches!(
+                    tag.as_str(),
+                    "大盘偏多" | "大盘偏弱" | "大盘大跌" | "美股偏多" | "美股偏空"
+                )
+        })
+        .cloned()
+        .collect()
+}
+
+fn similar_calibration_samples<'a>(
+    candidate_tags: &BTreeSet<String>,
+    samples: &'a [CalibrationSample],
+    regime: Option<&str>,
+) -> Vec<&'a CalibrationSample> {
+    samples
+        .iter()
+        .filter(|sample| regime.is_none_or(|key| sample.regime.as_deref() == Some(key)))
+        .filter(|sample| {
+            let shared = candidate_tags.intersection(&sample.tags).count();
+            let union = candidate_tags.union(&sample.tags).count();
+            shared >= 2 && union > 0 && shared as f64 / union as f64 >= 0.35
+        })
+        .collect()
+}
+
+fn calibrate_candidate(
+    tags: &[String],
+    history: &[CalibrationSample],
+    current_regime: Option<&str>,
+    positive_boost_enabled: bool,
+) -> CalibrationEvidence {
+    let tags = calibration_tags(tags);
+    let regime_matches = similar_calibration_samples(&tags, history, current_regime);
+    let (matches, scope) = if regime_matches.len() >= 30 {
+        (regime_matches, current_regime.unwrap_or("all").to_string())
+    } else {
+        (similar_calibration_samples(&tags, history, None), "all".into())
+    };
+    let samples = matches.len() as i64;
+    let wins = matches.iter().filter(|sample| sample.won).count() as i64;
+    let target_samples = matches
+        .iter()
+        .filter(|sample| sample.target_hit_5pct.is_some())
+        .count() as i64;
+    let target_hits = matches
+        .iter()
+        .filter(|sample| sample.target_hit_5pct == Some(true))
+        .count() as i64;
+    let posterior = (wins as f64 + 2.0) / (samples as f64 + 4.0);
+    let target_posterior = (target_hits as f64 + 2.0) / (target_samples as f64 + 4.0);
+    let (wilson_low, wilson_high, _) = wilson_interval(samples, wins, 1.96);
+    let sufficient = samples >= 30;
+    let abstain = sufficient && wilson_high < 0.5;
+    let positive = sufficient && wilson_low > 0.5;
+    let confidence_tier = if abstain {
+        "weak"
+    } else if positive {
+        "strong"
+    } else if sufficient {
+        "uncertain"
+    } else {
+        "insufficient"
+    };
+    let score_delta = if positive && positive_boost_enabled {
+        ((wilson_low - 0.5) * 40.0).clamp(0.0, 8.0)
+    } else {
+        0.0
+    };
+    CalibrationEvidence {
+        samples,
+        wins,
+        posterior_win_probability: posterior,
+        wilson_low,
+        wilson_high,
+        target_samples,
+        target_hits,
+        target_posterior_probability: target_posterior,
+        scope,
+        confidence_tier: confidence_tier.into(),
+        score_delta,
+        abstain,
+        positive_boost_enabled,
+    }
+}
+
+async fn load_calibration_history(
+    db: &SqlitePool,
+    as_of: NaiveDate,
+) -> Result<Vec<CalibrationSample>, PickError> {
+    let since = (as_of - Duration::days(180)).format("%Y-%m-%d").to_string();
+    let before = as_of.format("%Y-%m-%d").to_string();
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT reasons, meta FROM daily_pick WHERE date >= ? AND date < ? \
+         AND json_extract(meta,'$.outcome.t1_real') IS NOT NULL",
+    )
+    .bind(since)
+    .bind(before)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(reasons, raw)| {
+            let tags: Vec<String> = serde_json::from_str(&reasons).ok()?;
+            let meta: Value = serde_json::from_str(&raw).ok()?;
+            let real = meta["outcome"]["t1_real"].as_f64()?;
+            Some(CalibrationSample {
+                tags: calibration_tags(&tags),
+                regime: meta["cn"]["avg_pct"]
+                    .as_f64()
+                    .map(|avg| market_regime(avg).0.to_string()),
+                won: real > 0.0,
+                target_hit_5pct: meta["outcome"]["target_hit_5pct"].as_bool(),
+            })
+        })
+        .collect())
+}
+
+fn calibration_quality(predictions: &[(f64, bool)]) -> CalibrationQuality {
+    let samples = predictions.len() as i64;
+    if predictions.is_empty() {
+        return CalibrationQuality {
+            status: "insufficient".into(),
+            reason: "尚无已完成且推荐时相似样本≥30的概率预测".into(),
+            ..Default::default()
+        };
+    }
+    let mut bins = (0..5)
+        .map(|index| (index as f64 / 5.0, (index + 1) as f64 / 5.0, 0_i64, 0.0, 0_i64))
+        .collect::<Vec<_>>();
+    let mut brier_sum = 0.0;
+    let mut log_loss_sum = 0.0;
+    for (probability, won) in predictions {
+        let p = probability.clamp(0.001, 0.999);
+        let y = if *won { 1.0 } else { 0.0 };
+        brier_sum += (p - y).powi(2);
+        log_loss_sum -= y * p.ln() + (1.0 - y) * (1.0 - p).ln();
+        let index = ((p * 5.0).floor() as usize).min(4);
+        bins[index].2 += 1;
+        bins[index].3 += p;
+        bins[index].4 += i64::from(*won);
+    }
+    let brier_score = brier_sum / samples as f64;
+    let log_loss = log_loss_sum / samples as f64;
+    let mut expected_calibration_error = 0.0;
+    let bins = bins
+        .into_iter()
+        .map(|(lower, upper, count, probability_sum, wins)| {
+            let average_probability = if count > 0 { probability_sum / count as f64 } else { 0.0 };
+            let observed_win_rate = ratio(wins, count);
+            expected_calibration_error +=
+                count as f64 / samples as f64 * (average_probability - observed_win_rate).abs();
+            CalibrationBin {
+                lower,
+                upper,
+                samples: count,
+                average_probability,
+                observed_win_rate,
+            }
+        })
+        .collect::<Vec<_>>();
+    let positives = predictions.iter().filter(|(_, won)| *won).count() as i64;
+    let negatives = samples - positives;
+    let auc = if positives > 0 && negatives > 0 {
+        let favorable_pairs = predictions
+            .iter()
+            .filter(|(_, won)| *won)
+            .flat_map(|positive| {
+                predictions
+                    .iter()
+                    .filter(|(_, won)| !*won)
+                    .map(move |negative| {
+                        if positive.0 > negative.0 {
+                            1.0
+                        } else if (positive.0 - negative.0).abs() < f64::EPSILON {
+                            0.5
+                        } else {
+                            0.0
+                        }
+                    })
+            })
+            .sum::<f64>();
+        Some(favorable_pairs / (positives * negatives) as f64)
+    } else {
+        None
+    };
+    let sufficient = samples >= 50;
+    let reliable = sufficient && brier_score <= 0.24 && expected_calibration_error <= 0.10;
+    let (status, reason) = if !sufficient {
+        (
+            "insufficient",
+            format!("已完成 {samples}/50 个有效预测，正向概率加分保持关闭"),
+        )
+    } else if reliable {
+        (
+            "reliable",
+            format!("Brier {brier_score:.3}、ECE {expected_calibration_error:.3} 均通过门槛"),
+        )
+    } else {
+        (
+            "degraded",
+            format!("校准漂移：Brier {brier_score:.3} 或 ECE {expected_calibration_error:.3} 未达标，正向加分已关闭"),
+        )
+    };
+    CalibrationQuality {
+        status: status.into(),
+        samples,
+        brier_score,
+        expected_calibration_error,
+        log_loss,
+        auc,
+        positive_boost_enabled: reliable,
+        reason,
+        bins,
+    }
+}
+
+pub(crate) async fn load_calibration_quality(
+    db: &SqlitePool,
+    through_date: &str,
+) -> CalibrationQuality {
+    let parsed = NaiveDate::parse_from_str(through_date, "%Y-%m-%d")
+        .unwrap_or_else(|_| Utc::now().date_naive());
+    let since = (parsed - Duration::days(180)).format("%Y-%m-%d").to_string();
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT meta FROM daily_pick WHERE date >= ? AND date <= ? \
+         AND json_extract(meta,'$.outcome.t1_real') IS NOT NULL \
+         AND json_extract(meta,'$.calibration.posterior_win_probability') IS NOT NULL",
+    )
+    .bind(since)
+    .bind(through_date)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let predictions = rows
+        .into_iter()
+        .filter_map(|raw| {
+            let meta: Value = serde_json::from_str(&raw).ok()?;
+            if meta["calibration"]["samples"].as_i64().unwrap_or(0) < 30 {
+                return None;
+            }
+            Some((
+                meta["calibration"]["posterior_win_probability"].as_f64()?,
+                meta["outcome"]["t1_real"].as_f64()? > 0.0,
+            ))
+        })
+        .collect::<Vec<_>>();
+    calibration_quality(&predictions)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PickError {
     #[error("network: {0}")]
@@ -1392,6 +1697,12 @@ fn production_rule_manifest() -> Value {
             "abstain_when_wilson_high_below": 0.5,
             "positive_when_wilson_low_above": 0.5,
             "prior": "Beta(2,2)",
+            "quality_gate": {
+                "minimum_completed_predictions": 50,
+                "maximum_brier_score": 0.24,
+                "maximum_expected_calibration_error": 0.10,
+                "positive_boost_before_qualified": false
+            },
             "shadow_experiment_id": CALIBRATION_EXPERIMENT_ID,
         },
     })
@@ -2520,6 +2831,9 @@ pub async fn generate_picks(
         return Ok(doc);
     }
     let mut learned_meta: HashMap<String, Value> = HashMap::new();
+    let mut calibration_meta: HashMap<String, Value> = HashMap::new();
+    let mut shadow_experiment_map: HashMap<String, &'static str> = HashMap::new();
+    let mut shadow_reason_map: HashMap<String, &'static str> = HashMap::new();
     // 候选池：东财 push2 断连时切新浪榜（板块动量因子因无行业字段自动降级）
     let candidates = match state.pick_ranking.fetch(&state.http, 100).await {
         Ok(rows) if !rows.is_empty() => rows,
@@ -2598,6 +2912,9 @@ pub async fn generate_picks(
         .and_then(CnSentiment::avg_pct)
         .map(|avg| market_regime(avg).0);
     let learned_performance = load_tag_performance(&state.db, date, current_regime).await?;
+    let calibration_history = load_calibration_history(&state.db, date).await?;
+    let calibration_quality =
+        load_calibration_quality(&state.db, &date.format("%Y-%m-%d").to_string()).await;
     if candidates.is_empty() {
         return Err(PickError::Parse("涨幅榜为空".into()));
     }
@@ -2824,7 +3141,7 @@ pub async fn generate_picks(
         let reach_rate = target_risk
             .and_then(|risk| risk.t1_reach_5pct_rate_20d)
             .unwrap_or(0.0);
-        let shadow_only = !target_risk.is_some_and(|risk| risk.target_stable);
+        let mut shadow_only = !target_risk.is_some_and(|risk| risk.target_stable);
         if target_risk.is_some_and(|risk| risk.crowding_blocked) {
             continue;
         }
@@ -2971,6 +3288,34 @@ pub async fn generate_picks(
         let (learned_adjustment, evidence) = learned_score_adjustment(&tags, &learned_performance);
         score += learned_adjustment;
         learned_meta.insert(candidate.code.clone(), evidence);
+        // §A.15 样本外概率校准：只用推荐日前 180 天真实成交结果。
+        // 小样本保持中性；只有充分样本的 Wilson 上界仍低于 50% 才主动弃权。
+        let calibration = calibrate_candidate(
+            &tags,
+            &calibration_history,
+            current_regime,
+            calibration_quality.positive_boost_enabled,
+        );
+        score += calibration.score_delta;
+        if calibration.score_delta > 0.0 {
+            tags.push(format!(
+                "校准强证据·下界{:.0}%",
+                calibration.wilson_low * 100.0
+            ));
+        }
+        if calibration.abstain {
+            shadow_only = true;
+            tags.push("影子候选·校准主动弃权".into());
+            shadow_experiment_map.insert(candidate.code.clone(), CALIBRATION_EXPERIMENT_ID);
+            shadow_reason_map.insert(
+                candidate.code.clone(),
+                "相似历史样本的真实T+1胜率Wilson上界仍低于50%",
+            );
+        } else if shadow_only {
+            shadow_experiment_map.insert(candidate.code.clone(), SHADOW_EXPERIMENT_ID);
+            shadow_reason_map.insert(candidate.code.clone(), "未通过生产版5%双窗口稳定性门槛");
+        }
+        calibration_meta.insert(candidate.code.clone(), calibration.as_json());
         if shadow_only {
             shadow_boosted.push((candidate.clone(), score, tags));
         } else {
@@ -3070,9 +3415,8 @@ pub async fn generate_picks(
         .bind(&date_key)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM daily_pick_shadow WHERE date = ? AND experiment_id = ?")
+    sqlx::query("DELETE FROM daily_pick_shadow WHERE date = ?")
         .bind(&date_key)
-        .bind(SHADOW_EXPERIMENT_ID)
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM daily_pick_exclusion WHERE date = ? AND stage = 'calendar'")
@@ -3165,6 +3509,7 @@ pub async fn generate_picks(
                 "minimum_samples": 30,
                 "lookback_days": 30,
             })),
+            "calibration": calibration_meta.get(&candidate.code).cloned(),
             // §A.9 卖出价区间：基于该票近 30 天 outcome.t1_pct 均值与胜率
             "sell_zone_basis": sell_zone_basis_map.get(&candidate.code).cloned().unwrap_or(serde_json::json!({
                 "samples": 0, "win_rate": 0.0, "avg_t1_pct": 0.0, "win_rate_factor": 0.5
@@ -3209,15 +3554,23 @@ pub async fn generate_picks(
         .await?;
     }
     for (rank, (candidate, score, tags)) in shadow_picks.iter().enumerate() {
+        let shadow_experiment_id = shadow_experiment_map
+            .get(&candidate.code)
+            .copied()
+            .unwrap_or(SHADOW_EXPERIMENT_ID);
+        let challenger_reason = shadow_reason_map
+            .get(&candidate.code)
+            .copied()
+            .unwrap_or("未通过生产版5%双窗口稳定性门槛");
         let realtime_limit_up = limit_up_realtime
             .get(&candidate.code)
             .copied()
             .unwrap_or(candidate.is_limit_up);
         let plan_limit_up = realtime_limit_up || candidate.is_limit_up;
         let meta = serde_json::json!({
-            "experiment_id": SHADOW_EXPERIMENT_ID,
+            "experiment_id": shadow_experiment_id,
             "status": "shadow",
-            "challenger_reason": "未通过生产版5%双窗口稳定性门槛",
+            "challenger_reason": challenger_reason,
             "close": candidate.price,
             "pct": candidate.pct,
             "industry": candidate.industry,
@@ -3236,6 +3589,7 @@ pub async fn generate_picks(
                 "risk_score": c.risk_score().0,
             })),
             "auto_weight": learned_meta.get(&candidate.code).cloned(),
+            "calibration": calibration_meta.get(&candidate.code).cloned(),
             "promotion_criteria": {
                 "completed_days": SHADOW_PROMOTION_DAYS,
                 "samples": SHADOW_PROMOTION_SAMPLES,
@@ -3260,7 +3614,7 @@ pub async fn generate_picks(
              ) VALUES(?,?,?,?,?,?,?,?,?)",
         )
         .bind(&date_key)
-        .bind(SHADOW_EXPERIMENT_ID)
+        .bind(shadow_experiment_id)
         .bind(&candidate.code)
         .bind(&candidate.name)
         .bind((rank + 1) as i64)
@@ -5016,6 +5370,38 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         assert_eq!(evidence["minimum_samples"], 30);
         assert_eq!(evidence["method"], "walk_forward_wilson");
         assert_eq!(evidence["outcome_basis"], "t1_real");
+    }
+
+    #[test]
+    fn calibrated_probability_abstains_only_with_sufficient_weak_evidence() {
+        let sample = |won: bool| CalibrationSample {
+            tags: BTreeSet::from(["MACD金叉".into(), "放量".into(), "相对强势".into()]),
+            regime: Some("range".into()),
+            won,
+            target_hit_5pct: Some(won),
+        };
+        let tags = vec!["MACD金叉".into(), "放量".into(), "相对强势".into()];
+
+        let small = (0..10).map(|index| sample(index < 2)).collect::<Vec<_>>();
+        let small_result = calibrate_candidate(&tags, &small, Some("range"));
+        assert_eq!(small_result.confidence_tier, "insufficient");
+        assert!(!small_result.abstain, "小样本不得主动弃权");
+
+        let weak = (0..40).map(|index| sample(index < 8)).collect::<Vec<_>>();
+        let weak_result = calibrate_candidate(&tags, &weak, Some("range"));
+        assert_eq!(weak_result.samples, 40);
+        assert_eq!(weak_result.confidence_tier, "weak");
+        assert!(weak_result.wilson_high < 0.5);
+        assert!(weak_result.abstain);
+        assert_eq!(weak_result.score_delta, 0.0);
+
+        let strong = (0..40).map(|index| sample(index < 34)).collect::<Vec<_>>();
+        let strong_result = calibrate_candidate(&tags, &strong, Some("range"));
+        assert_eq!(strong_result.confidence_tier, "strong");
+        assert!(strong_result.wilson_low > 0.5);
+        assert!(!strong_result.abstain);
+        assert!(strong_result.score_delta > 0.0);
+        assert!(strong_result.posterior_win_probability < 0.85);
     }
 
     #[tokio::test]
