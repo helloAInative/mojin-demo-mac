@@ -44,6 +44,9 @@ swiftc -parse-as-library \
   "$SRC"/PortfolioBuilder.swift \
   "$SRC"/MarketStore.swift \
   "$SRC"/Charts.swift \
+  "$SRC"/UITokens.swift \
+  "$SRC"/PicksCardView.swift \
+  "$SRC"/WatchPortfolioViews.swift \
   "$SRC"/ContentView.swift \
   "$SRC"/JJWDWidgetApp.swift \
   -o "$OUT/$BIN_NAME" \

@@ -927,6 +927,7 @@ struct ContentView: View {
         case (.auto, .focus): return "盘中自动 · 专注"
         case (.auto, .standard): return "盘前盘后 · 标准"
         case (.auto, .full): return "盘外自动 · 全量"
+        case (.auto, .auto): return "自动"
         case (.focus, _): return "专注：报价 + 分时 + 价位 + 持仓"
         case (.standard, _): return "标准：增加指数条"
         case (.full, _): return "全量：含资讯 · 研报 · 止损卡 · OHLC"
@@ -3495,6 +3496,19 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var quoteSettingsBoxes: some View {
+        GroupBox("智能推荐安全") {
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("暂停智能推荐（Kill Switch）", isOn: Binding(
+                    get: { settings.smartPicksPaused },
+                    set: { settings.setSmartPicksPaused($0) }
+                ))
+                Text(settings.smartPicksPaused
+                     ? "已暂停：服务端会在任何行情、新闻或 AI 请求前返回空清单，并记录人工暂停原因。"
+                     : "紧急风控开关；大盘与连亏自动熔断仍独立生效。")
+                    .font(.caption2)
+                    .foregroundStyle(settings.smartPicksPaused ? .red : .secondary)
+            }.padding(6)
+        }
         GroupBox("行情网关") {
             VStack(alignment: .leading, spacing: 8) {
                 Toggle("优先使用 Rust 网关", isOn: $gatewayEnabled)
