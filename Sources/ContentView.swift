@@ -581,6 +581,10 @@ struct ContentView: View {
     @StateObject private var watchLegendState = WatchLegendState()
     /// §I.5 图例钉住高亮系列（空=无钉住）
     @State private var watchLegendPinned: String = ""
+    /// §I.8 精选卡 UI 状态（由 ContentView 持有，便于 Esc 远程关折 L2/L3）
+    @StateObject private var picksCardUI = PicksCardUIState()
+    /// §I.8 关折意图 tick：键盘 Esc 时 +1，PicksCardView 通过 .onChange 折叠
+    @State private var picksCollapseTick: Int = 0
     var embeddedInMenu: Bool = false
 
     enum ReviewKindFilter: Hashable {
@@ -730,18 +734,24 @@ struct ContentView: View {
                 store.syncTicketFromMarket(forcePrice: true)
                 tab = .trade
             case "enter":
-                // ⌘↵ / 单独 ↵ 跳 Top 1（仅复盘页）
-                if tab == .review,
+                // ⌘↵ / 单独 ↵ 跳 Top 1：复盘页 / AI 页（用户最常需要
+                // 「立刻看这只票详情」）。其他 tab 不抢 ↵（尤其委托页
+                // 可能要靠回车触发提交动作）。
+                if tab == .review || tab == .ai,
                    let first = store.picksDoc?.picks.first {
                     store.switchSymbol(first.code)
                     tab = .watch
                 }
             case "esc":
-                // Esc：优先关反向校验倒计时，再关分时详情，再清 chip 标记
+                // Esc：依次反向校验倒计时 → 分时详情 → 精选卡 L2/L3 → 设置 sheet
                 if reverseCheckTicketID != nil {
                     reverseCheckTicketID = nil
                 } else if showMinuteDetail {
                     showMinuteDetail = false
+                } else if picksCardUI.showDetail || picksCardUI.showAudit {
+                    picksCollapseTick &+= 1
+                } else if showSettings {
+                    showSettings = false
                 }
             default: break
             }
@@ -2855,7 +2865,9 @@ struct ContentView: View {
                 onOpenSymbol: { code, _ in
                     store.switchSymbol(code)
                     tab = .watch
-                }
+                },
+                ui: picksCardUI,
+                collapseTick: picksCollapseTick
             )
 
             // 复盘历史（从后端拉，按 kind 过滤）
