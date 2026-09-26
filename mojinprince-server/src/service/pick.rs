@@ -1363,7 +1363,7 @@ impl CalibrationEvidence {
             "abstain": self.abstain,
             "negative_expected_return": self.negative_expected_return,
             "positive_boost_enabled": self.positive_boost_enabled,
-            "method": "similar_tags_beta_wilson_payoff_v2",
+            "method": "day_clustered_beta_wilson_payoff_v3",
             "minimum_samples": 30,
             "minimum_completed_days": 20,
             "similarity_floor": 0.35,
@@ -1787,6 +1787,7 @@ fn production_rule_manifest() -> Value {
         "calibration": {
             "lookback_days": 180,
             "minimum_similar_samples": 30,
+            "minimum_completed_days": 20,
             "similarity_floor": 0.35,
             "minimum_shared_tags": 2,
             "abstain_when_wilson_high_below": 0.5,
@@ -1800,6 +1801,7 @@ fn production_rule_manifest() -> Value {
             },
             "payoff_gate": {
                 "winsorized_return_pct": [-20.0, 20.0],
+                "confidence_unit": "equal_weight_recommendation_day",
                 "negative_abstain_when_mean_95pct_high_below": 0.0,
                 "positive_requires_mean_95pct_low_above": 0.0,
                 "shadow_experiment_id": PAYOFF_EXPERIMENT_ID
@@ -5487,7 +5489,8 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
 
     #[test]
     fn calibrated_probability_abstains_only_with_sufficient_weak_evidence() {
-        let sample = |won: bool| CalibrationSample {
+        let sample = |index: usize, won: bool| CalibrationSample {
+            date: format!("day-{index:03}"),
             tags: BTreeSet::from(["MACD金叉".into(), "放量".into(), "相对强势".into()]),
             regime: Some("range".into()),
             won,
@@ -5496,12 +5499,12 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         };
         let tags = vec!["MACD金叉".into(), "放量".into(), "相对强势".into()];
 
-        let small = (0..10).map(|index| sample(index < 2)).collect::<Vec<_>>();
+        let small = (0..10).map(|index| sample(index, index < 2)).collect::<Vec<_>>();
         let small_result = calibrate_candidate(&tags, &small, Some("range"), true);
         assert_eq!(small_result.confidence_tier, "insufficient");
         assert!(!small_result.abstain, "小样本不得主动弃权");
 
-        let weak = (0..40).map(|index| sample(index < 8)).collect::<Vec<_>>();
+        let weak = (0..40).map(|index| sample(index, index < 8)).collect::<Vec<_>>();
         let weak_result = calibrate_candidate(&tags, &weak, Some("range"), true);
         assert_eq!(weak_result.samples, 40);
         assert_eq!(weak_result.confidence_tier, "weak");
@@ -5509,7 +5512,7 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         assert!(weak_result.abstain);
         assert_eq!(weak_result.score_delta, 0.0);
 
-        let strong = (0..40).map(|index| sample(index < 34)).collect::<Vec<_>>();
+        let strong = (0..40).map(|index| sample(index, index < 34)).collect::<Vec<_>>();
         let strong_result = calibrate_candidate(&tags, &strong, Some("range"), true);
         assert_eq!(strong_result.confidence_tier, "strong");
         assert!(strong_result.wilson_low > 0.5);
@@ -5526,6 +5529,7 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
 
         let high_win_negative_payoff = (0..40)
             .map(|index| CalibrationSample {
+                date: format!("day-{index:03}"),
                 tags: BTreeSet::from(["MACD金叉".into(), "放量".into(), "相对强势".into()]),
                 regime: Some("range".into()),
                 won: index < 34,
@@ -5539,6 +5543,18 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         assert!(negative.abstain);
         assert!(negative.negative_expected_return);
         assert_eq!(negative.score_delta, 0.0);
+
+        let same_day = (0..40)
+            .map(|index| CalibrationSample {
+                date: "single-market-day".into(),
+                ..sample(index, index < 34)
+            })
+            .collect::<Vec<_>>();
+        let clustered = calibrate_candidate(&tags, &same_day, Some("range"), true);
+        assert_eq!(clustered.samples, 40);
+        assert_eq!(clustered.completed_days, 1);
+        assert_eq!(clustered.confidence_tier, "insufficient");
+        assert_eq!(clustered.score_delta, 0.0, "同日相关样本不得膨胀置信度");
     }
 
     #[test]
