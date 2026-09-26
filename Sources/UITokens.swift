@@ -46,6 +46,32 @@ enum UITokens {
     /// 信号色上的「不可用 / 等待」占位文本用中性灰，避免与 buy/danger 混淆。
     static let idleText: Color = Color.primary.opacity(0.55)
 
+    // MARK: - 深色对比度修正（§I.7）
+
+    /// SwiftUI `.tertiary` 在 macOS 深色模式下与背景对比度 <3:1，
+    /// 8–9pt 字号下几乎不可读。本 modifier 在深色下升级到
+    /// `secondary` 的 0.85 不透明度，保证对比度 ≥4.5:1，
+    /// 浅色下保留 `.tertiary` 的视觉层次。
+    ///
+    /// 用法：`.foregroundStyle(.tertiary)` → `.foregroundStyle(.tertiary.adaptiveContrast())`
+    /// 或更彻底的 `.modifier(UITokens.ContrastTertiaryModifier())`。
+    static func adaptiveTertiary(for scheme: ColorScheme) -> Color {
+        scheme == .dark ? Color.secondary.opacity(0.85) : Color.tertiary
+    }
+
+    struct ContrastTertiaryModifier: ViewModifier {
+        @Environment(\.colorScheme) private var scheme
+        func body(content: Content) -> some View {
+            content.foregroundStyle(UITokens.adaptiveTertiary(for: scheme))
+        }
+    }
+
+    /// 价位 / 价位线 / 脉动描边在深色背景下的次级提示色：
+    /// 浅色用 primary 35%，深色用 primary 65%，避免「糊成一团」。
+    static func levelAccent(for scheme: ColorScheme) -> Color {
+        scheme == .dark ? Color.primary.opacity(0.65) : Color.primary.opacity(0.35)
+    }
+
     // MARK: - 语义色（信号：与趋势涨跌解耦）
 
     enum Signal {
