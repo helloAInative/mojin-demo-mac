@@ -391,20 +391,78 @@ struct GatewayPick: Codable, Equatable, Identifiable {
 struct GatewayPicksDocument: Decodable, Equatable {
     struct Audit: Decodable, Equatable {
         var poolSources: [String]
-        var concentration: Concentration?
-        var limitUpBreakdown: String?
-        var experimentId: String?
-
-        struct Concentration: Decodable, Equatable {
-            var maxPerIndustry: Int
-            var summary: String
-        }
+        var concentrationSummary: String
+        var limitUpCount: Int
+        var experimentId: String
+        var ruleVersion: String
+        var ruleHash: String
 
         enum CodingKeys: String, CodingKey {
             case poolSources = "pool_sources"
-            case concentration
-            case limitUpBreakdown = "limit_up_breakdown"
+            case concentrationSummary = "concentration_summary"
+            case limitUpCount = "limit_up_count"
             case experimentId = "experiment_id"
+            case ruleVersion = "rule_version"
+            case ruleHash = "rule_hash"
+        }
+    }
+
+    struct StrategyHealth: Decodable, Equatable {
+        var status: String
+        var score: Int
+        var completedDays: Int
+        var currentLossStreak: Int
+        var windows: [Window]
+        var curve: [Point]
+        var pauseCounts: [PauseCount]
+        var alerts: [String]
+
+        struct Window: Decodable, Equatable, Identifiable {
+            var days: Int
+            var completedDays: Int
+            var samples: Int
+            var winRate: Double
+            var avgT1Real: Double
+            var cumulativeReturn: Double
+            var maxDrawdown: Double
+            var id: Int { days }
+
+            enum CodingKeys: String, CodingKey {
+                case days, samples
+                case completedDays = "completed_days"
+                case winRate = "win_rate"
+                case avgT1Real = "avg_t1_real"
+                case cumulativeReturn = "cumulative_return"
+                case maxDrawdown = "max_drawdown"
+            }
+        }
+
+        struct Point: Decodable, Equatable, Identifiable {
+            var date: String
+            var samples: Int
+            var t1RealPct: Double
+            var cumulativePct: Double
+            var regime: String
+            var id: String { date }
+
+            enum CodingKeys: String, CodingKey {
+                case date, samples, regime
+                case t1RealPct = "t1_real_pct"
+                case cumulativePct = "cumulative_pct"
+            }
+        }
+
+        struct PauseCount: Decodable, Equatable, Identifiable {
+            var source: String
+            var count: Int
+            var id: String { source }
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case status, score, windows, curve, alerts
+            case completedDays = "completed_days"
+            case currentLossStreak = "current_loss_streak"
+            case pauseCounts = "pause_counts"
         }
     }
 
@@ -446,7 +504,7 @@ struct GatewayPicksDocument: Decodable, Equatable {
         case avgT5Pct = "avg_t5_pct"
         case tags
         case byRegime = "by_regime"
-        case audit
+        case audit, execution, health
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -467,6 +525,8 @@ struct GatewayPicksDocument: Decodable, Equatable {
     var execution: ExecutionStats?
     /// §A.14 规则版本与候选池审计信息；旧服务端缺失时为 nil。
     var audit: Audit?
+    /// §A.14 近 10/20 个已完成推荐日的滚动健康度。
+    var health: StrategyHealth?
 
     /// §A.9 上一交易日推荐（已有 T+1 outcome 回写），用于展示「昨日推荐 → 今日卖点」
     var previousPicks: [GatewayPreviousPick]?
@@ -633,6 +693,7 @@ struct GatewayPicksDocument: Decodable, Equatable {
         self.executeHint = nil
         self.execution = nil
         self.audit = nil
+        self.health = nil
         self.previousPicks = nil
     }
 
@@ -658,9 +719,11 @@ struct GatewayPicksDocument: Decodable, Equatable {
         tags = (try? stats.decodeIfPresent([TagStat].self, forKey: .tags)) ?? []
         byRegime = (try? stats.decodeIfPresent([RegimeStat].self, forKey: .byRegime)) ?? []
         audit = try? stats.decodeIfPresent(Audit.self, forKey: .audit)
+        health = try? stats.decodeIfPresent(StrategyHealth.self, forKey: .health)
         market = try? c.decodeIfPresent(MarketInfo.self, forKey: .market)
         executeHint = try? c.decodeIfPresent(String.self, forKey: .executeHint)
-        execution = try? c.decodeIfPresent(ExecutionStats.self, forKey: .execution)
+        execution = (try? stats.decodeIfPresent(ExecutionStats.self, forKey: .execution))
+            ?? (try? c.decodeIfPresent(ExecutionStats.self, forKey: .execution))
         previousPicks = try? c.decodeIfPresent([GatewayPreviousPick].self, forKey: .previousPicks)
     }
 }
