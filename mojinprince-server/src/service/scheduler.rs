@@ -342,6 +342,17 @@ async fn build_report(
     } else {
         None
     };
+    let calibration_quality = if kind == "weekly" {
+        Some(
+            crate::service::pick::load_calibration_quality(
+                &state.db,
+                &end.format("%Y-%m-%d").to_string(),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
 
     let title = match kind {
         "weekly" => format!("周报 · {period_key}"),
@@ -425,6 +436,26 @@ async fn build_report(
             body.push_str(&format!("- ⚠️ {alert}\n"));
         }
         body.push('\n');
+    }
+    if let Some(quality) = &calibration_quality {
+        let label = match quality.status.as_str() {
+            "reliable" => "可靠",
+            "degraded" => "漂移",
+            _ => "样本积累中",
+        };
+        body.push_str("## 概率校准质量（样本外）\n");
+        body.push_str(&format!(
+            "- 状态：{} · {} 个有效预测 · Brier {:.3} · ECE {:.3} · LogLoss {:.3}\n",
+            label,
+            quality.samples,
+            quality.brier_score,
+            quality.expected_calibration_error,
+            quality.log_loss
+        ));
+        if let Some(auc) = quality.auc {
+            body.push_str(&format!("- 区分度 AUC：{auc:.3}\n"));
+        }
+        body.push_str(&format!("- {}\n\n", quality.reason));
     }
 
     // 后端信号时间线
