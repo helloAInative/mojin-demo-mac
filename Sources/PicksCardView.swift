@@ -14,7 +14,13 @@ struct PicksCardView: View {
     /// 切到该标的并跳盯盘（ContentView 提供回调）。
     var onOpenSymbol: (String, String) -> Void
 
-    @ObservedObject private var ui = PicksCardUIState()
+    /// §I.8 UI 状态：默认本视图自管；外部注入时可远程操控（如 Esc 关折）。
+    /// SwiftUI 通过 @ObservedObject 自动订阅。
+    @ObservedObject var ui: PicksCardUIState
+
+    /// §I.8 关折意图 tick：外部 +1 时本视图折叠 L2/L3。
+    /// 避免为关折一个布尔状态引入 Combine 通道。
+    var collapseTick: Int = 0
 
     var body: some View {
         GroupBox {
@@ -52,6 +58,13 @@ struct PicksCardView: View {
                 }
             }
             .padding(4)
+        }
+        // §I.8 关折意图：ContentView +1 tick → 折叠 L2/L3
+        .onChange(of: collapseTick) { _ in
+            if ui.showDetail || ui.showAudit {
+                ui.showDetail = false
+                ui.showAudit = false
+            }
         }
     }
 
