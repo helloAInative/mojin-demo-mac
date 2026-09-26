@@ -23,6 +23,9 @@ struct PicksCardView: View {
                 if let doc = store.picksDoc {
                     marketSentimentBanner(doc)
                     intradayConfirmationBanner(doc)
+                    if let health = doc.health, health.completedDays > 0 {
+                        strategyHealthPanel(health)
+                    }
                     if doc.picks.isEmpty {
                         emptyState(doc)
                     } else {
@@ -225,6 +228,66 @@ struct PicksCardView: View {
             .help("Wilson 95% 区间；样本 < 30 时只看方向，不看数字")
     }
 
+    private func strategyHealthPanel(_ health: GatewayPicksDocument.StrategyHealth) -> some View {
+        let signal: UITokens.Signal = switch health.status {
+        case "healthy": .buy
+        case "critical": .danger
+        default: .observe
+        }
+        let statusLabel: String = switch health.status {
+        case "healthy": "健康"
+        case "critical": "高风险"
+        case "watch": "观察"
+        default: "样本积累中"
+        }
+        return VStack(alignment: .leading, spacing: UITokens.stackTight) {
+            HStack(spacing: UITokens.stackNormal) {
+                Label("策略健康度 \(health.score) · \(statusLabel)",
+                      systemImage: health.status == "critical" ? "heart.slash.fill" : "waveform.path.ecg")
+                    .font(.system(size: UITokens.metaSize, weight: .bold))
+                    .foregroundStyle(UITokens.color(signal))
+                if health.currentLossStreak > 0 {
+                    Text("连亏 \(health.currentLossStreak) 日")
+                        .font(.system(size: UITokens.microSize, weight: .semibold))
+                        .foregroundStyle(UITokens.color(.danger))
+                }
+                ForEach(health.windows) { window in
+                    Text(String(format: "%d日 %.0f%% · 均%+.2f%%",
+                                window.days, window.winRate * 100, window.avgT1Real))
+                        .font(.system(size: UITokens.microSize, design: .monospaced))
+                        .foregroundStyle(window.avgT1Real >= 0 ? .secondary : UITokens.color(.observe))
+                }
+                Spacer(minLength: 0)
+            }
+            if !health.curve.isEmpty {
+                StrategyHealthCurveView(points: health.curve)
+                    .frame(height: 66)
+            }
+            if let alert = health.alerts.first {
+                Label(alert, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: UITokens.microSize, weight: .semibold))
+                    .foregroundStyle(UITokens.color(signal))
+            }
+            if !health.pauseCounts.isEmpty {
+                Text("近窗暂停 · " + health.pauseCounts.map { "\(pauseLabel($0.source)) \($0.count)次" }.joined(separator: " · "))
+                    .font(.system(size: UITokens.microSize))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(UITokens.stackTight)
+        .background(UITokens.background(signal), in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func pauseLabel(_ source: String) -> String {
+        switch source {
+        case "manual": return "人工"
+        case "loss_streak": return "连亏"
+        case "market_crash": return "大盘"
+        case "joint_market": return "联动"
+        default: return source
+        }
+    }
+
     private func hintPill(_ hint: String) -> some View {
         Text(hint)
             .font(.system(size: UITokens.metaSize, weight: .bold))
@@ -360,9 +423,18 @@ struct PicksCardView: View {
                     .font(.system(size: UITokens.microSize))
                     .foregroundStyle(avgBeta >= 1.3 ? UITokens.color(.observe) : .secondary)
             }
-            Text("L3 元数据受服务端字段约束：池子来源 / 集中度 / experiment_id 等 §A.14 落地后即透出")
-                .font(.system(size: UITokens.microSize))
-                .foregroundStyle(.tertiary)
+            if let audit = doc.audit {
+                Text("实验 \(audit.experimentId)")
+                    .font(.system(size: UITokens.microSize, design: .monospaced))
+                    .textSelection(.enabled)
+                    .foregroundStyle(UITokens.color(.audit))
+                Text("规则 \(audit.ruleVersion) · hash \(audit.ruleHash) · 来源 \(audit.poolSources.joined(separator: "/"))")
+                    .font(.system(size: UITokens.microSize, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Text("集中度：\(audit.concentrationSummary) · 涨停 \(audit.limitUpCount) 只")
+                    .font(.system(size: UITokens.microSize))
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(UITokens.stackTight)
         .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 4))
@@ -898,5 +970,75 @@ struct PickExecutionCurveTokenView: View {
             }
         }
         .help("同一批推荐按日等权聚合：蓝线以推荐日收盘为纸面买入基准，橙线以次日真实开盘价为基准")
+    }
+}
+
+/// §A.14 滚动策略健康曲线：按推荐日组合真实 T+1 等权聚合，线段按市场环境着色。
+struct StrategyHealthCurveView: View {
+    let points: [GatewayPicksDocument.StrategyHealth.Point]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 9) {
+                regimeLegend("偏多", .red)
+                regimeLegend("震荡", .blue)
+                regimeLegend("偏空", .orange)
+                regimeLegend("急跌", UITokens.color(.danger))
+                Spacer(minLength: 0)
+                if let last = points.last {
+                    Text(String(format: "20日累计 %+.1f%%", last.cumulativePct))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.system(size: 8, weight: .semibold))
+            Canvas { context, size in
+                let values = points.map(\.cumulativePct) + [0]
+                let rawMin = values.min() ?? 0
+                let rawMax = values.max() ?? 0
+                let spread = max(rawMax - rawMin, 1)
+                let minY = rawMin - spread * 0.12
+                let maxY = rawMax + spread * 0.12
+                func location(_ index: Int, _ value: Double) -> CGPoint {
+                    let x = points.count <= 1 ? size.width / 2 :
+                        CGFloat(index) / CGFloat(points.count - 1) * size.width
+                    let ratio = (value - minY) / max(maxY - minY, 0.001)
+                    return CGPoint(x: x, y: size.height * (1 - ratio))
+                }
+                if minY <= 0, maxY >= 0 {
+                    var zero = Path()
+                    let y = location(0, 0).y
+                    zero.move(to: CGPoint(x: 0, y: y))
+                    zero.addLine(to: CGPoint(x: size.width, y: y))
+                    context.stroke(zero, with: .color(.secondary.opacity(0.25)),
+                                   style: StrokeStyle(lineWidth: 0.7, dash: [3, 3]))
+                }
+                for index in points.indices.dropFirst() {
+                    var segment = Path()
+                    segment.move(to: location(index - 1, points[index - 1].cumulativePct))
+                    segment.addLine(to: location(index, points[index].cumulativePct))
+                    context.stroke(segment, with: .color(regimeColor(points[index].regime)),
+                                   style: StrokeStyle(lineWidth: 1.8, lineCap: .round))
+                }
+            }
+        }
+        .help("近 20 个已完成推荐日的组合真实 T+1 累计曲线；红=偏多、蓝=震荡、橙=偏空、深红=急跌")
+    }
+
+    private func regimeLegend(_ label: String, _ color: Color) -> some View {
+        HStack(spacing: 2) {
+            Circle().fill(color).frame(width: 5, height: 5)
+            Text(label)
+        }
+        .foregroundStyle(color)
+    }
+
+    private func regimeColor(_ regime: String) -> Color {
+        switch regime {
+        case "bull": return .red
+        case "bear": return .orange
+        case "crash": return UITokens.color(.danger)
+        default: return .blue
+        }
     }
 }
