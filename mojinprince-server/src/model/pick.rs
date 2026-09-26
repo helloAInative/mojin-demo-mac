@@ -89,6 +89,68 @@ pub struct PickStats {
     /// 当日硬过滤汇总，便于解释“为什么今天少推/不推”。
     #[serde(default)]
     pub hard_filter_exclusions: Vec<HardFilterStat>,
+    /// §A.14 近 10/20 个已完成推荐日的滚动策略健康度。
+    #[serde(default)]
+    pub health: StrategyHealth,
+    /// §A.14 生产规则版本与关键阈值清单，用于复现实验。
+    #[serde(default)]
+    pub audit: PickAudit,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PickAudit {
+    pub experiment_id: String,
+    pub rule_version: String,
+    pub rule_hash: String,
+    #[serde(default)]
+    pub manifest: serde_json::Value,
+    #[serde(default)]
+    pub pool_sources: Vec<String>,
+    pub concentration_summary: String,
+    pub limit_up_count: i64,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct StrategyHealth {
+    /// healthy / watch / critical / insufficient
+    pub status: String,
+    pub score: i64,
+    pub completed_days: i64,
+    pub current_loss_streak: i64,
+    #[serde(default)]
+    pub windows: Vec<HealthWindow>,
+    #[serde(default)]
+    pub curve: Vec<HealthCurvePoint>,
+    #[serde(default)]
+    pub pause_counts: Vec<PauseCount>,
+    #[serde(default)]
+    pub alerts: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct HealthWindow {
+    pub days: i64,
+    pub completed_days: i64,
+    pub samples: i64,
+    pub win_rate: f64,
+    pub avg_t1_real: f64,
+    pub cumulative_return: f64,
+    pub max_drawdown: f64,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct HealthCurvePoint {
+    pub date: String,
+    pub samples: i64,
+    pub t1_real_pct: f64,
+    pub cumulative_pct: f64,
+    pub regime: String,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PauseCount {
+    pub source: String,
+    pub count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]

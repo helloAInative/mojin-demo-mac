@@ -524,6 +524,10 @@ async fn weekly_report_includes_level_attribution() {
         "B 的归因缺失：\n{body}"
     );
     assert!(body.contains("被忽略反馈：1 条"), "忽略反馈计数：\n{body}");
+    assert!(
+        body.contains("策略健康度（真实执行口径）"),
+        "周报必须包含滚动策略健康度：\n{body}"
+    );
     assert_eq!(resp["payload"]["summary"]["ai_feedback_ignored"], 1);
     assert_eq!(resp["payload"]["summary"]["level_never_reached"], 0);
 }

@@ -185,6 +185,52 @@ async fn manual_kill_switch_pauses_before_network_and_writes_audit() {
     assert_eq!(listed["market"]["pause_source"], "manual");
     assert_eq!(listed["market"]["pause_audit"][0]["source"], "manual");
     assert_eq!(listed["market"]["pause_audit"][0]["active"], true);
+
+    // 同日关闭人工开关后，若连亏熔断接管，人工记录保留但不再标 active。
+    sqlx::query("UPDATE settings SET value = 'false' WHERE key = 'smartPicksPaused'")
+        .execute(&db)
+        .await
+        .unwrap();
+    for (index, date) in ["2026-09-20", "2026-09-21", "2026-09-22"]
+        .iter()
+        .enumerate()
+    {
+        sqlx::query(
+            "INSERT INTO daily_pick(date, code, name, rank, score, reasons, ai_note, meta, created_at) \
+             VALUES(?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(*date)
+        .bind(format!("sz30061{index}"))
+        .bind("连亏接管样本")
+        .bind(1_i64)
+        .bind(80.0)
+        .bind("[]")
+        .bind("")
+        .bind(json!({"outcome": {"t1_real": -1.0}}).to_string())
+        .bind(0_i64)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    let switched: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/picks/run")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(switched["market"]["pause_source"], "loss_streak");
+    let activity: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT source, active FROM pick_pause_audit WHERE date = ? ORDER BY source",
+    )
+    .bind(switched["date"].as_str().unwrap())
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        activity,
+        vec![("loss_streak".into(), 1), ("manual".into(), 0)]
+    );
 }
 
 #[actix_web::test]
@@ -1081,6 +1127,68 @@ async fn list_picks_exposes_wilson_interval_and_low_sample_flag() {
 }
 
 #[actix_web::test]
+async fn rolling_health_detects_drift_and_exposes_reproducible_rule_id() {
+    let state = fresh_state().await;
+    let db = state.db.clone();
+    for index in 0..20_i64 {
+        let date = format!("2026-09-{:02}", index + 1);
+        // 最后三日连续亏损，短窗显著弱于前段基线。
+        let real = if index >= 17 { -2.0 } else { 0.8 };
+        sqlx::query(
+            "INSERT INTO daily_pick(date, code, name, rank, score, reasons, ai_note, meta, created_at) \
+             VALUES(?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&date)
+        .bind(format!("sz30{:04}", index))
+        .bind("健康度样本")
+        .bind(1_i64)
+        .bind(80.0)
+        .bind("[]")
+        .bind("")
+        .bind(
+            json!({
+                "industry": "半导体",
+                "pool_sources": ["momentum", "relative_strength"],
+                "cn": {"avg_pct": if index < 10 { 0.9 } else { -1.0 }},
+                "outcome": {"t1_pct": real, "t1_real": real}
+            })
+            .to_string(),
+        )
+        .bind(0_i64)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO pick_pause_audit(date, source, reason, active, created_at) \
+         VALUES('2026-09-18','loss_streak','test',0,0)",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let doc = service::pick::list_picks(&db, Some("2026-09-20"))
+        .await
+        .unwrap();
+    assert_eq!(doc.stats.health.completed_days, 20);
+    assert_eq!(doc.stats.health.current_loss_streak, 3);
+    assert_eq!(doc.stats.health.status, "critical");
+    assert_eq!(doc.stats.health.curve.len(), 20);
+    assert_eq!(doc.stats.health.windows[0].days, 10);
+    assert!(doc.stats.health.windows[0].avg_t1_real < 0.0);
+    assert_eq!(doc.stats.health.pause_counts[0].source, "loss_streak");
+    assert!(!doc.stats.health.alerts.is_empty());
+    assert!(doc
+        .stats
+        .audit
+        .experiment_id
+        .starts_with("production-v2026.09.26-"));
+    assert_eq!(doc.stats.audit.rule_hash.len(), 16);
+    assert_eq!(doc.stats.audit.manifest["industry_cap"], 2);
+    assert_eq!(doc.stats.audit.pool_sources.len(), 2);
+}
+
+#[actix_web::test]
 async fn picks_run_attaches_buy_and_sell_price_zones() {
     let upstream = MockServer::start();
     upstream.mock(|when, then| {
@@ -1172,6 +1280,13 @@ async fn picks_run_attaches_buy_and_sell_price_zones() {
     let basis = &pick["meta"]["sell_zone_basis"];
     assert_eq!(basis["samples"].as_i64().unwrap(), 5);
     assert!((basis["win_rate"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    let experiment_id = pick["meta"]["experiment_id"].as_str().unwrap();
+    assert!(experiment_id.starts_with("production-v2026.09.26-"));
+    assert_eq!(
+        pick["meta"]["experiment"]["manifest"]["market_crash_pause_pct"],
+        -2.0
+    );
+    assert_eq!(doc["market"]["experiment"]["experiment_id"], experiment_id);
 }
 
 #[actix_web::test]

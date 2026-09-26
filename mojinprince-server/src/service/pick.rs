@@ -7,8 +7,8 @@
 //! `meta.outcome` 形成命中率闭环。
 use crate::error::AppError;
 use crate::model::pick::{
-    AiRankConfig, DailyPick, HardFilterStat, PickStats, PickTagStat, PicksDocument, RegimeStat,
-    ShadowExperimentStat,
+    AiRankConfig, DailyPick, HardFilterStat, HealthCurvePoint, HealthWindow, PauseCount, PickAudit,
+    PickStats, PickTagStat, PicksDocument, RegimeStat, ShadowExperimentStat, StrategyHealth,
 };
 use crate::model::DayBar;
 use crate::service::ai::{self, ChatMessage};
@@ -18,7 +18,7 @@ use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Timelike, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use sqlx::SqlitePool;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration as StdDuration;
 
 /// 新浪 A 股涨幅榜（东财 push2 断连时候选池 fallback；同属既有三源）。
@@ -1362,8 +1362,65 @@ const TARGET_NET_RETURN: f64 = 0.05;
 const TARGET_COST_BUFFER: f64 = 0.002;
 const BUY_ZONE_UPPER_BUFFER: f64 = 0.02;
 const SHADOW_EXPERIMENT_ID: &str = "target-stability-challenger-v1";
+const CALIBRATION_EXPERIMENT_ID: &str = "calibrated-abstention-challenger-v1";
 const SHADOW_PROMOTION_DAYS: i64 = 20;
 const SHADOW_PROMOTION_SAMPLES: i64 = 30;
+const PRODUCTION_RULE_VERSION: &str = "production-v2026.09.26";
+
+/// 生产规则的可复现参数清单。修改影响入选或暂停的阈值时必须同步更新版本。
+fn production_rule_manifest() -> Value {
+    serde_json::json!({
+        "candidate_score_floor": 60.0,
+        "max_picks": 5,
+        "industry_cap": 2,
+        "portfolio_stress_floor_pct": -6.0,
+        "market_crash_pause_pct": -2.0,
+        "market_weak_penalty_pct": -0.8,
+        "joint_gate": {"nasdaq_pct": -1.5, "cn_pct": -1.0},
+        "loss_streak_pause_days": 3,
+        "liquidity_floor": 50_000_000.0,
+        "ai_quant_proximity_points": 5.0,
+        "target_net_return_pct": 5.0,
+        "execution_cost_pct": 0.2,
+        "walk_forward": {"lookback_days": 120, "train_days": 90, "validation_days": 30},
+        "shadow_experiment_id": SHADOW_EXPERIMENT_ID,
+        "calibration": {
+            "lookback_days": 180,
+            "minimum_similar_samples": 30,
+            "similarity_floor": 0.35,
+            "minimum_shared_tags": 2,
+            "abstain_when_wilson_high_below": 0.5,
+            "positive_when_wilson_low_above": 0.5,
+            "prior": "Beta(2,2)",
+            "shadow_experiment_id": CALIBRATION_EXPERIMENT_ID,
+        },
+    })
+}
+
+fn production_experiment() -> (String, String, Value) {
+    let manifest = production_rule_manifest();
+    let canonical = serde_json::to_string(&manifest).unwrap_or_default();
+    // FNV-1a：跨进程稳定，不依赖 Rust 随机哈希种子。
+    let hash = canonical.as_bytes().iter().fold(0xcbf29ce484222325_u64, |acc, byte| {
+        (acc ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    let rule_hash = format!("{hash:016x}");
+    (
+        format!("{PRODUCTION_RULE_VERSION}-{rule_hash}"),
+        rule_hash,
+        manifest,
+    )
+}
+
+fn attach_production_experiment(market: &mut Value) {
+    let (experiment_id, rule_hash, manifest) = production_experiment();
+    market["experiment"] = serde_json::json!({
+        "experiment_id": experiment_id,
+        "rule_version": PRODUCTION_RULE_VERSION,
+        "rule_hash": rule_hash,
+        "manifest": manifest,
+    });
+}
 
 fn close_returns_by_date(bars: &[DayBar]) -> HashMap<&str, f64> {
     bars.windows(2)
@@ -2158,7 +2215,7 @@ async fn build_pause_document(
             "risk_score": c.risk_score().0,
         })
     });
-    let market = serde_json::json!({
+    let mut market = serde_json::json!({
         "djia": us.and_then(|s| s.djia_pct),
         "ixic": us.and_then(|s| s.ixic_pct),
         "us": {
@@ -2167,6 +2224,7 @@ async fn build_pause_document(
         },
         "cn": cn_value,
     });
+    attach_production_experiment(&mut market);
     let previous_picks = fetch_previous_picks(&state.db, date)
         .await
         .unwrap_or_default();
@@ -2205,6 +2263,11 @@ async fn persist_pick_run(
         ""
     };
     let mut tx = db.begin().await?;
+    // 同一天重跑可能解除暂停或切换触发源：保留历史，但先撤销旧 active 状态。
+    sqlx::query("UPDATE pick_pause_audit SET active = 0 WHERE date = ? AND active != 0")
+        .bind(&date_key)
+        .execute(&mut *tx)
+        .await?;
     if paused {
         // 同日重跑由正常清单切换为暂停时，必须移除旧票，避免 GET 再返回它们。
         sqlx::query("DELETE FROM daily_pick WHERE date = ?")
@@ -2229,8 +2292,9 @@ async fn persist_pick_run(
     .await?;
     if paused {
         sqlx::query(
-            "INSERT OR IGNORE INTO pick_pause_audit(date, source, reason, active, created_at) \
-             VALUES(?,?,?,?,?)",
+            "INSERT INTO pick_pause_audit(date, source, reason, active, created_at) \
+             VALUES(?,?,?,?,?) ON CONFLICT(date, source, reason) DO UPDATE SET \
+             active=excluded.active, created_at=excluded.created_at",
         )
         .bind(&date_key)
         .bind(pause_source)
@@ -2999,6 +3063,8 @@ pub async fn generate_picks(
             .await
             .unwrap_or_default();
     let now_cn = Utc::now().with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap());
+    let (production_experiment_id, production_rule_hash, production_manifest) =
+        production_experiment();
     let mut tx = state.db.begin().await?;
     sqlx::query("DELETE FROM daily_pick WHERE date = ?")
         .bind(&date_key)
@@ -3024,6 +3090,12 @@ pub async fn generate_picks(
             .unwrap_or(candidate.is_limit_up);
         let plan_limit_up = realtime_limit_up || candidate.is_limit_up;
         let meta = serde_json::json!({
+            "experiment_id": production_experiment_id.clone(),
+            "experiment": {
+                "rule_version": PRODUCTION_RULE_VERSION,
+                "rule_hash": production_rule_hash.clone(),
+                "manifest": production_manifest.clone(),
+            },
             "close": candidate.price,
             "pct": candidate.pct,
             "industry": candidate.industry,
@@ -3246,6 +3318,7 @@ pub async fn generate_picks(
             "risk_score": c.risk_score().0,
         })),
     });
+    attach_production_experiment(&mut market);
     let session = current_pick_session(date);
     let pick_codes: Vec<String> = picks
         .iter()
@@ -3497,6 +3570,199 @@ async fn load_hard_filter_stats(
         .collect())
 }
 
+fn build_pick_audit(picks: &[DailyPick]) -> PickAudit {
+    let (experiment_id, rule_hash, manifest) = production_experiment();
+    let mut pool_sources = std::collections::BTreeSet::new();
+    let mut industries: HashMap<String, i64> = HashMap::new();
+    let mut limit_up_count = 0_i64;
+    for pick in picks {
+        if let Some(sources) = pick.meta["pool_sources"].as_array() {
+            for source in sources.iter().filter_map(Value::as_str) {
+                pool_sources.insert(source.to_string());
+            }
+        }
+        if let Some(industry) = pick.meta["industry"].as_str().filter(|item| !item.is_empty()) {
+            *industries.entry(industry.to_string()).or_insert(0) += 1;
+        }
+        if pick.meta["is_limit_up"].as_bool().unwrap_or(false) {
+            limit_up_count += 1;
+        }
+    }
+    let max_industry = industries.values().copied().max().unwrap_or(0);
+    PickAudit {
+        experiment_id,
+        rule_version: PRODUCTION_RULE_VERSION.into(),
+        rule_hash,
+        manifest,
+        pool_sources: pool_sources.into_iter().collect(),
+        concentration_summary: if picks.is_empty() {
+            "当日无生产候选".into()
+        } else {
+            format!("{} 个行业，单行业最多 {max_industry} 只（上限 2）", industries.len())
+        },
+        limit_up_count,
+    }
+}
+
+pub(crate) async fn load_strategy_health(db: &SqlitePool, through_date: &str) -> StrategyHealth {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT date, meta FROM daily_pick \
+         WHERE date <= ? AND json_extract(meta,'$.outcome.t1_real') IS NOT NULL \
+         ORDER BY date ASC",
+    )
+    .bind(through_date)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    // 每个推荐日按组合等权聚合，避免一天推荐较多时不成比例放大权重。
+    let mut days: BTreeMap<String, (i64, i64, f64, String)> = BTreeMap::new();
+    for (date, raw) in rows {
+        let Ok(meta) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(real) = meta["outcome"]["t1_real"].as_f64() else {
+            continue;
+        };
+        let regime = meta["cn"]["avg_pct"]
+            .as_f64()
+            .map(|pct| market_regime(pct).0.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let entry = days.entry(date).or_insert((0, 0, 0.0, regime));
+        entry.0 += 1;
+        entry.1 += i64::from(real > 0.0);
+        entry.2 += real;
+    }
+    let mut daily: Vec<(String, i64, i64, f64, String)> = days
+        .into_iter()
+        .map(|(date, (samples, wins, sum, regime))| {
+            (date, samples, wins, sum / samples as f64, regime)
+        })
+        .collect();
+    if daily.len() > 20 {
+        daily.drain(..daily.len() - 20);
+    }
+
+    let window = |size: usize| -> HealthWindow {
+        let slice = if daily.len() > size {
+            &daily[daily.len() - size..]
+        } else {
+            &daily[..]
+        };
+        let samples = slice.iter().map(|item| item.1).sum::<i64>();
+        let wins = slice.iter().map(|item| item.2).sum::<i64>();
+        let mut factor = 1.0_f64;
+        let mut peak = 1.0_f64;
+        let mut max_drawdown = 0.0_f64;
+        for (_, _, _, pct, _) in slice {
+            factor *= 1.0 + pct / 100.0;
+            peak = peak.max(factor);
+            max_drawdown = max_drawdown.min((factor / peak - 1.0) * 100.0);
+        }
+        HealthWindow {
+            days: size as i64,
+            completed_days: slice.len() as i64,
+            samples,
+            win_rate: ratio(wins, samples),
+            avg_t1_real: if slice.is_empty() {
+                0.0
+            } else {
+                slice.iter().map(|item| item.3).sum::<f64>() / slice.len() as f64
+            },
+            cumulative_return: (factor - 1.0) * 100.0,
+            max_drawdown,
+        }
+    };
+    let windows = vec![window(10), window(20)];
+    let current_loss_streak = daily
+        .iter()
+        .rev()
+        .take_while(|item| item.3 < 0.0)
+        .count() as i64;
+    let mut factor = 1.0_f64;
+    let curve = daily
+        .iter()
+        .map(|(date, samples, _, pct, regime)| {
+            factor *= 1.0 + pct / 100.0;
+            HealthCurvePoint {
+                date: date.clone(),
+                samples: *samples,
+                t1_real_pct: *pct,
+                cumulative_pct: (factor - 1.0) * 100.0,
+                regime: regime.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let first_date = daily
+        .first()
+        .map(|item| item.0.as_str())
+        .unwrap_or(through_date);
+    let pause_rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT source, COUNT(*) FROM pick_pause_audit \
+         WHERE date >= ? AND date <= ? GROUP BY source ORDER BY source",
+    )
+    .bind(first_date)
+    .bind(through_date)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let pause_counts = pause_rows
+        .into_iter()
+        .map(|(source, count)| PauseCount { source, count })
+        .collect::<Vec<_>>();
+
+    let ten = &windows[0];
+    let twenty = &windows[1];
+    let mut score = 100_i64;
+    let mut alerts = Vec::new();
+    if current_loss_streak >= 3 {
+        score -= 40;
+        alerts.push(format!("已连续亏损 {current_loss_streak} 个推荐日，策略应保持暂停"));
+    }
+    if ten.completed_days >= 5 && ten.win_rate < 0.45 {
+        score -= 20;
+        alerts.push(format!("近10日真实胜率降至 {:.0}%", ten.win_rate * 100.0));
+    }
+    if ten.completed_days >= 5 && ten.avg_t1_real < 0.0 {
+        score -= 20;
+        alerts.push(format!("近10日组合平均收益转负至 {:.2}%", ten.avg_t1_real));
+    }
+    if ten.max_drawdown <= -8.0 {
+        score -= 25;
+        alerts.push(format!("近10日累计曲线最大回撤 {:.1}%", ten.max_drawdown));
+    }
+    if ten.completed_days >= 8
+        && twenty.completed_days >= 15
+        && ten.win_rate + 0.15 < twenty.win_rate
+    {
+        score -= 15;
+        alerts.push(format!(
+            "短窗胜率较20日基线下降 {:.0} 个百分点",
+            (twenty.win_rate - ten.win_rate) * 100.0
+        ));
+    }
+    score = score.clamp(0, 100);
+    let status = if daily.len() < 5 {
+        "insufficient"
+    } else if current_loss_streak >= 3 || ten.avg_t1_real <= -1.0 || ten.max_drawdown <= -8.0 {
+        "critical"
+    } else if !alerts.is_empty() {
+        "watch"
+    } else {
+        "healthy"
+    };
+    StrategyHealth {
+        status: status.into(),
+        score,
+        completed_days: daily.len() as i64,
+        current_loss_streak,
+        windows,
+        curve,
+        pause_counts,
+        alerts,
+    }
+}
+
 pub fn market_regime(avg_pct: f64) -> (&'static str, &'static str) {
     if avg_pct <= -2.0 {
         ("crash", "急跌")
@@ -3545,6 +3811,8 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
                 execution: Default::default(),
                 shadow_experiments: load_shadow_experiment_stats(db).await.unwrap_or_default(),
                 hard_filter_exclusions: Vec::new(),
+                health: StrategyHealth::default(),
+                audit: build_pick_audit(&[]),
             },
             market: serde_json::Value::Null,
             execute_hint: String::new(),
@@ -3912,6 +4180,8 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     )
     .await
     .unwrap_or_default();
+    let health = load_strategy_health(db, &date_key).await;
+    let audit = build_pick_audit(&picks);
     Ok(PicksDocument {
         date: date_key.clone(),
         picks,
@@ -3953,6 +4223,8 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
             hard_filter_exclusions: load_hard_filter_stats(db, &date_key)
                 .await
                 .unwrap_or_default(),
+            health,
+            audit,
         },
         market,
         execute_hint,

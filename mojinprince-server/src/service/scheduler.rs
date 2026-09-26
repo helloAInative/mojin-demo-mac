@@ -331,6 +331,17 @@ async fn build_report(
     } else {
         None
     };
+    let strategy_health = if kind == "weekly" {
+        Some(
+            crate::service::pick::load_strategy_health(
+                &state.db,
+                &end.format("%Y-%m-%d").to_string(),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
 
     let title = match kind {
         "weekly" => format!("周报 · {period_key}"),
@@ -373,6 +384,47 @@ async fn build_report(
         if !attribution.section.is_empty() {
             body.push('\n');
         }
+    }
+
+    if let Some(health) = &strategy_health {
+        let status = match health.status.as_str() {
+            "healthy" => "健康",
+            "critical" => "高风险",
+            "watch" => "观察",
+            _ => "样本积累中",
+        };
+        body.push_str("## 策略健康度（真实执行口径）\n");
+        body.push_str(&format!(
+            "- 状态：{} / 100 · {} · 已完成 {} 个推荐日 · 当前连亏 {} 日\n",
+            health.score, status, health.completed_days, health.current_loss_streak
+        ));
+        for window in &health.windows {
+            body.push_str(&format!(
+                "- 近{}日：胜率 {:.1}% · 平均 {:+.2}% · 累计 {:+.2}% · 最大回撤 {:.2}%（{}日/{}样本）\n",
+                window.days,
+                window.win_rate * 100.0,
+                window.avg_t1_real,
+                window.cumulative_return,
+                window.max_drawdown,
+                window.completed_days,
+                window.samples
+            ));
+        }
+        if !health.pause_counts.is_empty() {
+            body.push_str(&format!(
+                "- 闸门触发：{}\n",
+                health
+                    .pause_counts
+                    .iter()
+                    .map(|item| format!("{} {}次", item.source, item.count))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            ));
+        }
+        for alert in &health.alerts {
+            body.push_str(&format!("- ⚠️ {alert}\n"));
+        }
+        body.push('\n');
     }
 
     // 后端信号时间线
