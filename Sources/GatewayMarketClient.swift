@@ -238,6 +238,7 @@ struct GatewayPick: Codable, Equatable, Identifiable {
         var industry: String?
         var outcome: Outcome?
         var autoWeight: AutoWeight?
+        var calibration: Calibration?
         var plan: TradePlan?
         /// 今日已涨停（T 日买不进，需次日开盘）
         var isLimitUp: Bool?
@@ -248,11 +249,36 @@ struct GatewayPick: Codable, Equatable, Identifiable {
         var risk: RiskMetrics?
 
         enum CodingKeys: String, CodingKey {
-            case close, pct, industry, outcome, plan, risk
+            case close, pct, industry, outcome, plan, risk, calibration
             case autoWeight = "auto_weight"
             case isLimitUp = "is_limit_up"
             case sellZoneBasis = "sell_zone_basis"
             case negativeSignals = "negative_signals"
+        }
+    }
+
+    struct Calibration: Codable, Equatable {
+        var samples: Int
+        var wins: Int
+        var posteriorWinProbability: Double
+        var wilsonLow: Double
+        var wilsonHigh: Double
+        var target5pctSamples: Int
+        var target5pctPosteriorProbability: Double
+        var scope: String
+        var confidenceTier: String
+        var scoreDelta: Double
+        var abstain: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case samples, wins, scope, abstain
+            case posteriorWinProbability = "posterior_win_probability"
+            case wilsonLow = "wilson_low"
+            case wilsonHigh = "wilson_high"
+            case target5pctSamples = "target_5pct_samples"
+            case target5pctPosteriorProbability = "target_5pct_posterior_probability"
+            case confidenceTier = "confidence_tier"
+            case scoreDelta = "score_delta"
         }
     }
 
@@ -466,6 +492,32 @@ struct GatewayPicksDocument: Decodable, Equatable {
         }
     }
 
+    struct ShadowExperiment: Decodable, Equatable, Identifiable {
+        var experimentId: String
+        var status: String
+        var completedDays: Int
+        var samples: Int
+        var t1RealWinRate: Double
+        var t1RealWilsonLow: Double
+        var target5pctHitRate: Double
+        var target5pctWilsonLow: Double
+        var promotionEligible: Bool
+        var promotionReason: String
+        var id: String { experimentId }
+
+        enum CodingKeys: String, CodingKey {
+            case status, samples
+            case experimentId = "experiment_id"
+            case completedDays = "completed_days"
+            case t1RealWinRate = "t1_real_win_rate"
+            case t1RealWilsonLow = "t1_real_wilson_low"
+            case target5pctHitRate = "target_5pct_hit_rate"
+            case target5pctWilsonLow = "target_5pct_wilson_low"
+            case promotionEligible = "promotion_eligible"
+            case promotionReason = "promotion_reason"
+        }
+    }
+
     var date: String
     var picks: [GatewayPick]
     var samples: Int
@@ -505,6 +557,7 @@ struct GatewayPicksDocument: Decodable, Equatable {
         case tags
         case byRegime = "by_regime"
         case audit, execution, health
+        case shadowExperiments = "shadow_experiments"
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -527,6 +580,7 @@ struct GatewayPicksDocument: Decodable, Equatable {
     var audit: Audit?
     /// §A.14 近 10/20 个已完成推荐日的滚动健康度。
     var health: StrategyHealth?
+    var shadowExperiments: [ShadowExperiment]
 
     /// §A.9 上一交易日推荐（已有 T+1 outcome 回写），用于展示「昨日推荐 → 今日卖点」
     var previousPicks: [GatewayPreviousPick]?
@@ -694,6 +748,7 @@ struct GatewayPicksDocument: Decodable, Equatable {
         self.execution = nil
         self.audit = nil
         self.health = nil
+        self.shadowExperiments = []
         self.previousPicks = nil
     }
 
@@ -720,6 +775,7 @@ struct GatewayPicksDocument: Decodable, Equatable {
         byRegime = (try? stats.decodeIfPresent([RegimeStat].self, forKey: .byRegime)) ?? []
         audit = try? stats.decodeIfPresent(Audit.self, forKey: .audit)
         health = try? stats.decodeIfPresent(StrategyHealth.self, forKey: .health)
+        shadowExperiments = (try? stats.decodeIfPresent([ShadowExperiment].self, forKey: .shadowExperiments)) ?? []
         market = try? c.decodeIfPresent(MarketInfo.self, forKey: .market)
         executeHint = try? c.decodeIfPresent(String.self, forKey: .executeHint)
         execution = (try? stats.decodeIfPresent(ExecutionStats.self, forKey: .execution))
