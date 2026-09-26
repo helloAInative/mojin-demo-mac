@@ -16,6 +16,7 @@ struct WatchLegendView: View {
     let trendUp: Color
     let trendDown: Color
     @State private var pinned: String? = nil
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         HStack(spacing: UITokens.stackNormal) {
@@ -46,7 +47,7 @@ struct WatchLegendView: View {
                 Capsule().fill(color).frame(width: 10, height: 3)
             }
             Text(text)
-                .foregroundStyle(active ? .secondary : .tertiary)
+                .foregroundStyle(active ? Color.secondary : UITokens.adaptiveTertiary(for: colorScheme))
                 .fontWeight(pinned == key ? .semibold : .regular)
         }
         .padding(.horizontal, 2)
@@ -192,6 +193,7 @@ struct WatchLevelRowView: View {
 struct WatchDensityChipView: View {
     @ObservedObject var settings: AppSettings
     let resolved: WatchDensity
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -227,7 +229,7 @@ struct WatchDensityChipView: View {
             }
             Text(effectiveHint)
                 .font(.system(size: 8))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(UITokens.adaptiveTertiary(for: colorScheme))
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
