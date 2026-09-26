@@ -38,6 +38,9 @@ struct MinuteChart: View {
     var costLightPct: Double = 1.0
     /// B.1：当日 level 事件右侧栏（按时间戳竖列，颜色分 hit / 失效 / 等待中）
     var levelMarks: [LevelMark] = []
+    /// §I.5 图例 hover 联动：图例点 hover 后会把未在集合里的系列淡化。
+    /// 支持 key："price" / "avg" / "prev" / "support" / "resistance" / "base"。
+    var dimmedSeries: Set<String> = []
     /// 单击图表时打开详细视图；详细视图本身不传入，避免重复弹出。
     var onOpenDetail: (() -> Void)? = nil
     /// 详细视图可保留最后一次十字光标，并将选中分钟同步到外部数据条。
@@ -206,7 +209,8 @@ struct MinuteChart: View {
         var prevLine = Path()
         prevLine.move(to: CGPoint(x: padL, y: y(prev)))
         prevLine.addLine(to: CGPoint(x: size.width - padR, y: y(prev)))
-        context.stroke(prevLine, with: .color(.white.opacity(0.25)), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+        let prevAlpha: Double = dimmedSeries.isEmpty || dimmedSeries.contains("prev") ? 0.25 : 0.07
+        context.stroke(prevLine, with: .color(.white.opacity(prevAlpha)), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
 
         // 关键价位线（base / support / resistance）：支持接近现价时闪烁
         // 提示带 + 加粗线体——以 drawAlertLevels 集中绘制
@@ -219,7 +223,9 @@ struct MinuteChart: View {
                         xLeft: padL, xRight: size.width - padR,
                         y: y,
                         lightPct: levelLightPct,
-                        deepPct: levelDeepPct)
+                        deepPct: levelDeepPct,
+                        dimKeys: ["base": "base", "resistance": "resistance", "support": "support"],
+                        dimmedSeries: dimmedSeries)
 
         let up = (lastPrice) >= prev
         let color: Color = up ? Color(red: 1, green: 0.27, blue: 0.23) : Color(red: 0.2, green: 0.84, blue: 0.29)
@@ -243,7 +249,7 @@ struct MinuteChart: View {
             let pt = CGPoint(x: x(i), y: y(b.price))
             if i == 0 { line.move(to: pt) } else { line.addLine(to: pt) }
         }
-        context.stroke(line, with: .color(color), lineWidth: 1.6)
+        context.stroke(line, with: .color(color.opacity(dimmedSeries.isEmpty || dimmedSeries.contains("price") ? 1 : 0.18)), lineWidth: 1.6)
 
         // B.3：均价线（VWAP，腾讯分钟数据的 avg）——黄细线，hover 亦有数值
         var avgLine = Path()
@@ -257,7 +263,8 @@ struct MinuteChart: View {
                 started = true
             }
         }
-        context.stroke(avgLine, with: .color(Color(red: 1, green: 0.84, blue: 0.04).opacity(0.65)), lineWidth: 1)
+        let avgAlpha: Double = dimmedSeries.isEmpty || dimmedSeries.contains("avg") ? 0.65 : 0.12
+        context.stroke(avgLine, with: .color(Color(red: 1, green: 0.84, blue: 0.04).opacity(avgAlpha)), lineWidth: 1)
 
         if let i = hoverIndex, i < bars.count {
             let hx = x(i)
@@ -690,20 +697,24 @@ struct MinuteChart: View {
         xRight: CGFloat,
         y: (Double) -> CGFloat,
         lightPct: Double,
-        deepPct: Double
+        deepPct: Double,
+        dimKeys: [String: String] = ["base": "base", "resistance": "resistance", "support": "support"],
+        dimmedSeries: Set<String> = []
     ) {
-        struct Level { let value: Double; let color: Color; let label: String }
+        struct Level { let value: Double; let color: Color; let label: String; let key: String }
         var levels: [Level] = []
         if base > 0 {
-            levels.append(.init(value: base, color: .cyan, label: "基准"))
+            levels.append(.init(value: base, color: .cyan, label: "基准", key: dimKeys["base"] ?? "base"))
         }
         if resistance > 0 {
-            levels.append(.init(value: resistance, color: .orange, label: "阻力"))
+            levels.append(.init(value: resistance, color: .orange, label: "阻力", key: dimKeys["resistance"] ?? "resistance"))
         }
         if support > 0 {
-            levels.append(.init(value: support, color: .green, label: "支撑"))
+            levels.append(.init(value: support, color: .green, label: "支撑", key: dimKeys["support"] ?? "support"))
         }
         for lv in levels {
+            let isDimmed = !dimmedSeries.isEmpty && !dimmedSeries.contains(lv.key)
+            let dimFactor: Double = isDimmed ? 0.18 : 1.0
             let dist = lastPrice > 0 ? abs(lastPrice - lv.value) / max(lv.value, 0.0001) * 100 : 999
             let tier: MarketStore.LevelAlertTier = lastPrice > 0
                 ? .classify(distPct: dist,
@@ -714,7 +725,7 @@ struct MinuteChart: View {
             let isDeep = tier == .deep
 
             // 静态态
-            let baseAlpha: Double = isAlert ? 0.45 + 0.45 * flashPhase : 0.45
+            let baseAlpha: Double = (isAlert ? 0.45 + 0.45 * flashPhase : 0.45) * dimFactor
             let lineWidth: CGFloat = isAlert ? (1.4 + CGFloat(flashPhase) * 0.8) : 1.0
 
             var p = Path()
@@ -734,7 +745,7 @@ struct MinuteChart: View {
                 let bandAlpha: Double = isDeep
                     ? (0.18 + 0.22 * flashPhaseDeep)   // 二级脉动频率 1Hz
                     : (0.10 + 0.15 * flashPhase)
-                context.fill(bandPath, with: .color(lv.color.opacity(bandAlpha)))
+                context.fill(bandPath, with: .color(lv.color.opacity(bandAlpha * dimFactor)))
 
                 // 主虚线
                 context.stroke(
@@ -754,7 +765,7 @@ struct MinuteChart: View {
                     : 1.0
                 context.stroke(
                     solid,
-                    with: .color(lv.color.opacity(solidAlpha)),
+                    with: .color(lv.color.opacity(solidAlpha * dimFactor)),
                     style: StrokeStyle(lineWidth: solidWidth)
                 )
 
@@ -765,7 +776,7 @@ struct MinuteChart: View {
                     ring.addLine(to: CGPoint(x: xRight, y: y(lv.value)))
                     context.stroke(
                         ring,
-                        with: .color(.red.opacity(0.35 + 0.45 * flashPhaseDeep)),
+                        with: .color(.red.opacity((0.35 + 0.45 * flashPhaseDeep) * dimFactor)),
                         style: StrokeStyle(lineWidth: 0.8)
                     )
                 }
