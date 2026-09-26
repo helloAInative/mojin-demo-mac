@@ -6,7 +6,10 @@
 //! 落库 `daily_pick`，按 (date, code) 主键；T+1/T+5 收盘对照回写
 //! `meta.outcome` 形成命中率闭环。
 use crate::error::AppError;
-use crate::model::pick::{AiRankConfig, DailyPick, PickStats, PickTagStat, PicksDocument};
+use crate::model::pick::{
+    AiRankConfig, DailyPick, HardFilterStat, PickStats, PickTagStat, PicksDocument, RegimeStat,
+    ShadowExperimentStat,
+};
 use crate::model::DayBar;
 use crate::service::ai::{self, ChatMessage};
 use crate::service::ingest::MainNetSnapshot;
@@ -15,7 +18,7 @@ use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Timelike, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration as StdDuration;
 
 /// 新浪 A 股涨幅榜（东财 push2 断连时候选池 fallback；同属既有三源）。
@@ -103,6 +106,9 @@ fn filter_sina_rows(rows: Vec<SinaRow>) -> Vec<Candidate> {
                 pct,
                 industry: String::new(),
                 is_limit_up: lu,
+                turnover_pct: None,
+                volume_ratio: None,
+                pool_sources: vec!["momentum".into()],
             })
         })
         .collect()
@@ -173,14 +179,21 @@ pub struct Candidate {
     pub industry: String,
     /// 涨停（无法当日买入，标「次日开盘买入」）
     pub is_limit_up: bool,
+    /// 当日换手率（%）；新浪 fallback 无该字段时为 None。
+    pub turnover_pct: Option<f64>,
+    /// 当日量比；上游缺失时由近期日 K 成交量估算。
+    pub volume_ratio: Option<f64>,
+    /// momentum / relative_strength / pullback；最终可包含多个来源。
+    pub pool_sources: Vec<String>,
 }
 
 impl EastMoneyRanking {
-    /// 拉涨幅榜前 `limit` 名（`fltt=2` 数值型字段）。
-    pub async fn fetch(
+    async fn fetch_sorted(
         &self,
         http: &reqwest::Client,
         limit: usize,
+        fid: &str,
+        source: &str,
     ) -> Result<Vec<Candidate>, PickError> {
         let response = http
             .get(format!("{}/api/qt/clist/get", self.base_url))
@@ -191,9 +204,9 @@ impl EastMoneyRanking {
                 ("np", "1"),
                 ("fltt", "2"),
                 ("invt", "2"),
-                ("fid", "f3"),
+                ("fid", fid),
                 ("fs", "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"),
-                ("fields", "f2,f3,f12,f14,f100"),
+                ("fields", "f2,f3,f8,f10,f12,f14,f100"),
             ])
             .send()
             .await
@@ -238,9 +251,40 @@ impl EastMoneyRanking {
                 pct,
                 industry: row["f100"].as_str().unwrap_or("").to_string(),
                 is_limit_up: limit_up,
+                turnover_pct: row["f8"].as_f64(),
+                volume_ratio: row["f10"].as_f64(),
+                pool_sources: vec![source.to_string()],
             });
         }
         Ok(out)
+    }
+
+    /// §A.12 多源候选：涨幅动量 + 活跃换手池。第二源失败时保留原涨幅榜降级路径。
+    pub async fn fetch(
+        &self,
+        http: &reqwest::Client,
+        limit: usize,
+    ) -> Result<Vec<Candidate>, PickError> {
+        let momentum = self.fetch_sorted(http, limit, "f3", "momentum").await?;
+        let active = self
+            .fetch_sorted(http, limit, "f8", "active")
+            .await
+            .unwrap_or_default();
+        let mut merged: Vec<Candidate> = Vec::with_capacity(momentum.len() + active.len());
+        let mut positions: HashMap<String, usize> = HashMap::new();
+        for candidate in momentum.into_iter().chain(active) {
+            if let Some(index) = positions.get(&candidate.code).copied() {
+                for source in candidate.pool_sources {
+                    if !merged[index].pool_sources.contains(&source) {
+                        merged[index].pool_sources.push(source);
+                    }
+                }
+            } else {
+                positions.insert(candidate.code.clone(), merged.len());
+                merged.push(candidate);
+            }
+        }
+        Ok(merged)
     }
 }
 
@@ -276,6 +320,105 @@ pub fn is_anomaly(code: &str, pct: f64) -> bool {
         7.0
     };
     pct >= threshold
+}
+
+// ============================================================================
+// §A.11 P0 涨停强弱分档：只使用可复现的行情证据，不让「涨停」天然获得正向加分。
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct LimitUpStrength {
+    tier: &'static str,
+    score_delta: f64,
+    prior_streak: usize,
+    turnover_pct: Option<f64>,
+    volume_ratio: Option<f64>,
+    strong_industry: bool,
+    evidence: Vec<String>,
+}
+
+fn classify_limit_up_strength(
+    candidate: &Candidate,
+    bars: &[DayBar],
+    strong_industry: bool,
+) -> LimitUpStrength {
+    let mut prior_streak = 0usize;
+    for pair in bars.windows(2).rev() {
+        let previous = pair[0].close;
+        let current = pair[1].close;
+        if previous <= 0.0 {
+            break;
+        }
+        let pct = (current - previous) / previous * 100.0;
+        if is_limit_up(&candidate.code, pct) {
+            prior_streak += 1;
+        } else {
+            break;
+        }
+    }
+    let estimated_volume_ratio = if bars.len() >= 6 {
+        let last = bars.last().map(|bar| bar.volume as f64).unwrap_or(0.0);
+        let previous = &bars[bars.len() - 6..bars.len() - 1];
+        let average =
+            previous.iter().map(|bar| bar.volume as f64).sum::<f64>() / previous.len() as f64;
+        (average > 0.0).then_some(last / average)
+    } else {
+        None
+    };
+    let volume_ratio = candidate.volume_ratio.or(estimated_volume_ratio);
+
+    let turnover_healthy = candidate
+        .turnover_pct
+        .map(|turnover| (3.0..=25.0).contains(&turnover))
+        .unwrap_or(false);
+    let volume_healthy = volume_ratio
+        .map(|ratio| (0.8..=4.0).contains(&ratio))
+        .unwrap_or(false);
+    let mut evidence = Vec::new();
+    let mut strength_points = 0usize;
+    if prior_streak > 0 {
+        strength_points += 2;
+        evidence.push(format!("前序连板 {prior_streak} 天"));
+    }
+    if strong_industry {
+        strength_points += 1;
+        evidence.push("强势行业共振".into());
+    }
+    if turnover_healthy {
+        strength_points += 1;
+        evidence.push("换手充分".into());
+    }
+    if volume_healthy {
+        strength_points += 1;
+        evidence.push("量能健康".into());
+    }
+
+    let weak_liquidity = candidate
+        .turnover_pct
+        .map(|turnover| !(1.0..=30.0).contains(&turnover))
+        .unwrap_or(false)
+        || volume_ratio
+            .map(|ratio| !(0.6..=5.0).contains(&ratio))
+            .unwrap_or(false);
+    let (tier, score_delta) = if strength_points >= 3 {
+        ("strong", 0.0)
+    } else if strength_points <= 1 || weak_liquidity {
+        ("weak", -12.0)
+    } else {
+        ("neutral", -5.0)
+    };
+    if evidence.is_empty() {
+        evidence.push("缺少连板/行业/换手确认".into());
+    }
+    LimitUpStrength {
+        tier,
+        score_delta,
+        prior_streak,
+        turnover_pct: candidate.turnover_pct,
+        volume_ratio,
+        strong_industry,
+        evidence,
+    }
 }
 
 // ============================================================================
@@ -443,6 +586,132 @@ fn parse_us_index(body: &str) -> UsSentiment {
 }
 
 // ============================================================================
+// §A.10 A 股大盘情绪（腾讯 qt.gtimg.cn 同源接口，零新增网络栈）
+// ============================================================================
+
+/// 同 TencentUsIndex，复用 qt.gtimg.cn 的 `q=` 多 symbol 语法拉上证 / 深成 / 创业板 / 沪深 300。
+#[derive(Debug, Clone)]
+pub struct TencentCnIndex {
+    /// 测试可覆写（默认 `http://qt.gtimg.cn`）
+    pub base_url: String,
+}
+
+impl Default for TencentCnIndex {
+    fn default() -> Self {
+        Self {
+            base_url: "http://qt.gtimg.cn".into(),
+        }
+    }
+}
+
+/// 主流指数当日涨跌幅（%）。失败时各字段为 None。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CnSentiment {
+    pub sh_pct: Option<f64>,    // 上证综指 sh000001
+    pub sz_pct: Option<f64>,    // 深证成指 sz399001
+    pub gem_pct: Option<f64>,   // 创业板指 sz399006
+    pub hs300_pct: Option<f64>, // 沪深 300 sh000300
+}
+
+impl TencentCnIndex {
+    pub async fn fetch(&self, http: &reqwest::Client) -> Result<CnSentiment, PickError> {
+        let url = format!("{}/q=sh000001,sz399001,sz399006,sh000300", self.base_url);
+        let response = http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| PickError::Network(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(PickError::Network(format!("status {}", response.status())));
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|e| PickError::Network(e.to_string()))?;
+        let (decoded, _, _) = encoding_rs::GBK.decode(body.as_bytes());
+        Ok(parse_cn_index(&decoded))
+    }
+}
+
+/// 解析四只指数。腾讯字段布局：
+/// 索引 0=市场类型, 1=名称, 2=代码, 3=现价, 4=昨收, 32=涨跌幅（%）
+fn parse_cn_index(body: &str) -> CnSentiment {
+    let mut out = CnSentiment::default();
+    for line in body.lines() {
+        let (Some(start), Some(end)) = (line.find('"'), line.rfind('"')) else {
+            continue;
+        };
+        if end <= start {
+            continue;
+        }
+        let fields: Vec<&str> = line[start + 1..end].split('~').collect();
+        // 腾讯 qt 接口字段顺序：1~名称~代码~现~昨开~今开~vol~0~0~...~0~0~~yyyyMMddHHmmss~涨跌额~涨跌幅%
+        // pct 在字段索引 30
+        if fields.len() <= 30 {
+            continue;
+        }
+        // pct 字段（索引 30）由腾讯直接给「涨跌幅（%）」，无需用现价/昨收重算
+        let pct = fields[30].parse::<f64>().ok();
+        match fields[2] {
+            "000001" => out.sh_pct = pct,
+            "399001" => out.sz_pct = pct,
+            "399006" => out.gem_pct = pct,
+            "000300" => out.hs300_pct = pct,
+            _ => {}
+        }
+    }
+    out
+}
+
+impl CnSentiment {
+    /// §A.10 大盘 beta 过滤分（应用到所有候选的全局 delta）：
+    ///
+    /// 三指数均值 ≤ -2.0  → -30「大盘大跌」、应暂停推荐
+    /// 三指数均值 ≤ -0.8  → -15「大盘偏弱」、所有短炒票加权
+    /// 三指数均值 ≥ +1.0  → +10「大盘偏多」
+    /// 其它区间           → 0
+    pub fn risk_score(&self) -> (f64, Option<String>) {
+        let values: Vec<f64> = [self.sh_pct, self.sz_pct, self.gem_pct, self.hs300_pct]
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        if values.is_empty() {
+            return (0.0, None);
+        }
+        let avg = values.iter().sum::<f64>() / values.len() as f64;
+        if avg <= -2.0 {
+            (-30.0, Some("大盘大跌".into()))
+        } else if avg <= -0.8 {
+            (-15.0, Some("大盘偏弱".into()))
+        } else if avg >= 1.0 {
+            (10.0, Some("大盘偏多".into()))
+        } else {
+            (0.0, None)
+        }
+    }
+
+    /// 大盘三指数均值（用于元数据透出）
+    pub fn avg_pct(&self) -> Option<f64> {
+        let values: Vec<f64> = [self.sh_pct, self.sz_pct, self.gem_pct, self.hs300_pct]
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.iter().sum::<f64>() / values.len() as f64)
+        }
+    }
+
+    /// §A.10 极端行情下应暂停推荐（返回 true）
+    pub fn should_pause(&self) -> bool {
+        self.avg_pct().map(|p| p <= -2.0).unwrap_or(false)
+    }
+}
+
+// ============================================================================
 // 板块动量（候选池行业聚合，零新增请求）与新闻关键词
 // ============================================================================
 
@@ -474,6 +743,160 @@ fn industry_momentum(
         .collect();
     let map = avgs.into_iter().collect();
     (map, strong)
+}
+
+fn select_diversified_candidates(
+    candidates: &[Candidate],
+    industry_avg: &HashMap<String, f64>,
+    cn_avg_pct: Option<f64>,
+    limit: usize,
+) -> Vec<Candidate> {
+    let defensive = cn_avg_pct.is_some_and(|pct| pct <= -0.8);
+    let (momentum_quota, relative_quota, pullback_quota) = if defensive {
+        (25usize, 40usize, 35usize)
+    } else {
+        (45usize, 30usize, 25usize)
+    };
+    let mut selected: Vec<Candidate> = Vec::with_capacity(limit);
+    let mut seen = std::collections::HashSet::new();
+    let push = |candidate: &Candidate,
+                source: &str,
+                selected: &mut Vec<Candidate>,
+                seen: &mut std::collections::HashSet<String>| {
+        if selected.len() >= limit || !seen.insert(candidate.code.clone()) {
+            return;
+        }
+        let mut candidate = candidate.clone();
+        if !candidate.pool_sources.iter().any(|item| item == source) {
+            candidate.pool_sources.push(source.to_string());
+        }
+        selected.push(candidate);
+    };
+
+    let mut momentum: Vec<&Candidate> = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .pool_sources
+                .iter()
+                .any(|source| source == "momentum")
+        })
+        .collect();
+    momentum.sort_by(|a, b| {
+        b.pct
+            .partial_cmp(&a.pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for candidate in momentum.into_iter().take(momentum_quota) {
+        push(candidate, "momentum", &mut selected, &mut seen);
+    }
+
+    let residual = |candidate: &Candidate| {
+        candidate.pct
+            - industry_avg
+                .get(&candidate.industry)
+                .copied()
+                .unwrap_or(0.0)
+    };
+    let mut relative: Vec<&Candidate> = candidates
+        .iter()
+        .filter(|candidate| residual(candidate) >= 0.5)
+        .collect();
+    relative.sort_by(|a, b| {
+        residual(b)
+            .partial_cmp(&residual(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for candidate in relative.into_iter().take(relative_quota) {
+        push(candidate, "relative_strength", &mut selected, &mut seen);
+    }
+
+    let mut pullback: Vec<&Candidate> = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .pool_sources
+                .iter()
+                .any(|source| source == "active")
+                && (-3.0..=3.0).contains(&candidate.pct)
+                && candidate
+                    .turnover_pct
+                    .is_some_and(|turnover| (1.0..=20.0).contains(&turnover))
+                && candidate
+                    .volume_ratio
+                    .is_none_or(|ratio| (0.6..=3.0).contains(&ratio))
+        })
+        .collect();
+    pullback.sort_by(|a, b| {
+        residual(b)
+            .partial_cmp(&residual(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for candidate in pullback.into_iter().take(pullback_quota) {
+        push(candidate, "pullback", &mut selected, &mut seen);
+    }
+
+    // 某一类样本不足时按残差强度递补，但不突破总上限。
+    let mut fallback: Vec<&Candidate> = candidates.iter().collect();
+    fallback.sort_by(|a, b| {
+        residual(b)
+            .partial_cmp(&residual(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for candidate in fallback {
+        push(candidate, "fallback", &mut selected, &mut seen);
+    }
+    selected
+}
+
+fn push_with_industry_cap(
+    picks: &mut Vec<(Candidate, f64, Vec<String>)>,
+    item: &(Candidate, f64, Vec<String>),
+    cap: usize,
+) -> bool {
+    if picks
+        .iter()
+        .any(|(candidate, _, _)| candidate.code == item.0.code)
+    {
+        return false;
+    }
+    if !item.0.industry.is_empty()
+        && picks
+            .iter()
+            .filter(|(candidate, _, _)| candidate.industry == item.0.industry)
+            .count()
+            >= cap
+    {
+        return false;
+    }
+    picks.push(item.clone());
+    true
+}
+
+fn push_with_risk_budget(
+    picks: &mut Vec<(Candidate, f64, Vec<String>)>,
+    item: &(Candidate, f64, Vec<String>),
+    cap: usize,
+    risk: &HashMap<String, StockRiskMetrics>,
+    portfolio_floor: f64,
+) -> bool {
+    let current_stress: f64 = picks
+        .iter()
+        .map(|(candidate, _, _)| {
+            risk.get(&candidate.code)
+                .map(|metrics| metrics.stress_loss_market_down_2pct)
+                .unwrap_or(portfolio_floor)
+        })
+        .sum();
+    let candidate_stress = risk
+        .get(&item.0.code)
+        .map(|metrics| metrics.stress_loss_market_down_2pct)
+        .unwrap_or(portfolio_floor);
+    let prospective_average = (current_stress + candidate_stress) / (picks.len() + 1) as f64;
+    if prospective_average < portfolio_floor {
+        return false;
+    }
+    push_with_industry_cap(picks, item, cap)
 }
 
 /// 半导体 / 电子类行业（纳指隔夜联动惩罚范围）。
@@ -548,8 +971,86 @@ fn news_keyword_score(
         }
     }
     let total = score.clamp(-25.0, 25.0);
-    let positive_tag = if pos_hit { Some("利好新闻".to_string()) } else { None };
+    let positive_tag = if pos_hit {
+        Some("利好新闻".to_string())
+    } else {
+        None
+    };
     (total, positive_tag, neg_tags, neg_signals)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CalendarHardBlock {
+    reason: String,
+    title: String,
+    published_date: String,
+    url: String,
+}
+
+/// §A.12 事件日历硬过滤。仅匹配已经发生或确定落地的事件措辞；
+/// “拟减持/减持计划”等意向性公告仍沿用软扣分，避免关键词误杀。
+fn calendar_hard_block(
+    items: &[crate::model::NewsItem],
+    as_of: NaiveDate,
+) -> Option<CalendarHardBlock> {
+    let cn = FixedOffset::east_opt(8 * 3600).expect("valid CN offset");
+    for item in items {
+        let event_date = item.published_at.with_timezone(&cn).date_naive();
+        let age = as_of.signed_duration_since(event_date).num_days();
+        if !(0..=7).contains(&age) {
+            continue;
+        }
+        let text = format!("{}{}", item.title, item.summary);
+        let reason = if ["被立案调查", "证监会立案", "立案告知书"]
+            .iter()
+            .any(|keyword| text.contains(keyword))
+        {
+            Some("监管立案")
+        } else if ["终止上市", "退市风险警示", "暂停上市"]
+            .iter()
+            .any(|keyword| text.contains(keyword))
+        {
+            Some("退市风险")
+        } else if ["限售股上市流通", "解除限售", "股份解禁"]
+            .iter()
+            .any(|keyword| text.contains(keyword))
+        {
+            Some("限售解禁")
+        } else if ["定增缴款", "定向增发缴款", "认购款缴纳"]
+            .iter()
+            .any(|keyword| text.contains(keyword))
+        {
+            Some("定增缴款")
+        } else if ["减持实施进展", "累计减持", "已减持", "减持完成"]
+            .iter()
+            .any(|keyword| text.contains(keyword))
+        {
+            Some("减持实施")
+        } else if ["停牌核查", "复牌公告", "股票复牌"]
+            .iter()
+            .any(|keyword| text.contains(keyword))
+            && age <= 1
+        {
+            Some("停复牌事件")
+        } else if (text.contains("业绩预告") || text.contains("业绩快报"))
+            && ["首亏", "续亏", "预亏", "大幅下降", "下修"]
+                .iter()
+                .any(|keyword| text.contains(keyword))
+        {
+            Some("业绩风险")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Some(CalendarHardBlock {
+                reason: reason.to_string(),
+                title: item.title.clone(),
+                published_date: event_date.format("%Y-%m-%d").to_string(),
+                url: item.url.clone(),
+            });
+        }
+    }
+    None
 }
 
 /// §A.6 主力资金净流入打分（净流入 / 万元）：
@@ -610,16 +1111,74 @@ pub fn main_net_score(main_net_wan: f64, pct_ratio: f64) -> (f64, Option<String>
 struct TagPerformance {
     samples: i64,
     win_rate: f64,
+    wilson_low: f64,
+    wilson_high: f64,
+    recent_samples: i64,
+    recent_win_rate: f64,
+    prior_samples: i64,
+    prior_win_rate: f64,
+    regime_scope: String,
 }
 
-/// 单标签调整：少于 30 样本不介入；30..60 样本线性增加置信度。
-/// 胜率 50% 为中性，单标签最多 ±10 分，防止小样本把技术分整体推翻。
-fn learned_tag_delta(samples: i64, win_rate: f64) -> f64 {
-    if samples < 30 || !win_rate.is_finite() {
+#[derive(Debug, Default, Clone, Copy)]
+struct TagWindowBucket {
+    recent_samples: i64,
+    recent_wins: i64,
+    prior_samples: i64,
+    prior_wins: i64,
+}
+
+impl TagWindowBucket {
+    fn performance(self, regime_scope: &str) -> TagPerformance {
+        let samples = self.recent_samples + self.prior_samples;
+        let wins = self.recent_wins + self.prior_wins;
+        let (wilson_low, wilson_high, _) = wilson_interval(samples, wins, 1.96);
+        TagPerformance {
+            samples,
+            win_rate: ratio(wins, samples),
+            wilson_low,
+            wilson_high,
+            recent_samples: self.recent_samples,
+            recent_win_rate: ratio(self.recent_wins, self.recent_samples),
+            prior_samples: self.prior_samples,
+            prior_win_rate: ratio(self.prior_wins, self.prior_samples),
+            regime_scope: regime_scope.to_string(),
+        }
+    }
+}
+
+fn ratio(hits: i64, samples: i64) -> f64 {
+    if samples > 0 {
+        hits as f64 / samples as f64
+    } else {
+        0.0
+    }
+}
+
+fn tag_performance_eligible(stat: &TagPerformance) -> bool {
+    stat.samples >= 30
+        && stat.recent_samples >= 8
+        && stat.prior_samples >= 12
+        && stat.win_rate.is_finite()
+        && (stat.recent_win_rate - stat.prior_win_rate).abs() <= 0.20
+}
+
+/// Walk-forward 单标签调整：较早训练窗与最近验证窗必须方向稳定。
+/// 正向边际取 Wilson 95% 下界、负向边际取上界；置信区间跨过 50% 时不调权。
+/// 单标签最多 ±10 分，防止标签历史覆盖当日硬风控。
+fn learned_tag_delta(stat: &TagPerformance) -> f64 {
+    if !tag_performance_eligible(stat) {
         return 0.0;
     }
-    let confidence = (samples as f64 / 60.0).clamp(0.5, 1.0);
-    ((win_rate.clamp(0.0, 1.0) - 0.5) * 40.0 * confidence).clamp(-10.0, 10.0)
+    let conservative_edge = if stat.wilson_low > 0.5 {
+        stat.wilson_low - 0.5
+    } else if stat.wilson_high < 0.5 {
+        stat.wilson_high - 0.5
+    } else {
+        0.0
+    };
+    let confidence = (stat.samples as f64 / 80.0).clamp(0.375, 1.0);
+    (conservative_edge * 40.0 * confidence).clamp(-10.0, 10.0)
 }
 
 /// 返回（总调整分，可解释证据 JSON）。总调整限制在 ±20 分。
@@ -633,7 +1192,7 @@ fn learned_score_adjustment(
         let Some(stat) = performance.get(tag) else {
             continue;
         };
-        let delta = learned_tag_delta(stat.samples, stat.win_rate);
+        let delta = learned_tag_delta(stat);
         if delta.abs() < 0.01 {
             continue;
         }
@@ -642,6 +1201,13 @@ fn learned_score_adjustment(
             "tag": tag,
             "samples": stat.samples,
             "win_rate": stat.win_rate,
+            "wilson_low": stat.wilson_low,
+            "wilson_high": stat.wilson_high,
+            "recent_samples": stat.recent_samples,
+            "recent_win_rate": stat.recent_win_rate,
+            "prior_samples": stat.prior_samples,
+            "prior_win_rate": stat.prior_win_rate,
+            "regime_scope": stat.regime_scope,
             "delta": delta,
         }));
     }
@@ -652,60 +1218,89 @@ fn learned_score_adjustment(
             "adjustment": adjustment,
             "tags": evidence,
             "minimum_samples": 30,
-            "lookback_days": 30,
+            "recent_minimum_samples": 8,
+            "prior_minimum_samples": 12,
+            "lookback_days": 120,
+            "validation_days": 30,
+            "outcome_basis": "t1_real",
+            "method": "walk_forward_wilson",
         }),
     )
 }
 
-/// 只使用推荐日之前的 T+1 结果，对齐“尾盘买、明日涨”的主目标，
-/// 并杜绝重跑当日推荐时的未来数据泄漏。
+/// 只使用推荐日之前、已经回写的真实成交口径 T+1 结果。
+/// 最近 30 个自然日作为验证窗，之前 90 日作为训练窗；当前市场环境样本不足时
+/// 逐标签回退到全市场统计，既避免未来泄漏，也避免 regime 小样本过拟合。
 async fn load_tag_performance(
     db: &SqlitePool,
     as_of: NaiveDate,
+    current_regime: Option<&str>,
 ) -> Result<HashMap<String, TagPerformance>, PickError> {
-    let since = (as_of - Duration::days(30)).format("%Y-%m-%d").to_string();
+    let since = (as_of - Duration::days(120)).format("%Y-%m-%d").to_string();
+    let validation_since = (as_of - Duration::days(30)).format("%Y-%m-%d").to_string();
     let before = as_of.format("%Y-%m-%d").to_string();
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT reasons, meta FROM daily_pick \
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT date, reasons, meta FROM daily_pick \
          WHERE date >= ? AND date < ? \
-         AND json_extract(meta,'$.outcome.t1_pct') IS NOT NULL",
+         AND json_extract(meta,'$.outcome.t1_real') IS NOT NULL",
     )
     .bind(&since)
     .bind(&before)
     .fetch_all(db)
     .await
     .unwrap_or_default();
-    let mut bucket: HashMap<String, (i64, i64)> = HashMap::new();
-    for (reasons, meta) in rows {
-        let t1 = serde_json::from_str::<Value>(&meta)
-            .ok()
-            .and_then(|m| m["outcome"]["t1_pct"].as_f64());
+    let mut global: HashMap<String, TagWindowBucket> = HashMap::new();
+    let mut by_regime: HashMap<String, HashMap<String, TagWindowBucket>> = HashMap::new();
+    for (date, reasons, meta) in rows {
+        let parsed = serde_json::from_str::<Value>(&meta).ok();
+        let t1 = parsed
+            .as_ref()
+            .and_then(|m| m["outcome"]["t1_real"].as_f64());
         let Some(t1) = t1 else { continue };
+        let regime = parsed
+            .as_ref()
+            .and_then(|m| m["cn"]["avg_pct"].as_f64())
+            .map(|avg| market_regime(avg).0.to_string());
+        let recent = date >= validation_since;
         let tags: Vec<String> = serde_json::from_str(&reasons).unwrap_or_default();
         for tag in tags {
-            let entry = bucket.entry(tag).or_insert((0, 0));
-            entry.0 += 1;
-            if t1 > 0.0 {
-                entry.1 += 1;
+            record_tag_outcome(global.entry(tag.clone()).or_default(), recent, t1 > 0.0);
+            if let Some(regime) = &regime {
+                record_tag_outcome(
+                    by_regime
+                        .entry(regime.clone())
+                        .or_default()
+                        .entry(tag)
+                        .or_default(),
+                    recent,
+                    t1 > 0.0,
+                );
             }
         }
     }
-    Ok(bucket
+    let regime_bucket = current_regime.and_then(|regime| by_regime.get(regime));
+    Ok(global
         .into_iter()
-        .map(|(tag, (samples, wins))| {
-            (
-                tag,
-                TagPerformance {
-                    samples,
-                    win_rate: if samples > 0 {
-                        wins as f64 / samples as f64
-                    } else {
-                        0.0
-                    },
-                },
-            )
+        .map(|(tag, bucket)| {
+            let global_stat = bucket.performance("all");
+            let chosen = regime_bucket
+                .and_then(|items| items.get(&tag).copied())
+                .map(|bucket| bucket.performance(current_regime.unwrap_or("all")))
+                .filter(tag_performance_eligible)
+                .unwrap_or(global_stat);
+            (tag, chosen)
         })
         .collect())
+}
+
+fn record_tag_outcome(bucket: &mut TagWindowBucket, recent: bool, won: bool) {
+    if recent {
+        bucket.recent_samples += 1;
+        bucket.recent_wins += i64::from(won);
+    } else {
+        bucket.prior_samples += 1;
+        bucket.prior_wins += i64::from(won);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -745,6 +1340,184 @@ impl From<sqlx::Error> for PickError {
 pub struct TechScore {
     pub score: f64,
     pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct StockRiskMetrics {
+    beta_60d: Option<f64>,
+    avg_amount_20d: Option<f64>,
+    max_drawdown_20d: Option<f64>,
+    expected_shortfall_10pct_20d: Option<f64>,
+    t1_reach_5pct_rate_20d: Option<f64>,
+    t1_reach_5pct_wilson_low: Option<f64>,
+    target_stable: bool,
+    return_5d: Option<f64>,
+    crowding_penalty: f64,
+    crowding_blocked: bool,
+    stress_loss_market_down_2pct: f64,
+    liquidity_blocked: bool,
+}
+
+const TARGET_NET_RETURN: f64 = 0.05;
+const TARGET_COST_BUFFER: f64 = 0.002;
+const BUY_ZONE_UPPER_BUFFER: f64 = 0.02;
+const SHADOW_EXPERIMENT_ID: &str = "target-stability-challenger-v1";
+const SHADOW_PROMOTION_DAYS: i64 = 20;
+const SHADOW_PROMOTION_SAMPLES: i64 = 30;
+
+fn close_returns_by_date(bars: &[DayBar]) -> HashMap<&str, f64> {
+    bars.windows(2)
+        .filter_map(|pair| {
+            let previous = pair[0].close;
+            (previous > 0.0).then_some((pair[1].date.as_str(), pair[1].close / previous - 1.0))
+        })
+        .collect()
+}
+
+fn estimate_beta(stock: &[DayBar], benchmark: &[DayBar]) -> Option<f64> {
+    let benchmark_returns = close_returns_by_date(benchmark);
+    let mut pairs: Vec<(f64, f64)> = stock
+        .windows(2)
+        .filter_map(|pair| {
+            let previous = pair[0].close;
+            if previous <= 0.0 {
+                return None;
+            }
+            benchmark_returns
+                .get(pair[1].date.as_str())
+                .map(|market_return| (pair[1].close / previous - 1.0, *market_return))
+        })
+        .collect();
+    if pairs.len() > 60 {
+        pairs.drain(..pairs.len() - 60);
+    }
+    if pairs.len() < 20 {
+        return None;
+    }
+    let stock_mean = pairs.iter().map(|(value, _)| value).sum::<f64>() / pairs.len() as f64;
+    let market_mean = pairs.iter().map(|(_, value)| value).sum::<f64>() / pairs.len() as f64;
+    let covariance = pairs
+        .iter()
+        .map(|(stock_return, market_return)| {
+            (stock_return - stock_mean) * (market_return - market_mean)
+        })
+        .sum::<f64>();
+    let market_variance = pairs
+        .iter()
+        .map(|(_, market_return)| (market_return - market_mean).powi(2))
+        .sum::<f64>();
+    (market_variance > f64::EPSILON).then_some(covariance / market_variance)
+}
+
+fn stock_risk_metrics(
+    bars: &[DayBar],
+    benchmark: &[DayBar],
+    turnover_pct: Option<f64>,
+    volume_ratio: Option<f64>,
+) -> StockRiskMetrics {
+    let recent_amounts: Vec<f64> = bars
+        .iter()
+        .rev()
+        .take(20)
+        .filter_map(|bar| (bar.amount > 0.0).then_some(bar.amount))
+        .collect();
+    // 某些降级行情源不返回成交额；样本不足时不误杀，只把指标标成未知。
+    let avg_amount_20d = (recent_amounts.len() >= 10)
+        .then(|| recent_amounts.iter().sum::<f64>() / recent_amounts.len() as f64);
+    let liquidity_blocked = avg_amount_20d.is_some_and(|amount| amount < 50_000_000.0)
+        || turnover_pct.is_some_and(|turnover| turnover < 0.5);
+    let recent: Vec<f64> = bars
+        .iter()
+        .rev()
+        .take(20)
+        .map(|bar| bar.close)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let max_drawdown_20d = if recent.len() >= 2 {
+        let mut peak = recent[0];
+        let mut drawdown = 0.0_f64;
+        for close in &recent {
+            peak = peak.max(*close);
+            if peak > 0.0 {
+                drawdown = drawdown.min((close - peak) / peak * 100.0);
+            }
+        }
+        Some(drawdown)
+    } else {
+        None
+    };
+    let mut returns: Vec<f64> = recent
+        .windows(2)
+        .filter_map(|pair| (pair[0] > 0.0).then_some((pair[1] / pair[0] - 1.0) * 100.0))
+        .collect();
+    returns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let expected_shortfall_10pct_20d = if returns.is_empty() {
+        None
+    } else {
+        let count = ((returns.len() as f64 * 0.1).ceil() as usize).max(1);
+        Some(returns[..count].iter().sum::<f64>() / count as f64)
+    };
+    let reach_samples: Vec<bool> = bars
+        .windows(2)
+        .rev()
+        .take(40)
+        .filter_map(|pair| {
+            (pair[0].close > 0.0).then_some(
+                pair[1].high / pair[0].close - 1.0
+                    >= (1.0 + BUY_ZONE_UPPER_BUFFER)
+                        * (1.0 + TARGET_NET_RETURN + TARGET_COST_BUFFER)
+                        - 1.0,
+            )
+        })
+        .collect();
+    let recent_count = reach_samples.len().min(20);
+    let recent_hits = reach_samples[..recent_count]
+        .iter()
+        .filter(|reached| **reached)
+        .count();
+    let prior = &reach_samples[recent_count..];
+    let prior_hits = prior.iter().filter(|reached| **reached).count();
+    let t1_reach_5pct_rate_20d = (recent_count == 20).then_some(recent_hits as f64 / 20.0);
+    let total_hits = recent_hits + prior_hits;
+    let t1_reach_5pct_wilson_low = (reach_samples.len() >= 39)
+        .then(|| wilson_interval(reach_samples.len() as i64, total_hits as i64, 1.96).0);
+    let target_stable = recent_count == 20
+        && prior.len() >= 19
+        && recent_hits >= 2
+        && prior_hits >= 2
+        && t1_reach_5pct_wilson_low.is_some_and(|lower| lower >= 0.05);
+    let beta_60d = estimate_beta(bars, benchmark);
+    let return_5d = (bars.len() >= 6 && bars[bars.len() - 6].close > 0.0).then(|| {
+        (bars.last().map(|bar| bar.close).unwrap_or(0.0) / bars[bars.len() - 6].close - 1.0) * 100.0
+    });
+    let overheated_turnover = turnover_pct.is_some_and(|turnover| turnover >= 20.0)
+        || volume_ratio.is_some_and(|ratio| ratio >= 2.5);
+    let crowding_blocked = return_5d.is_some_and(|value| value >= 25.0);
+    let crowding_penalty = if return_5d.is_some_and(|value| value >= 15.0) && overheated_turnover {
+        -15.0
+    } else if return_5d.is_some_and(|value| value >= 12.0) {
+        -8.0
+    } else {
+        0.0
+    };
+    let stress_loss_market_down_2pct =
+        (-2.0 * beta_60d.unwrap_or(1.0).max(0.5)).min(expected_shortfall_10pct_20d.unwrap_or(-3.0));
+    StockRiskMetrics {
+        beta_60d,
+        avg_amount_20d,
+        max_drawdown_20d,
+        expected_shortfall_10pct_20d,
+        t1_reach_5pct_rate_20d,
+        t1_reach_5pct_wilson_low,
+        target_stable,
+        return_5d,
+        crowding_penalty,
+        crowding_blocked,
+        stress_loss_market_down_2pct,
+        liquidity_blocked,
+    }
 }
 
 fn ema_series(values: &[f64], period: usize) -> Vec<f64> {
@@ -1014,7 +1787,12 @@ fn build_trade_plan(
             "next_day_open_positive",
         )
     } else if today_signal && before_close {
-        ("today_close", "今日尾盘", "14:45-14:57", "next_day_positive_close")
+        (
+            "today_close",
+            "今日尾盘",
+            "14:45-14:57",
+            "next_day_positive_close",
+        )
     } else {
         (
             "next_session_pullback",
@@ -1030,7 +1808,13 @@ fn build_trade_plan(
     };
     // §A.9 买入价区间：现价 ±2%；封板票以封板价 ±2% 作为次日开盘预期买入区
     // §A.9 卖出价区间：基于 T+1 历史均值 × 胜率因子 ±1.5%（无数据时按 1.5% 期望收益推算）
-    let (sell_price_low, sell_price_high) = sell_zone.unwrap_or((close * 1.012, close * 1.022));
+    let predicted_zone = sell_zone.unwrap_or((close * 1.012, close * 1.022));
+    // 用户目标是净盈利至少 5%；预留约 0.2% 手续费/滑点，并按买区上界计算，
+    // 避免在买区内较高价格成交后，展示的卖价仍达不到目标。
+    let profit_target_price =
+        round_price(buy_zone_high * (1.0 + TARGET_NET_RETURN + TARGET_COST_BUFFER));
+    let sell_price_low = predicted_zone.0.max(profit_target_price);
+    let sell_price_high = predicted_zone.1.max(sell_price_low * 1.01);
     serde_json::json!({
         "signal_date": date.format("%Y-%m-%d").to_string(),
         "target": "T+1",
@@ -1046,6 +1830,9 @@ fn build_trade_plan(
         "buy_price_high": round_price(buy_zone_high),
         "sell_price_low": round_price(sell_price_low),
         "sell_price_high": round_price(sell_price_high),
+        "profit_target_price": profit_target_price,
+        "target_return_pct": 5.0,
+        "target_cost_buffer_pct": 0.2,
         "buy_basis_close": round_price(close),
     })
 }
@@ -1055,17 +1842,110 @@ fn round_price(p: f64) -> f64 {
     (p * 100.0).round() / 100.0
 }
 
+fn classify_entry_validity(
+    open: f64,
+    buy_low: f64,
+    buy_high: f64,
+) -> Option<(&'static str, String)> {
+    if open <= 0.0 || buy_low <= 0.0 || buy_high <= 0.0 {
+        return None;
+    }
+    if open < buy_low {
+        Some((
+            "invalid_below",
+            format!("买入失效 · 开盘 {:.2} 跌破买区 {:.2}", open, buy_low),
+        ))
+    } else if open > buy_high * 1.02 {
+        Some((
+            "invalid_gap",
+            format!("买入失效 · 高开超买区上界，勿追（{:.2}）", open),
+        ))
+    } else {
+        Some(("valid", "开盘仍在可执行区间".into()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DynamicExitPlan {
+    sell_low: f64,
+    sell_high: f64,
+    risk_stop: f64,
+    open_strength: &'static str,
+    action: &'static str,
+    action_label: String,
+    target_reached: Option<bool>,
+}
+
+/// §A.14 动态卖出计划：盈利目标始终按真实执行成本计算；开盘弱只收窄上沿，
+/// 风险退出价单列，绝不把止损价包装成“盈利 5%”。
+fn dynamic_exit_plan(
+    signal_date: NaiveDate,
+    today: NaiveDate,
+    entry: f64,
+    reference_close: f64,
+    t1_open: Option<f64>,
+    t1_close: Option<f64>,
+    entry_status: Option<&str>,
+) -> Option<DynamicExitPlan> {
+    if entry <= 0.0 {
+        return None;
+    }
+    let gap = t1_open
+        .filter(|open| *open > 0.0 && reference_close > 0.0)
+        .map(|open| (open - reference_close) / reference_close * 100.0)
+        .unwrap_or(0.0);
+    let open_strength = if gap >= 1.5 {
+        "strong"
+    } else if gap <= -1.0 {
+        "weak"
+    } else {
+        "neutral"
+    };
+    let sell_low = round_price(entry * (1.0 + TARGET_NET_RETURN + TARGET_COST_BUFFER));
+    let upper_factor = match open_strength {
+        "strong" => 1.02,
+        "weak" => 1.005,
+        _ => 1.01,
+    };
+    let sell_high = round_price(sell_low * upper_factor);
+    let risk_stop = round_price(entry * 0.97);
+    let reached = t1_close.map(|close| close >= sell_low);
+    let (action, action_label) = if entry_status.is_some_and(|status| status.starts_with("invalid")) {
+        ("entry_invalid", "买入条件已失效，不应按计划追入".to_string())
+    } else if t1_close.is_some_and(|close| close < risk_stop) {
+        ("risk_exit", format!("跌破风险线 {:.2}，优先控制损失", risk_stop))
+    } else if reached == Some(true) {
+        ("take_profit", "已达到净5%目标，可分批止盈".to_string())
+    } else if today > signal_date && t1_close.is_some() {
+        ("t1_timeout", "T+1收盘仍未达目标，尾盘评估退出".to_string())
+    } else {
+        match open_strength {
+            "strong" => ("hold_strength", "强开，目标区内分批止盈".to_string()),
+            "weak" => (
+                "risk_control",
+                format!("弱开，反弹减仓；跌破 {:.2} 优先退出", risk_stop),
+            ),
+            _ => ("hold_neutral", "平开，按目标区分批处理".to_string()),
+        }
+    };
+    Some(DynamicExitPlan {
+        sell_low,
+        sell_high,
+        risk_stop,
+        open_strength,
+        action,
+        action_label,
+        target_reached: reached,
+    })
+}
+
 /// §A.9 卖出价区间计算器：基于该票近 30 天 outcome.t1_pct 均值与胜率。
 ///
 ///  sell_mid = close × (1 + avg_t1_pct × win_rate_factor)
 ///  win_rate_factor = max(0.5, observed_win_rate)  // 0.5 是「50% 期望收益」的下限
 ///  返回 (sell_low = sell_mid × 0.985, sell_high = sell_mid × 1.015)
 ///  样本 < 3 时 fallback：sell_mid = close × 1.012（市场平均 T+1 收益 1.2%）。
-pub async fn fetch_sell_zone(
-    db: &SqlitePool,
-    code: &str,
-    close: f64,
-) -> Option<(f64, f64)> {
+pub async fn fetch_sell_zone(db: &SqlitePool, code: &str, close: f64) -> Option<(f64, f64)> {
     if close <= 0.0 {
         return None;
     }
@@ -1134,7 +2014,10 @@ pub async fn fetch_previous_picks(
     // 取最近的 1 个有 outcome 的 date
     let latest: Option<(String,)> = sqlx::query_as(
         "SELECT date FROM daily_pick \
-         WHERE date >= ? AND json_extract(meta,'$.outcome.t1_pct') IS NOT NULL \
+         WHERE date >= ? AND (\
+            json_extract(meta,'$.outcome.t1_pct') IS NOT NULL OR \
+            json_extract(meta,'$.outcome.entry_open') IS NOT NULL\
+         ) \
          ORDER BY date DESC LIMIT 1",
     )
     .bind(&since)
@@ -1145,7 +2028,10 @@ pub async fn fetch_previous_picks(
     };
     let rows: Vec<(String, String, String, i64, String, Option<String>)> = sqlx::query_as(
         "SELECT date, code, name, rank, reasons, meta FROM daily_pick \
-         WHERE date = ? AND json_extract(meta,'$.outcome.t1_pct') IS NOT NULL \
+         WHERE date = ? AND (\
+            json_extract(meta,'$.outcome.t1_pct') IS NOT NULL OR \
+            json_extract(meta,'$.outcome.entry_open') IS NOT NULL\
+         ) \
          ORDER BY rank ASC",
     )
     .bind(&latest_date)
@@ -1161,26 +2047,60 @@ pub async fn fetch_previous_picks(
         let outcome = &meta["outcome"];
         let t1_pct = outcome["t1_pct"].as_f64();
         let t1_real_pct = outcome["t1_real"].as_f64();
-        let t1_open = outcome["t1_open_basis"].as_f64();
+        let t1_open = outcome["t1_open_basis"]
+            .as_f64()
+            .or_else(|| outcome["entry_open"].as_f64());
         let t1_close = outcome["t1_close"].as_f64();
         let entry_gap = outcome["entry_gap"].as_f64();
         let entry_timing = meta["plan"]["entry_timing"].as_str().map(String::from);
         let entry_label = meta["plan"]["entry_label"].as_str().map(String::from);
+        let calculated_entry = t1_open.and_then(|open| {
+            classify_entry_validity(
+                open,
+                meta["plan"]["buy_price_low"].as_f64().unwrap_or(0.0),
+                meta["plan"]["buy_price_high"].as_f64().unwrap_or(0.0),
+            )
+        });
+        let entry_status = outcome["entry_status"]
+            .as_str()
+            .map(String::from)
+            .or_else(|| {
+                calculated_entry
+                    .as_ref()
+                    .map(|(status, _)| (*status).into())
+            });
+        let entry_status_label = outcome["entry_status_label"]
+            .as_str()
+            .map(String::from)
+            .or_else(|| calculated_entry.map(|(_, label)| label));
         let reasons_vec: Vec<String> = serde_json::from_str(&reasons).unwrap_or_default();
-        // §A.9 卖出价区间
-        let (basis_price, basis_kind) = if matches!(entry_timing.as_deref(), Some("next_session_open")) {
-            if let Some(open) = t1_open {
-                (Some(open * 1.005), Some("actual_t1_open".to_string()))
-            } else {
-                (t1_close.or(close), Some("t1_close".to_string()))
-            }
+        // 可执行卖点以真实/计划买入成本为基准，禁止使用已经发生的 T+1 收盘价反推。
+        let basis_price = if matches!(entry_timing.as_deref(), Some("next_session_open")) {
+            t1_open.or(close)
         } else {
-            (t1_close.or(close), Some("t1_close".to_string()))
+            close
         };
-        let (sell_low, sell_high) = match basis_price {
-            Some(p) => (round_price(p * 0.985), round_price(p * 1.015)),
-            None => (0.0, 0.0),
-        };
+        let basis_kind = Some("actual_execution_5pct_target".to_string());
+        let signal_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d").unwrap_or(today);
+        let exit_plan = basis_price.and_then(|entry| {
+            dynamic_exit_plan(
+                signal_date,
+                today,
+                entry,
+                close.unwrap_or(entry),
+                t1_open,
+                t1_close,
+                if matches!(entry_timing.as_deref(), Some("today_close")) {
+                    None
+                } else {
+                    entry_status.as_deref()
+                },
+            )
+        });
+        let (sell_low, sell_high) = exit_plan
+            .as_ref()
+            .map(|plan| (plan.sell_low, plan.sell_high))
+            .unwrap_or((0.0, 0.0));
         out.push(crate::model::PreviousPick {
             date,
             code,
@@ -1193,15 +2113,285 @@ pub async fn fetch_previous_picks(
             t1_real_pct,
             entry_gap,
             sell_price_low: if sell_low > 0.0 { Some(sell_low) } else { None },
-            sell_price_high: if sell_high > 0.0 { Some(sell_high) } else { None },
+            sell_price_high: if sell_high > 0.0 {
+                Some(sell_high)
+            } else {
+                None
+            },
             sell_basis_price: basis_price,
             sell_basis_kind: basis_kind,
+            open_strength: exit_plan
+                .as_ref()
+                .map(|plan| plan.open_strength.to_string()),
+            sell_action: exit_plan.as_ref().map(|plan| plan.action.to_string()),
+            sell_action_label: exit_plan
+                .as_ref()
+                .map(|plan| plan.action_label.clone()),
+            risk_stop_price: exit_plan.as_ref().map(|plan| plan.risk_stop),
+            target_reached: exit_plan.as_ref().and_then(|plan| plan.target_reached),
             entry_timing,
             entry_label,
+            entry_status,
+            entry_status_label,
             reasons: reasons_vec,
         });
     }
     Ok(out)
+}
+
+/// §A.10 大盘极端行情下不出推荐时返回的轻量 PicksDocument：
+/// picks=[]、stats=默认、execute_hint=暂停提示、market.cn 透出大盘数据。
+async fn build_pause_document(
+    state: &AppState,
+    date: NaiveDate,
+    cn: Option<&CnSentiment>,
+    us: Option<&UsSentiment>,
+    hint: String,
+) -> PicksDocument {
+    let cn_value = cn.map(|c| {
+        serde_json::json!({
+            "sh_pct": c.sh_pct,
+            "sz_pct": c.sz_pct,
+            "gem_pct": c.gem_pct,
+            "hs300_pct": c.hs300_pct,
+            "avg_pct": c.avg_pct(),
+            "risk_score": c.risk_score().0,
+        })
+    });
+    let market = serde_json::json!({
+        "djia": us.and_then(|s| s.djia_pct),
+        "ixic": us.and_then(|s| s.ixic_pct),
+        "us": {
+            "djia": us.and_then(|s| s.djia_pct),
+            "ixic": us.and_then(|s| s.ixic_pct),
+        },
+        "cn": cn_value,
+    });
+    let previous_picks = fetch_previous_picks(&state.db, date)
+        .await
+        .unwrap_or_default();
+    PicksDocument {
+        date: date.format("%Y-%m-%d").to_string(),
+        picks: Vec::new(),
+        stats: PickStats::default(),
+        market,
+        execute_hint: hint,
+        previous_picks,
+    }
+}
+
+fn joint_market_should_pause(cn: Option<&CnSentiment>, us: Option<&UsSentiment>) -> bool {
+    let nasdaq_crash = us
+        .and_then(|item| item.ixic_pct)
+        .is_some_and(|pct| pct <= -1.5);
+    let cn_open_weak = cn
+        .and_then(CnSentiment::avg_pct)
+        .is_some_and(|pct| pct <= -1.0);
+    nasdaq_crash && cn_open_weak
+}
+
+async fn persist_pick_run(
+    db: &SqlitePool,
+    date: NaiveDate,
+    market: &Value,
+    execute_hint: &str,
+    paused: bool,
+    pause_source: Option<&str>,
+) -> Result<(), PickError> {
+    let date_key = date.format("%Y-%m-%d").to_string();
+    let pause_source = if paused {
+        pause_source.unwrap_or("unknown")
+    } else {
+        ""
+    };
+    let mut tx = db.begin().await?;
+    if paused {
+        // 同日重跑由正常清单切换为暂停时，必须移除旧票，避免 GET 再返回它们。
+        sqlx::query("DELETE FROM daily_pick WHERE date = ?")
+            .bind(&date_key)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(
+        "INSERT INTO daily_pick_run(date, market, execute_hint, paused, created_at, pause_source) \
+         VALUES(?,?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET \
+         market=excluded.market, execute_hint=excluded.execute_hint, \
+         paused=excluded.paused, created_at=excluded.created_at, \
+         pause_source=excluded.pause_source",
+    )
+    .bind(&date_key)
+    .bind(market.to_string())
+    .bind(execute_hint)
+    .bind(if paused { 1_i64 } else { 0_i64 })
+    .bind(Utc::now().timestamp_millis())
+    .bind(pause_source)
+    .execute(&mut *tx)
+    .await?;
+    if paused {
+        sqlx::query(
+            "INSERT OR IGNORE INTO pick_pause_audit(date, source, reason, active, created_at) \
+             VALUES(?,?,?,?,?)",
+        )
+        .bind(&date_key)
+        .bind(pause_source)
+        .bind(execute_hint)
+        .bind(1_i64)
+        .bind(Utc::now().timestamp_millis())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 人工安全阀必须位于所有行情、新闻和 AI 请求之前。设置表保存 JSON，
+/// 同时兼容历史客户端可能写入的字符串布尔值。
+async fn manual_pick_paused(db: &SqlitePool) -> Result<bool, PickError> {
+    let raw: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'smartPicksPaused'")
+            .fetch_optional(db)
+            .await?;
+    Ok(raw
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .is_some_and(|value| {
+            value.as_bool().unwrap_or_else(|| {
+                value
+                    .as_str()
+                    .is_some_and(|text| text.eq_ignore_ascii_case("true"))
+            })
+        }))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct IntradayConfirmation {
+    status: &'static str,
+    overlap_ratio: f64,
+    regime_changed: bool,
+    reason: String,
+}
+
+fn regime_key_from_market(market: &Value) -> Option<&'static str> {
+    market["cn"]["avg_pct"]
+        .as_f64()
+        .map(|avg| market_regime(avg).0)
+}
+
+fn compare_intraday_snapshots(
+    morning_codes: &[String],
+    morning_market: &Value,
+    tail_codes: &[String],
+    tail_market: &Value,
+) -> IntradayConfirmation {
+    let denominator = morning_codes.len().min(tail_codes.len());
+    let overlap = morning_codes
+        .iter()
+        .filter(|code| tail_codes.contains(code))
+        .count();
+    let overlap_ratio = if denominator > 0 {
+        overlap as f64 / denominator as f64
+    } else {
+        0.0
+    };
+    let morning_regime = regime_key_from_market(morning_market);
+    let tail_regime = regime_key_from_market(tail_market);
+    let regime_changed =
+        morning_regime.is_some() && tail_regime.is_some() && morning_regime != tail_regime;
+    let unstable = regime_changed || overlap_ratio < 0.4;
+    let reason = if regime_changed {
+        format!(
+            "盘中市场环境由 {} 变为 {}",
+            morning_regime.unwrap_or("unknown"),
+            tail_regime.unwrap_or("unknown")
+        )
+    } else if overlap_ratio < 0.4 {
+        format!("早盘与尾盘 Top 重合率仅 {:.0}%", overlap_ratio * 100.0)
+    } else {
+        format!("早盘与尾盘 Top 重合率 {:.0}%", overlap_ratio * 100.0)
+    };
+    IntradayConfirmation {
+        status: if unstable {
+            "observe_only"
+        } else {
+            "confirmed"
+        },
+        overlap_ratio,
+        regime_changed,
+        reason,
+    }
+}
+
+async fn persist_pick_snapshot(
+    db: &SqlitePool,
+    date: NaiveDate,
+    session: &str,
+    market: &Value,
+    codes: &[String],
+) -> Result<(), PickError> {
+    sqlx::query(
+        "INSERT INTO daily_pick_snapshot(date, session, market, picks, created_at) \
+         VALUES(?,?,?,?,?) ON CONFLICT(date,session) DO UPDATE SET \
+         market=excluded.market, picks=excluded.picks, created_at=excluded.created_at",
+    )
+    .bind(date.format("%Y-%m-%d").to_string())
+    .bind(session)
+    .bind(market.to_string())
+    .bind(serde_json::to_string(codes).unwrap_or_else(|_| "[]".into()))
+    .bind(Utc::now().timestamp_millis())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn load_pick_snapshot(
+    db: &SqlitePool,
+    date: NaiveDate,
+    session: &str,
+) -> Result<Option<(Value, Vec<String>)>, PickError> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT market, picks FROM daily_pick_snapshot WHERE date=? AND session=?")
+            .bind(date.format("%Y-%m-%d").to_string())
+            .bind(session)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.map(|(market, picks)| {
+        (
+            serde_json::from_str(&market).unwrap_or(Value::Null),
+            serde_json::from_str(&picks).unwrap_or_default(),
+        )
+    }))
+}
+
+fn current_pick_session(date: NaiveDate) -> &'static str {
+    let tz = FixedOffset::east_opt(8 * 3600).expect("valid UTC+8 offset");
+    let now_cn = Utc::now().with_timezone(&tz);
+    let minute = now_cn.hour() * 60 + now_cn.minute();
+    if date == now_cn.date_naive() && minute < 14 * 60 + 45 {
+        "morning"
+    } else {
+        "tail"
+    }
+}
+
+async fn consecutive_loss_days(
+    db: &SqlitePool,
+    before: NaiveDate,
+    required: usize,
+) -> Result<Vec<(String, f64)>, PickError> {
+    let rows: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT date, AVG(CAST(json_extract(meta,'$.outcome.t1_real') AS REAL)) AS portfolio_t1 \
+         FROM daily_pick WHERE date < ? \
+         AND json_extract(meta,'$.outcome.t1_real') IS NOT NULL \
+         GROUP BY date ORDER BY date DESC LIMIT ?",
+    )
+    .bind(before.format("%Y-%m-%d").to_string())
+    .bind(required as i64)
+    .fetch_all(db)
+    .await?;
+    if rows.len() == required && rows.iter().all(|(_, value)| *value < 0.0) {
+        Ok(rows)
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 /// 生成某基准日推荐。`ai` 为客户端透传配置（None = 纯量化，调度器路径）。
@@ -1211,7 +2401,60 @@ pub async fn generate_picks(
     date: NaiveDate,
     ai_config: Option<&AiRankConfig>,
 ) -> Result<PicksDocument, PickError> {
-    let learned_performance = load_tag_performance(&state.db, date).await?;
+    // §A.13 人工 Kill Switch：绝对优先级最高，且不得触发任何外部请求。
+    if manual_pick_paused(&state.db).await? {
+        let hint = "⏸ 已在设置中手动暂停智能推荐；关闭 Kill Switch 后方可恢复".to_string();
+        let mut doc = build_pause_document(state, date, None, None, hint).await;
+        doc.market["pause_source"] = Value::String("manual".into());
+        persist_pick_snapshot(
+            &state.db,
+            date,
+            current_pick_session(date),
+            &doc.market,
+            &[],
+        )
+        .await?;
+        persist_pick_run(
+            &state.db,
+            date,
+            &doc.market,
+            &doc.execute_hint,
+            true,
+            Some("manual"),
+        )
+        .await?;
+        return Ok(doc);
+    }
+    // §A.13 策略级熔断：大盘即使正常，最近 3 个已回写推荐日组合仍连续亏损时暂停。
+    let loss_days = consecutive_loss_days(&state.db, date, 3).await?;
+    if !loss_days.is_empty() {
+        let summary = loss_days
+            .iter()
+            .map(|(day, pct)| format!("{day} {pct:+.1}%"))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let hint = format!("⚠️ 策略连续 3 个推荐日亏损（{summary}），今日暂停推荐并进入观察期");
+        let mut doc = build_pause_document(state, date, None, None, hint).await;
+        doc.market["pause_source"] = Value::String("loss_streak".into());
+        persist_pick_snapshot(
+            &state.db,
+            date,
+            current_pick_session(date),
+            &doc.market,
+            &[],
+        )
+        .await?;
+        persist_pick_run(
+            &state.db,
+            date,
+            &doc.market,
+            &doc.execute_hint,
+            true,
+            Some("loss_streak"),
+        )
+        .await?;
+        return Ok(doc);
+    }
     let mut learned_meta: HashMap<String, Value> = HashMap::new();
     // 候选池：东财 push2 断连时切新浪榜（板块动量因子因无行业字段自动降级）
     let candidates = match state.pick_ranking.fetch(&state.http, 100).await {
@@ -1222,13 +2465,87 @@ pub async fn generate_picks(
             state.sina_ranking.fetch(&state.http, 100).await?
         }
     };
+    // §A.10 大盘 beta：拉上证/深成/创业板/沪深300 当日涨跌幅，三指数均值
+    //  ≤-2.0 视为极端行情——直接短路不出推荐，避免在系统性下跌日追涨杀跌。
+    let cn_sentiment: Option<CnSentiment> = state.cn_index.fetch(&state.http).await.ok();
+    let (cn_risk, cn_tag) = cn_sentiment
+        .as_ref()
+        .map(|s| s.risk_score())
+        .unwrap_or((0.0, None));
+    let us_sentiment: Option<UsSentiment> = state.us_index.fetch(&state.http).await.ok();
+    let joint_pause = joint_market_should_pause(cn_sentiment.as_ref(), us_sentiment.as_ref());
+    if cn_sentiment
+        .as_ref()
+        .map(|s| s.should_pause())
+        .unwrap_or(false)
+        || joint_pause
+    {
+        let avg = cn_sentiment
+            .as_ref()
+            .and_then(|s| s.avg_pct())
+            .unwrap_or(0.0);
+        let hint = if joint_pause && avg > -2.0 {
+            let ixic = us_sentiment
+                .as_ref()
+                .and_then(|item| item.ixic_pct)
+                .unwrap_or(0.0);
+            format!("📉 隔夜纳指 {ixic:+.2}% + A股大盘 {avg:+.2}%，联动闸门触发，今日暂停推荐")
+        } else {
+            format!("📉 大盘大跌（主流指数均值 {avg:+.2}%），今日暂停推荐；建议观望 1-2 个交易日")
+        };
+        tracing::warn!(avg_pct = avg, joint_pause, "市场风险闸门触发，今日暂停推荐");
+        // 返回空 picks + 在 market.cn 透出大盘数据 + execute_hint 给前端提示。
+        // 同时持久化「零推荐」运行快照，确保随后 GET /picks 不会回退到旧清单。
+        let pause_source = if joint_pause {
+            "joint_market"
+        } else {
+            "market_crash"
+        };
+        let mut doc = build_pause_document(
+            state,
+            date,
+            cn_sentiment.as_ref(),
+            us_sentiment.as_ref(),
+            hint,
+        )
+        .await;
+        doc.market["pause_source"] = Value::String(pause_source.into());
+        persist_pick_snapshot(
+            &state.db,
+            date,
+            current_pick_session(date),
+            &doc.market,
+            &[],
+        )
+        .await?;
+        persist_pick_run(
+            &state.db,
+            date,
+            &doc.market,
+            &doc.execute_hint,
+            true,
+            Some(pause_source),
+        )
+        .await?;
+        return Ok(doc);
+    }
+    let current_regime = cn_sentiment
+        .as_ref()
+        .and_then(CnSentiment::avg_pct)
+        .map(|avg| market_regime(avg).0);
+    let learned_performance = load_tag_performance(&state.db, date, current_regime).await?;
     if candidates.is_empty() {
         return Err(PickError::Parse("涨幅榜为空".into()));
     }
 
     // 板块动量（候选池行业聚合）+ 隔夜美股情绪（拉取失败只降级跳过）
     let (industry_avg, strong_industries) = industry_momentum(&candidates);
-    let us_sentiment: Option<UsSentiment> = state.us_index.fetch(&state.http).await.ok();
+    let candidates = select_diversified_candidates(
+        &candidates,
+        &industry_avg,
+        cn_sentiment.as_ref().and_then(CnSentiment::avg_pct),
+        100,
+    );
     let (us_mood, us_tag) = us_sentiment
         .as_ref()
         .map(|s| s.mood_score())
@@ -1238,11 +2555,38 @@ pub async fn generate_picks(
         .map(|s| s.semis_drag())
         .unwrap_or(false);
 
+    // §A.12 个股 beta：沪深300 作为统一基准；失败时降级为不施加 beta 权重。
+    let benchmark_bars = fetch_days_cached(state, "sh000300", 80)
+        .await
+        .unwrap_or_default();
+
     // ② 逐候选拉日 K（顺带落库 day_bar，给回测与复盘复用），300ms 间隔防限流
     let mut scored: Vec<(Candidate, TechScore)> = Vec::new();
+    let mut limit_up_strength_map: HashMap<String, LimitUpStrength> = HashMap::new();
+    let mut stock_risk_map: HashMap<String, StockRiskMetrics> = HashMap::new();
     for candidate in &candidates {
         match fetch_days_cached(state, &candidate.code, 120).await {
             Ok(bars) => {
+                let risk = stock_risk_metrics(
+                    &bars,
+                    &benchmark_bars,
+                    candidate.turnover_pct,
+                    candidate.volume_ratio,
+                );
+                let liquidity_blocked = risk.liquidity_blocked;
+                stock_risk_map.insert(candidate.code.clone(), risk);
+                if liquidity_blocked {
+                    tracing::debug!(code = %candidate.code, "candidate removed by liquidity floor");
+                    continue;
+                }
+                limit_up_strength_map.insert(
+                    candidate.code.clone(),
+                    classify_limit_up_strength(
+                        candidate,
+                        &bars,
+                        strong_industries.contains(&candidate.industry),
+                    ),
+                );
                 if let Some(tech) = score_bars(
                     &bars.iter().map(|b| b.close).collect::<Vec<_>>(),
                     &bars.iter().map(|b| b.high).collect::<Vec<_>>(),
@@ -1320,7 +2664,9 @@ pub async fn generate_picks(
             .unwrap_or_else(|| Utc::now().timestamp_millis())
     };
     let mut boosted: Vec<(Candidate, f64, Vec<String>)> = Vec::new();
+    let mut shadow_boosted: Vec<(Candidate, f64, Vec<String>)> = Vec::new();
     let mut negative_signals_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut calendar_exclusions: Vec<(String, CalendarHardBlock)> = Vec::new();
     // §A.9 卖出价区间：基于该票近 30 天 outcome.t1_pct 算 sell_zone_map / sell_zone_basis_map
     let mut sell_zone_map: HashMap<String, (f64, f64)> = HashMap::new();
     let mut sell_zone_basis_map: HashMap<String, Value> = HashMap::new();
@@ -1340,16 +2686,40 @@ pub async fn generate_picks(
             }),
         );
     }
-    for (candidate, tech) in &scored {
+    'candidate_loop: for (candidate, tech) in &scored {
         let mut score = tech.score;
         let mut tags = tech.tags.clone();
+        if candidate
+            .pool_sources
+            .iter()
+            .any(|source| source == "relative_strength")
+        {
+            tags.push("相对强势".into());
+        }
+        if candidate
+            .pool_sources
+            .iter()
+            .any(|source| source == "pullback")
+        {
+            tags.push("健康回调".into());
+        }
 
-        // 今日已涨停的票：T 日买不进，必须次日开盘才有成交。
-        // 不硬淘汰（好标的仍可保留），扣分 -5（弱惩罚），打「次日开盘」标签；
-        // build_trade_plan 会把 entry_label 强制改为「次日开盘 09:30-09:35」。
-        if candidate.is_limit_up {
-            score -= 5.0;
+        // §A.11 涨停不再统一视为正向证据：按连板、行业、换手/量能分档。
+        // 强板仅免扣分；中性 -5；弱板 -12，并把分档写入标签与 meta。
+        let is_limit_up_now = candidate.is_limit_up
+            || limit_up_realtime
+                .get(&candidate.code)
+                .copied()
+                .unwrap_or(false);
+        if is_limit_up_now {
+            let strength = limit_up_strength_map.get(&candidate.code);
+            score += strength.map(|item| item.score_delta).unwrap_or(-12.0);
             tags.push("次日开盘".into());
+            tags.push(match strength.map(|item| item.tier) {
+                Some("strong") => "强涨停".into(),
+                Some("neutral") => "涨停待观察".into(),
+                _ => "弱涨停".into(),
+            });
         }
 
         // 板块动量：强势行业 +15；行业均值 ≤0 减 10
@@ -1363,6 +2733,16 @@ pub async fn generate_picks(
         {
             score -= 10.0;
         }
+        // §A.11 截面去市场化：用个股涨幅减行业均值，避免把“随板块普涨”误判为个股强势。
+        let residual_pct = candidate.pct
+            - industry_avg
+                .get(&candidate.industry)
+                .copied()
+                .unwrap_or(0.0);
+        score += (residual_pct * 2.0).clamp(-10.0, 10.0);
+        if residual_pct >= 1.0 && !tags.iter().any(|tag| tag == "相对强势") {
+            tags.push("相对强势".into());
+        }
 
         // 隔夜美股：全局情绪 ±10；纳指跌超 1% 时半导体 / 电子类额外 −15
         score += us_mood;
@@ -1372,6 +2752,72 @@ pub async fn generate_picks(
         if semis_drag && is_tech_industry(&candidate.industry) {
             score -= 15.0;
             tags.push("隔夜纳指拖累".into());
+        }
+
+        // T+1 盈利 5% 是硬目标：近 20 个交易日从前收至次日最高至少有 2 次
+        // 达到 5.2%（含成本缓冲）才保留。缺足 20 日样本同样不进入可买清单。
+        let target_risk = stock_risk_map.get(&candidate.code);
+        let reach_rate = target_risk
+            .and_then(|risk| risk.t1_reach_5pct_rate_20d)
+            .unwrap_or(0.0);
+        let shadow_only = !target_risk.is_some_and(|risk| risk.target_stable);
+        if target_risk.is_some_and(|risk| risk.crowding_blocked) {
+            continue;
+        }
+        let lower = target_risk
+            .and_then(|risk| risk.t1_reach_5pct_wilson_low)
+            .unwrap_or(0.0);
+        let expected_shortfall = target_risk
+            .and_then(|risk| risk.expected_shortfall_10pct_20d)
+            .unwrap_or(-10.0);
+        let max_drawdown = target_risk
+            .and_then(|risk| risk.max_drawdown_20d)
+            .unwrap_or(-25.0);
+        if expected_shortfall < -8.0 || max_drawdown < -20.0 {
+            continue;
+        }
+        let downside_penalty = ((-expected_shortfall - 3.0).max(0.0) * 2.0).min(10.0)
+            + (-max_drawdown - 12.0).max(0.0).min(8.0);
+        if !shadow_only {
+            score += (lower * 40.0).clamp(0.0, 12.0);
+        }
+        score -= downside_penalty;
+        if let Some(risk) = target_risk {
+            score += risk.crowding_penalty;
+            if risk.crowding_penalty < 0.0 {
+                tags.push("短线拥挤".into());
+            }
+        }
+        if shadow_only {
+            tags.push("影子候选·5%稳定性待验证".into());
+        } else {
+            tags.push(format!(
+                "T+1达5%率{:.0}%·下界{:.0}%",
+                reach_rate * 100.0,
+                lower * 100.0
+            ));
+        }
+
+        // §A.12 偏空日优先低 beta：高 beta 额外扣分，低 beta 给小幅抗跌加分。
+        if cn_sentiment
+            .as_ref()
+            .and_then(CnSentiment::avg_pct)
+            .is_some_and(|avg| avg <= -0.8)
+        {
+            match stock_risk_map
+                .get(&candidate.code)
+                .and_then(|risk| risk.beta_60d)
+            {
+                Some(beta) if beta >= 1.3 => {
+                    score -= 15.0;
+                    tags.push("高Beta风险".into());
+                }
+                Some(beta) if beta <= 0.8 => {
+                    score += 6.0;
+                    tags.push("低Beta抗跌".into());
+                }
+                _ => {}
+            }
         }
 
         // §A.7 异动：实时校准 pct ≥ 阈值（主板 7 / 创业 17）→ 加「异常波动」标签
@@ -1413,6 +2859,16 @@ pub async fn generate_picks(
                 if let Err(error) = crate::service::ingest::persist_news(&state.db, &items).await {
                     tracing::warn!(code = %candidate.code, %error, "pick news persist failed");
                 }
+                if let Some(block) = calendar_hard_block(&items, date) {
+                    tracing::info!(
+                        code = %candidate.code,
+                        reason = %block.reason,
+                        title = %block.title,
+                        "candidate removed by calendar hard filter"
+                    );
+                    calendar_exclusions.push((candidate.code.clone(), block));
+                    continue 'candidate_loop;
+                }
                 let (news_score, positive_tag, neg_tags, neg_signals) = news_keyword_score(&items);
                 score += news_score;
                 if let Some(tag) = positive_tag {
@@ -1443,16 +2899,34 @@ pub async fn generate_picks(
                 tags.push(tag);
             }
         }
+        // §A.10 大盘 beta：所有候选统一扣分（避免系统性下跌日追涨杀跌）
+        score += cn_risk;
+        if let Some(tag) = &cn_tag {
+            tags.push(tag.clone());
+        }
         let (learned_adjustment, evidence) = learned_score_adjustment(&tags, &learned_performance);
         score += learned_adjustment;
         learned_meta.insert(candidate.code.clone(), evidence);
-        boosted.push((candidate.clone(), score, tags));
+        if shadow_only {
+            shadow_boosted.push((candidate.clone(), score, tags));
+        } else {
+            boosted.push((candidate.clone(), score, tags));
+        }
         tokio::time::sleep(StdDuration::from_millis(300)).await;
     }
     // 高胜率门槛：综合分 <60 不入选（宁缺毋滥，不足 5 只就少推）
     boosted.retain(|(_, score, _)| *score >= 60.0);
     boosted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     boosted.truncate(10);
+    shadow_boosted.retain(|(_, score, _)| *score >= 60.0);
+    shadow_boosted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut shadow_picks: Vec<(Candidate, f64, Vec<String>)> = Vec::new();
+    for item in &shadow_boosted {
+        if shadow_picks.len() >= 5 {
+            break;
+        }
+        push_with_risk_budget(&mut shadow_picks, item, 2, &stock_risk_map, -6.0);
+    }
 
     // ④ AI 精排：top10 喂给模型，出 top5 顺序；失败降级纯量化序
     let mut ai_order: Option<Vec<String>> = None;
@@ -1464,13 +2938,20 @@ pub async fn generate_picks(
     }
     let mut picks: Vec<(Candidate, f64, Vec<String>)> = Vec::new();
     if let Some(codes) = &ai_order {
+        let ai_score_floor = boosted.first().map(|item| item.1 - 5.0).unwrap_or(0.0);
         for code in codes {
             if picks.len() >= 5 {
                 break;
             }
             if let Some((candidate, score, tags)) = boosted.iter().find(|(c, _, _)| &c.code == code)
             {
-                picks.push((candidate.clone(), *score, tags.clone()));
+                if *score < ai_score_floor {
+                    continue;
+                }
+                let mut guarded_tags = tags.clone();
+                guarded_tags.push("AI量化共识".into());
+                let item = (candidate.clone(), *score, guarded_tags);
+                push_with_risk_budget(&mut picks, &item, 2, &stock_risk_map, -6.0);
             }
         }
     }
@@ -1479,13 +2960,34 @@ pub async fn generate_picks(
             if picks.len() >= 5 {
                 break;
             }
-            if picks.iter().any(|(c, _, _)| c.code == candidate.code) {
-                continue;
-            }
-            picks.push((candidate.clone(), *score, tags.clone()));
+            let item = (candidate.clone(), *score, tags.clone());
+            push_with_risk_budget(&mut picks, &item, 2, &stock_risk_map, -6.0);
         }
     }
     picks.truncate(5);
+    let final_industry_counts: HashMap<String, usize> =
+        picks
+            .iter()
+            .fold(HashMap::new(), |mut counts, (candidate, _, _)| {
+                if !candidate.industry.is_empty() {
+                    *counts.entry(candidate.industry.clone()).or_insert(0) += 1;
+                }
+                counts
+            });
+    let portfolio_stress_loss = if picks.is_empty() {
+        0.0
+    } else {
+        picks
+            .iter()
+            .map(|(candidate, _, _)| {
+                stock_risk_map
+                    .get(&candidate.code)
+                    .map(|risk| risk.stress_loss_market_down_2pct)
+                    .unwrap_or(-6.0)
+            })
+            .sum::<f64>()
+            / picks.len() as f64
+    };
 
     // §A.5.1 涨停二次校准已在候选池阶段完成（提前到 scored 之后），这里直接复用。
 
@@ -1499,6 +3001,15 @@ pub async fn generate_picks(
     let now_cn = Utc::now().with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap());
     let mut tx = state.db.begin().await?;
     sqlx::query("DELETE FROM daily_pick WHERE date = ?")
+        .bind(&date_key)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM daily_pick_shadow WHERE date = ? AND experiment_id = ?")
+        .bind(&date_key)
+        .bind(SHADOW_EXPERIMENT_ID)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM daily_pick_exclusion WHERE date = ? AND stage = 'calendar'")
         .bind(&date_key)
         .execute(&mut *tx)
         .await?;
@@ -1517,16 +3028,56 @@ pub async fn generate_picks(
             "pct": candidate.pct,
             "industry": candidate.industry,
             "industry_avg": industry_avg.get(&candidate.industry),
+            "residual_pct": candidate.pct - industry_avg.get(&candidate.industry).copied().unwrap_or(0.0),
+            "pool_sources": candidate.pool_sources.clone(),
+            "risk": stock_risk_map.get(&candidate.code).map(|risk| serde_json::json!({
+                "beta_60d": risk.beta_60d,
+                "avg_amount_20d": risk.avg_amount_20d,
+                "max_drawdown_20d": risk.max_drawdown_20d,
+                "expected_shortfall_10pct_20d": risk.expected_shortfall_10pct_20d,
+                "t1_reach_5pct_rate_20d": risk.t1_reach_5pct_rate_20d,
+                "t1_reach_5pct_wilson_low": risk.t1_reach_5pct_wilson_low,
+                "target_stable": risk.target_stable,
+                "return_5d": risk.return_5d,
+                "crowding_penalty": risk.crowding_penalty,
+                "crowding_blocked": risk.crowding_blocked,
+                "stress_loss_market_down_2pct": risk.stress_loss_market_down_2pct,
+                "liquidity_floor": 50_000_000.0,
+                "liquidity_blocked": risk.liquidity_blocked,
+            })),
+            "concentration": {
+                "industry": candidate.industry,
+                "count": final_industry_counts.get(&candidate.industry).copied().unwrap_or(1),
+                "cap": 2,
+            },
+            "portfolio_risk_budget": {
+                "stress_loss_market_down_2pct": portfolio_stress_loss,
+                "floor": -6.0,
+            },
             "is_limit_up": candidate.is_limit_up,
             "limit_up_realtime": limit_up_realtime
                 .get(&candidate.code)
                 .copied()
                 .unwrap_or(false),
             "limit_up_calibrated": limit_up_realtime.contains_key(&candidate.code),
+            "limit_up_strength": if plan_limit_up {
+                limit_up_strength_map.get(&candidate.code).and_then(|strength| serde_json::to_value(strength).ok())
+            } else {
+                None
+            },
             "us": {
                 "djia": us_sentiment.as_ref().and_then(|s| s.djia_pct),
                 "ixic": us_sentiment.as_ref().and_then(|s| s.ixic_pct),
             },
+            // §A.10 A 股大盘情绪（上证/深成/创业板/沪深300）透出
+            "cn": cn_sentiment.as_ref().map(|c| serde_json::json!({
+                "sh_pct": c.sh_pct,
+                "sz_pct": c.sz_pct,
+                "gem_pct": c.gem_pct,
+                "hs300_pct": c.hs300_pct,
+                "avg_pct": c.avg_pct(),
+                "risk_score": c.risk_score().0,
+            })),
             "main_net": main_net_map.get(&candidate.code).map(|s| serde_json::json!({
                 "main_net_wan": s.main_net_wan,
                 "super_net_wan": s.super_net_wan,
@@ -1585,16 +3136,142 @@ pub async fn generate_picks(
         .execute(&mut *tx)
         .await?;
     }
+    for (rank, (candidate, score, tags)) in shadow_picks.iter().enumerate() {
+        let realtime_limit_up = limit_up_realtime
+            .get(&candidate.code)
+            .copied()
+            .unwrap_or(candidate.is_limit_up);
+        let plan_limit_up = realtime_limit_up || candidate.is_limit_up;
+        let meta = serde_json::json!({
+            "experiment_id": SHADOW_EXPERIMENT_ID,
+            "status": "shadow",
+            "challenger_reason": "未通过生产版5%双窗口稳定性门槛",
+            "close": candidate.price,
+            "pct": candidate.pct,
+            "industry": candidate.industry,
+            "pool_sources": candidate.pool_sources.clone(),
+            "risk": stock_risk_map.get(&candidate.code).map(|risk| serde_json::json!({
+                "beta_60d": risk.beta_60d,
+                "max_drawdown_20d": risk.max_drawdown_20d,
+                "expected_shortfall_10pct_20d": risk.expected_shortfall_10pct_20d,
+                "t1_reach_5pct_rate_20d": risk.t1_reach_5pct_rate_20d,
+                "t1_reach_5pct_wilson_low": risk.t1_reach_5pct_wilson_low,
+                "target_stable": risk.target_stable,
+                "stress_loss_market_down_2pct": risk.stress_loss_market_down_2pct,
+            })),
+            "cn": cn_sentiment.as_ref().map(|c| serde_json::json!({
+                "avg_pct": c.avg_pct(),
+                "risk_score": c.risk_score().0,
+            })),
+            "auto_weight": learned_meta.get(&candidate.code).cloned(),
+            "promotion_criteria": {
+                "completed_days": SHADOW_PROMOTION_DAYS,
+                "samples": SHADOW_PROMOTION_SAMPLES,
+                "t1_real_wilson_low": 0.5,
+                "target_5pct_wilson_low": 0.05,
+            },
+            "plan": build_trade_plan(
+                date,
+                now_cn,
+                tags,
+                false,
+                plan_limit_up,
+                candidate.price,
+                sell_zone_map.get(&candidate.code).copied(),
+                candidate.price * 0.98,
+                candidate.price * 1.02,
+            ),
+        });
+        sqlx::query(
+            "INSERT INTO daily_pick_shadow(\
+                date, experiment_id, code, name, rank, score, reasons, meta, created_at\
+             ) VALUES(?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&date_key)
+        .bind(SHADOW_EXPERIMENT_ID)
+        .bind(&candidate.code)
+        .bind(&candidate.name)
+        .bind((rank + 1) as i64)
+        .bind(*score)
+        .bind(serde_json::to_string(tags).unwrap_or_else(|_| "[]".into()))
+        .bind(meta.to_string())
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await?;
+    }
+    for (code, block) in &calendar_exclusions {
+        sqlx::query(
+            "INSERT INTO daily_pick_exclusion(\
+                date, code, stage, reason, evidence, created_at\
+             ) VALUES(?, ?, 'calendar', ?, ?, ?)",
+        )
+        .bind(&date_key)
+        .bind(code)
+        .bind(&block.reason)
+        .bind(
+            serde_json::json!({
+                "title": block.title,
+                "published_date": block.published_date,
+                "url": block.url,
+            })
+            .to_string(),
+        )
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
-    let mut doc = list_picks(&state.db, Some(&date_key)).await?;
     // 执行时机：15:00 前生成 → 当天下午可买入；之后 → 次日开盘买入
     let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
     let now_cn = chrono::Utc::now().with_timezone(&tz);
-    doc.execute_hint = if now_cn.hour() < 15 {
+    let mut execute_hint = if now_cn.hour() < 15 {
         "当天下午可买入".to_string()
     } else {
         "次日开盘买入（次日开盘价可能高于推荐日收盘价）".to_string()
     };
+    let mut market = serde_json::json!({
+        // 顶层字段兼容 §A.10 前的客户端；新客户端读取 market.us / market.cn。
+        "djia": us_sentiment.as_ref().and_then(|s| s.djia_pct),
+        "ixic": us_sentiment.as_ref().and_then(|s| s.ixic_pct),
+        "us": {
+            "djia": us_sentiment.as_ref().and_then(|s| s.djia_pct),
+            "ixic": us_sentiment.as_ref().and_then(|s| s.ixic_pct),
+        },
+        "cn": cn_sentiment.as_ref().map(|c| serde_json::json!({
+            "sh_pct": c.sh_pct,
+            "sz_pct": c.sz_pct,
+            "gem_pct": c.gem_pct,
+            "hs300_pct": c.hs300_pct,
+            "avg_pct": c.avg_pct(),
+            "risk_score": c.risk_score().0,
+        })),
+    });
+    let session = current_pick_session(date);
+    let pick_codes: Vec<String> = picks
+        .iter()
+        .map(|(candidate, _, _)| candidate.code.clone())
+        .collect();
+    if session == "tail" {
+        if let Some((morning_market, morning_codes)) =
+            load_pick_snapshot(&state.db, date, "morning").await?
+        {
+            let confirmation =
+                compare_intraday_snapshots(&morning_codes, &morning_market, &pick_codes, &market);
+            market["confirmation"] = serde_json::json!({
+                "status": confirmation.status,
+                "overlap_ratio": confirmation.overlap_ratio,
+                "regime_changed": confirmation.regime_changed,
+                "reason": confirmation.reason.clone(),
+            });
+            if confirmation.status == "observe_only" {
+                execute_hint = format!("仅观察 · {}；不作为尾盘可执行清单", confirmation.reason);
+            }
+        }
+    }
+    persist_pick_snapshot(&state.db, date, session, &market, &pick_codes).await?;
+    persist_pick_run(&state.db, date, &market, &execute_hint, false, None).await?;
+    let mut doc = list_picks(&state.db, Some(&date_key)).await?;
+    doc.execute_hint = execute_hint;
     Ok(doc)
 }
 
@@ -1748,11 +3425,97 @@ pub fn confidence_bounds(samples: i64, hits: i64) -> (f64, f64, f64, bool) {
     (low, high, margin, samples_sufficient(samples))
 }
 
+async fn load_shadow_experiment_stats(
+    db: &SqlitePool,
+) -> Result<Vec<ShadowExperimentStat>, PickError> {
+    let rows: Vec<(String, i64, i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT experiment_id, \
+            COUNT(DISTINCT CASE WHEN json_extract(meta,'$.outcome.t1_real') IS NOT NULL THEN date END), \
+            COUNT(json_extract(meta,'$.outcome.t1_real')), \
+            COALESCE(SUM(CASE WHEN CAST(json_extract(meta,'$.outcome.t1_real') AS REAL) > 0 THEN 1 ELSE 0 END), 0), \
+            COUNT(json_extract(meta,'$.outcome.target_hit_5pct')), \
+            COALESCE(SUM(CASE WHEN json_extract(meta,'$.outcome.target_hit_5pct') = 1 THEN 1 ELSE 0 END), 0) \
+         FROM daily_pick_shadow GROUP BY experiment_id ORDER BY experiment_id",
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(experiment_id, completed_days, samples, wins, target_samples, target_hits)| {
+                let (win_low, _, _) = wilson_interval(samples, wins, 1.96);
+                let (target_low, _, _) = wilson_interval(target_samples, target_hits, 1.96);
+                let eligible = completed_days >= SHADOW_PROMOTION_DAYS
+                    && samples >= SHADOW_PROMOTION_SAMPLES
+                    && win_low >= 0.5
+                    && target_low >= 0.05;
+                let reason = if eligible {
+                    "样本外门槛已达标，等待人工审查后方可晋升".to_string()
+                } else {
+                    format!(
+                        "继续影子观察：{completed_days}/{SHADOW_PROMOTION_DAYS}日，\
+                         {samples}/{SHADOW_PROMOTION_SAMPLES}样本，胜率下界{:.0}%，5%达标下界{:.0}%",
+                        win_low * 100.0,
+                        target_low * 100.0
+                    )
+                };
+                ShadowExperimentStat {
+                    experiment_id,
+                    status: if eligible { "qualified" } else { "shadow" }.into(),
+                    completed_days,
+                    samples,
+                    t1_real_win_rate: ratio(wins, samples),
+                    t1_real_wilson_low: win_low,
+                    target_5pct_hit_rate: ratio(target_hits, target_samples),
+                    target_5pct_wilson_low: target_low,
+                    promotion_eligible: eligible,
+                    promotion_reason: reason,
+                }
+            },
+        )
+        .collect())
+}
+
+async fn load_hard_filter_stats(
+    db: &SqlitePool,
+    date: &str,
+) -> Result<Vec<HardFilterStat>, PickError> {
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT stage, reason, COUNT(*) FROM daily_pick_exclusion \
+         WHERE date=? GROUP BY stage, reason ORDER BY stage, reason",
+    )
+    .bind(date)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(stage, reason, count)| HardFilterStat {
+            stage,
+            reason,
+            count,
+        })
+        .collect())
+}
+
+pub fn market_regime(avg_pct: f64) -> (&'static str, &'static str) {
+    if avg_pct <= -2.0 {
+        ("crash", "急跌")
+    } else if avg_pct <= -0.8 {
+        ("bear", "偏空")
+    } else if avg_pct >= 0.8 {
+        ("bull", "偏多")
+    } else {
+        ("range", "震荡")
+    }
+}
+
 pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocument, PickError> {
     let date_key = match date {
         Some(d) => d.to_string(),
         None => {
-            let latest: Option<String> = sqlx::query_scalar("SELECT MAX(date) FROM daily_pick")
+            let latest: Option<String> = sqlx::query_scalar(
+                "SELECT MAX(date) FROM (SELECT date FROM daily_pick UNION ALL SELECT date FROM daily_pick_run)",
+            )
                 .fetch_one(db)
                 .await?;
             latest.unwrap_or_default()
@@ -1778,13 +3541,26 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
                 t5_samples_sufficient: false,
                 avg_t5_pct: 0.0,
                 tags: Vec::new(),
+                by_regime: Vec::new(),
                 execution: Default::default(),
+                shadow_experiments: load_shadow_experiment_stats(db).await.unwrap_or_default(),
+                hard_filter_exclusions: Vec::new(),
             },
             market: serde_json::Value::Null,
             execute_hint: String::new(),
             previous_picks: Vec::new(),
         });
     }
+    let run_snapshot: Option<(String, String, i64, String)> = sqlx::query_as(
+        "SELECT market, execute_hint, paused, pause_source FROM daily_pick_run WHERE date = ?",
+    )
+            .bind(&date_key)
+            .fetch_optional(db)
+            .await?;
+    let paused = run_snapshot
+        .as_ref()
+        .map(|(_, _, paused, _)| *paused != 0)
+        .unwrap_or(false);
     let rows: Vec<(String, String, String, i64, f64, String, String, String)> = sqlx::query_as(
         "SELECT date, code, name, rank, score, reasons, ai_note, meta FROM daily_pick \
          WHERE date = ? ORDER BY rank ASC",
@@ -1792,7 +3568,7 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     .bind(&date_key)
     .fetch_all(db)
     .await?;
-    let picks: Vec<DailyPick> = rows
+    let picks: Vec<DailyPick> = if paused { Vec::new() } else { rows }
         .into_iter()
         .map(
             |(date, code, name, rank, score, reasons, ai_note, meta)| DailyPick {
@@ -1826,11 +3602,10 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     let mut t5_win = 0.0;
     let mut t5_sum = 0.0;
     let mut t5_samples = 0_i64;
+    let mut regime_buckets: HashMap<String, (String, i64, i64, f64)> = HashMap::new();
     // §A.8 Wilson 95% 区间：避免「胜率 70% · 样本 10」被误读为稳定指标
-    let (mut t1_low, mut t1_high, mut t1_margin, mut t1_sufficient) =
-        confidence_bounds(0, 0);
-    let (mut t5_low, mut t5_high, mut t5_margin, mut t5_sufficient) =
-        confidence_bounds(0, 0);
+    let (mut t1_low, mut t1_high, mut t1_margin, mut t1_sufficient) = confidence_bounds(0, 0);
+    let (mut t5_low, mut t5_high, mut t5_margin, mut t5_sufficient) = confidence_bounds(0, 0);
     for meta in &outcomes {
         if let Ok(value) = serde_json::from_str::<Value>(meta) {
             if let Some(pct) = value["outcome"]["t1_pct"].as_f64() {
@@ -1838,6 +3613,20 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
                 t1_sum += pct;
                 if pct > 0.0 {
                     t1_win += 1.0;
+                }
+                if let Some(avg_pct) = value["cn"]["avg_pct"].as_f64() {
+                    let (regime, label) = market_regime(avg_pct);
+                    let entry = regime_buckets.entry(regime.to_string()).or_insert((
+                        label.to_string(),
+                        0,
+                        0,
+                        0.0,
+                    ));
+                    entry.1 += 1;
+                    if pct > 0.0 {
+                        entry.2 += 1;
+                    }
+                    entry.3 += pct;
                 }
             }
             if let Some(pct) = value["outcome"]["t5_pct"].as_f64() {
@@ -1905,10 +3694,28 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
         .collect();
     tag_stats.sort_by(|a, b| b.samples.cmp(&a.samples));
     tag_stats.truncate(6);
+    let mut by_regime = Vec::new();
+    for regime in ["bull", "range", "bear", "crash"] {
+        let Some((label, samples, wins, sum)) = regime_buckets.remove(regime) else {
+            continue;
+        };
+        let (low, high, margin, sufficient) = confidence_bounds(samples, wins);
+        by_regime.push(RegimeStat {
+            regime: regime.to_string(),
+            label,
+            samples,
+            win_rate: wins as f64 / samples as f64,
+            win_rate_low: low,
+            win_rate_high: high,
+            win_rate_margin: margin,
+            samples_sufficient: sufficient,
+            avg_t1_pct: sum / samples as f64,
+        });
+    }
 
     // 真实执行口径统计（从 meta.outcome 提取）
-    let exec_rows: Vec<String> = sqlx::query_scalar(
-        "SELECT meta FROM daily_pick \
+    let exec_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT date, meta FROM daily_pick \
          WHERE date >= ? AND json_extract(meta,'$.outcome.t1_real') IS NOT NULL",
     )
     .bind(&since)
@@ -1920,7 +3727,10 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     let mut dds: Vec<f64> = Vec::new();
     let mut wins: Vec<f64> = Vec::new();
     let mut losses: Vec<f64> = Vec::new();
-    for meta in &exec_rows {
+    let mut target_5pct_samples = 0_i64;
+    let mut target_5pct_hits = 0_i64;
+    let mut daily_execution: BTreeMap<String, (i64, f64, f64)> = BTreeMap::new();
+    for (date, meta) in &exec_rows {
         if let Ok(v) = serde_json::from_str::<Value>(meta) {
             let o = &v["outcome"];
             if let Some(g) = o["entry_gap"].as_f64() {
@@ -1933,9 +3743,21 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
                 } else {
                     losses.push(r);
                 }
+                if let Some(paper) = o["t1_pct"].as_f64() {
+                    let entry = daily_execution.entry(date.clone()).or_insert((0, 0.0, 0.0));
+                    entry.0 += 1;
+                    entry.1 += paper;
+                    entry.2 += r;
+                }
             }
             if let Some(d) = o["max_dd"].as_f64() {
                 dds.push(d);
+            }
+            if let Some(hit) = o["target_hit_5pct"].as_bool() {
+                target_5pct_samples += 1;
+                if hit {
+                    target_5pct_hits += 1;
+                }
             }
         }
     }
@@ -1949,6 +3771,48 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     };
     let real_hits = t1_reals.iter().filter(|r| **r > 0.0).count() as i64;
     let (real_low, real_high, real_margin, real_sufficient) = confidence_bounds(n, real_hits);
+    let (target_low, target_high, _) = wilson_interval(target_5pct_samples, target_5pct_hits, 1.96);
+    let mut paper_factor = 1.0_f64;
+    let mut open_factor = 1.0_f64;
+    let mut curve = Vec::new();
+    for (date, (samples, paper_sum, open_sum)) in daily_execution {
+        let paper = paper_sum / samples as f64;
+        let open = open_sum / samples as f64;
+        paper_factor *= 1.0 + paper / 100.0;
+        open_factor *= 1.0 + open / 100.0;
+        curve.push(crate::model::pick::ExecutionCurvePoint {
+            date,
+            samples,
+            paper_t1_pct: paper,
+            open_t1_pct: open,
+            paper_cumulative_pct: (paper_factor - 1.0) * 100.0,
+            open_cumulative_pct: (open_factor - 1.0) * 100.0,
+        });
+    }
+    if curve.len() > 20 {
+        curve.drain(..curve.len() - 20);
+    }
+    let execution_drag = if t1_samples > 0 && n > 0 {
+        t1_sum / t1_samples as f64 - avg(&t1_reals)
+    } else {
+        0.0
+    };
+    let execution_warning = n >= 5 && execution_drag >= 0.8;
+    let execution_hint = if execution_warning {
+        format!(
+            "次日开盘执行较纸面回测平均少 {execution_drag:.1} 个百分点，当前清单仅作观察，不按纸面胜率推断可执行收益"
+        )
+    } else {
+        String::new()
+    };
+    let mut sorted_reals = t1_reals.clone();
+    sorted_reals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let expected_shortfall_10 = if sorted_reals.is_empty() {
+        0.0
+    } else {
+        let count = ((sorted_reals.len() as f64 * 0.1).ceil() as usize).max(1);
+        avg(&sorted_reals[..count])
+    };
     let execution = crate::model::pick::ExecutionStats {
         avg_entry_gap: avg(&gaps),
         t1_real_win_rate: if n > 0 {
@@ -1961,7 +3825,19 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
         t1_real_win_rate_margin: real_margin,
         t1_real_samples_sufficient: real_sufficient,
         avg_t1_real: avg(&t1_reals),
+        avg_win: avg(&wins),
+        avg_loss: avg(&losses),
         avg_max_dd: avg(&dds),
+        max_drawdown: dds.iter().copied().reduce(f64::min).unwrap_or(0.0),
+        expected_shortfall_10,
+        target_5pct_samples,
+        target_5pct_hit_rate: if target_5pct_samples > 0 {
+            target_5pct_hits as f64 / target_5pct_samples as f64
+        } else {
+            0.0
+        },
+        target_5pct_wilson_low: target_low,
+        target_5pct_wilson_high: target_high,
         win_loss_ratio: {
             let w = avg(&wins);
             let l = avg(&losses).abs();
@@ -1973,21 +3849,48 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
                 0.0
             }
         },
+        curve,
+        execution_drag,
+        execution_warning,
+        execution_hint,
     };
 
-    // market 取首条 meta.us（生成时统一写入）
-    let market = picks
-        .first()
-        .and_then(|p| p.meta.get("us").cloned())
-        .unwrap_or(serde_json::Value::Null);
+    // 优先读取运行快照；兼容旧数据时再由首条 pick 的 meta 组装。
+    let mut market = run_snapshot
+        .as_ref()
+        .and_then(|(market, _, _, _)| serde_json::from_str::<Value>(market).ok())
+        .or_else(|| {
+            picks.first().map(|p| {
+                serde_json::json!({
+                    "djia": p.meta.get("us").and_then(|us| us.get("djia")).cloned().unwrap_or(Value::Null),
+                    "ixic": p.meta.get("us").and_then(|us| us.get("ixic")).cloned().unwrap_or(Value::Null),
+                    "us": p.meta.get("us").cloned().unwrap_or(Value::Null),
+                    "cn": p.meta.get("cn").cloned().unwrap_or(Value::Null),
+                })
+            })
+        })
+        .unwrap_or(Value::Null);
+    if let Some((_, _, true, source)) = run_snapshot
+        .as_ref()
+        .map(|(market, hint, paused, source)| (market, hint, *paused != 0, source))
+    {
+        if !source.is_empty() {
+            market["pause_source"] = Value::String(source.clone());
+        }
+    }
+    let execute_hint = run_snapshot
+        .as_ref()
+        .map(|(_, hint, _, _)| hint.clone())
+        .unwrap_or_default();
     let previous_picks = fetch_previous_picks(
         db,
-        NaiveDate::parse_from_str(&date_key, "%Y-%m-%d").unwrap_or_else(|_| Utc::now().date_naive()),
+        NaiveDate::parse_from_str(&date_key, "%Y-%m-%d")
+            .unwrap_or_else(|_| Utc::now().date_naive()),
     )
     .await
     .unwrap_or_default();
     Ok(PicksDocument {
-        date: date_key,
+        date: date_key.clone(),
         picks,
         stats: PickStats {
             samples: t1_samples,
@@ -2021,10 +3924,15 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
                 0.0
             },
             tags: tag_stats,
+            by_regime,
             execution,
+            shadow_experiments: load_shadow_experiment_stats(db).await.unwrap_or_default(),
+            hard_filter_exclusions: load_hard_filter_stats(db, &date_key)
+                .await
+                .unwrap_or_default(),
         },
         market,
-        execute_hint: String::new(),
+        execute_hint,
         previous_picks,
     })
 }
@@ -2043,6 +3951,10 @@ pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
          WHERE date >= ? AND date < ? AND (\
            json_extract(meta,'$.outcome.t1_pct') IS NULL OR \
            json_extract(meta,'$.outcome.entry_open') IS NULL OR \
+           (json_extract(meta,'$.plan.target_return_pct') IS NOT NULL AND \
+            json_extract(meta,'$.outcome.target_hit_5pct') IS NULL) OR \
+           (json_extract(meta,'$.plan.buy_price_low') IS NOT NULL AND \
+            json_extract(meta,'$.outcome.entry_status') IS NULL) OR \
            (date <= ? AND json_extract(meta,'$.outcome.t5_pct') IS NULL)\
          ) \
          ORDER BY date DESC",
@@ -2069,6 +3981,12 @@ pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
             .unwrap_or_default();
         let mut meta = meta;
         let base = meta["close"].as_f64().unwrap_or(bars[index].close);
+        let buy_low = meta["plan"]["buy_price_low"].as_f64().unwrap_or(0.0);
+        let buy_high = meta["plan"]["buy_price_high"].as_f64().unwrap_or(0.0);
+        let plan_entry_timing = meta["plan"]["entry_timing"]
+            .as_str()
+            .unwrap_or("next_session_open")
+            .to_string();
         if base <= 0.0 {
             continue;
         }
@@ -2095,16 +4013,57 @@ pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
         {
             let entry_open = bars[index + 1].open;
             if entry_open > 0.0 {
-                let gap = (entry_open - base) / base * 100.0;
+                let gap = if plan_entry_timing == "today_close" {
+                    0.0
+                } else {
+                    (entry_open - base) / base * 100.0
+                };
                 outcome_map.insert("entry_open".into(), serde_json::json!(entry_open));
                 outcome_map.insert("entry_gap".into(), serde_json::json!(gap));
                 changed = true;
             }
         }
-        let entry = outcome_map
-            .get("entry_open")
-            .and_then(Value::as_f64)
-            .unwrap_or(base);
+        let entry_open = outcome_map.get("entry_open").and_then(Value::as_f64);
+        if outcome_map
+            .get("entry_status")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            if let Some(open) = entry_open {
+                if let Some((status, label)) = classify_entry_validity(open, buy_low, buy_high) {
+                    outcome_map.insert("entry_status".into(), serde_json::json!(status));
+                    outcome_map.insert("entry_status_label".into(), serde_json::json!(label));
+                    changed = true;
+                }
+            }
+        }
+        let entry = if plan_entry_timing == "today_close" {
+            base
+        } else {
+            entry_open.unwrap_or(base)
+        };
+        if outcome_map
+            .get("target_hit_5pct")
+            .and_then(Value::as_bool)
+            .is_none()
+            && index + 1 < bars.len()
+        {
+            let high = bars[index + 1].high;
+            let target = entry * (1.0 + TARGET_NET_RETURN + TARGET_COST_BUFFER);
+            outcome_map.insert("execution_entry".into(), serde_json::json!(entry));
+            outcome_map.insert(
+                "execution_basis".into(),
+                serde_json::json!(if plan_entry_timing == "today_close" {
+                    "tail_close"
+                } else {
+                    "next_open"
+                }),
+            );
+            outcome_map.insert("t1_high".into(), serde_json::json!(high));
+            outcome_map.insert("target_price_5pct".into(), serde_json::json!(target));
+            outcome_map.insert("target_hit_5pct".into(), serde_json::json!(high >= target));
+            changed = true;
+        }
         if outcome_map.get("t1_pct").and_then(Value::as_f64).is_none() && index + 1 < bars.len() {
             let t1 = (bars[index + 1].close - base) / base * 100.0;
             let t1r = (bars[index + 1].close - entry) / entry * 100.0;
@@ -2138,6 +4097,90 @@ pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
             .bind(code)
             .execute(&state.db)
             .await?;
+        updated += 1;
+        tokio::time::sleep(StdDuration::from_millis(300)).await;
+    }
+    updated += backfill_shadow_outcomes(state, today).await?;
+    Ok(updated)
+}
+
+async fn backfill_shadow_outcomes(state: &AppState, today: NaiveDate) -> Result<usize, PickError> {
+    let since = (today - Duration::days(180)).format("%Y-%m-%d").to_string();
+    let today_key = today.format("%Y-%m-%d").to_string();
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT date, experiment_id, code FROM daily_pick_shadow \
+         WHERE date >= ? AND date < ? AND (\
+            json_extract(meta,'$.outcome.t1_real') IS NULL OR \
+            json_extract(meta,'$.outcome.target_hit_5pct') IS NULL\
+         ) ORDER BY date DESC",
+    )
+    .bind(&since)
+    .bind(&today_key)
+    .fetch_all(&state.db)
+    .await?;
+    let mut updated = 0usize;
+    for (date, experiment_id, code) in rows {
+        let Ok(bars) = fetch_days_cached(state, &code, 220).await else {
+            continue;
+        };
+        let Some(index) = bars.iter().position(|bar| bar.date == date) else {
+            continue;
+        };
+        if index + 1 >= bars.len() {
+            continue;
+        }
+        let raw: String = sqlx::query_scalar(
+            "SELECT meta FROM daily_pick_shadow \
+             WHERE date=? AND experiment_id=? AND code=?",
+        )
+        .bind(&date)
+        .bind(&experiment_id)
+        .bind(&code)
+        .fetch_one(&state.db)
+        .await?;
+        let mut meta: Value = serde_json::from_str(&raw).unwrap_or_default();
+        let base = meta["close"].as_f64().unwrap_or(bars[index].close);
+        if base <= 0.0 {
+            continue;
+        }
+        let timing = meta["plan"]["entry_timing"]
+            .as_str()
+            .unwrap_or("next_session_open");
+        let entry_open = bars[index + 1].open;
+        let entry = if timing == "today_close" || entry_open <= 0.0 {
+            base
+        } else {
+            entry_open
+        };
+        let t1_close = bars[index + 1].close;
+        let t1_high = bars[index + 1].high;
+        let target = entry * (1.0 + TARGET_NET_RETURN + TARGET_COST_BUFFER);
+        let outcome = serde_json::json!({
+            "entry_open": entry_open,
+            "execution_entry": entry,
+            "execution_basis": if timing == "today_close" { "tail_close" } else { "next_open" },
+            "t1_close": t1_close,
+            "t1_real": (t1_close - entry) / entry * 100.0,
+            "t1_high": t1_high,
+            "target_price_5pct": target,
+            "target_hit_5pct": t1_high >= target,
+        });
+        if !meta.is_object() {
+            meta = serde_json::json!({});
+        }
+        meta.as_object_mut()
+            .expect("shadow meta normalized")
+            .insert("outcome".into(), outcome);
+        sqlx::query(
+            "UPDATE daily_pick_shadow SET meta=? \
+             WHERE date=? AND experiment_id=? AND code=?",
+        )
+        .bind(meta.to_string())
+        .bind(&date)
+        .bind(&experiment_id)
+        .bind(&code)
+        .execute(&state.db)
+        .await?;
         updated += 1;
         tokio::time::sleep(StdDuration::from_millis(300)).await;
     }
@@ -2242,6 +4285,109 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
     }
 
     #[test]
+    fn overnight_and_cn_joint_gate_requires_both_legs() {
+        let us = UsSentiment {
+            djia_pct: Some(-1.0),
+            ixic_pct: Some(-1.6),
+        };
+        let weak_cn = CnSentiment {
+            sh_pct: Some(-1.0),
+            sz_pct: Some(-1.2),
+            gem_pct: Some(-1.1),
+            hs300_pct: Some(-1.0),
+        };
+        assert!(joint_market_should_pause(Some(&weak_cn), Some(&us)));
+
+        let flat_cn = CnSentiment {
+            sh_pct: Some(-0.3),
+            sz_pct: Some(-0.5),
+            gem_pct: Some(-0.4),
+            hs300_pct: Some(-0.2),
+        };
+        assert!(!joint_market_should_pause(Some(&flat_cn), Some(&us)));
+        assert!(!joint_market_should_pause(
+            Some(&weak_cn),
+            Some(&UsSentiment {
+                djia_pct: Some(-0.5),
+                ixic_pct: Some(-1.4),
+            })
+        ));
+    }
+
+    #[test]
+    fn intraday_confirmation_detects_regime_flip_and_low_overlap() {
+        let morning_codes = vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()];
+        let stable_tail = vec!["a".into(), "b".into(), "c".into(), "x".into(), "y".into()];
+        let range = serde_json::json!({"cn": {"avg_pct": 0.1}});
+        let stable = compare_intraday_snapshots(&morning_codes, &range, &stable_tail, &range);
+        assert_eq!(stable.status, "confirmed");
+        assert!((stable.overlap_ratio - 0.6).abs() < 1e-9);
+
+        let bear = serde_json::json!({"cn": {"avg_pct": -1.1}});
+        let flipped = compare_intraday_snapshots(&morning_codes, &range, &stable_tail, &bear);
+        assert_eq!(flipped.status, "observe_only");
+        assert!(flipped.regime_changed);
+
+        let unstable_tail = vec!["a".into(), "x".into(), "y".into(), "z".into(), "q".into()];
+        let unstable = compare_intraday_snapshots(&morning_codes, &range, &unstable_tail, &range);
+        assert_eq!(unstable.status, "observe_only");
+        assert!(!unstable.regime_changed);
+        assert!((unstable.overlap_ratio - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn beta_and_liquidity_metrics_are_bounded_by_available_data() {
+        let mut market_close = 100.0;
+        let mut stock_close = 50.0;
+        let mut market = Vec::new();
+        let mut stock = Vec::new();
+        for day in 0..31 {
+            if day > 0 {
+                let market_return = if day % 2 == 0 { 0.01 } else { -0.006 };
+                market_close *= 1.0 + market_return;
+                stock_close *= 1.0 + market_return * 2.0;
+            }
+            let date = format!("2026-08-{:02}", day + 1);
+            market.push(DayBar {
+                code: "sh000300".into(),
+                date: date.clone(),
+                open: market_close,
+                high: market_close,
+                low: market_close,
+                close: market_close,
+                volume: 1,
+                amount: 1_000_000_000.0,
+            });
+            stock.push(DayBar {
+                code: "sz000001".into(),
+                date,
+                open: stock_close,
+                high: stock_close,
+                low: stock_close,
+                close: stock_close,
+                volume: 1,
+                amount: 30_000_000.0,
+            });
+        }
+        let risk = stock_risk_metrics(&stock, &market, Some(1.2), Some(1.0));
+        assert!((risk.beta_60d.unwrap() - 2.0).abs() < 0.05);
+        assert_eq!(risk.avg_amount_20d, Some(30_000_000.0));
+        assert!(risk.max_drawdown_20d.unwrap() < 0.0);
+        assert!(risk.expected_shortfall_10pct_20d.unwrap() < 0.0);
+        assert!(risk.liquidity_blocked);
+
+        for bar in &mut stock {
+            bar.amount = 0.0;
+        }
+        let missing_amount = stock_risk_metrics(&stock, &market, None, None);
+        assert_eq!(missing_amount.avg_amount_20d, None);
+        assert!(
+            !missing_amount.liquidity_blocked,
+            "缺字段时应降级而不是误杀"
+        );
+    }
+
+    #[test]
     fn industry_momentum_marks_strong_and_weak() {
         let candidates: Vec<Candidate> = ["半导体", "半导体", "白酒", "银行"]
             .iter()
@@ -2255,6 +4401,9 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
                         pct: if *industry == "半导体" { 5.0 } else { -1.0 },
                         industry: industry.to_string(),
                         is_limit_up: false,
+                        turnover_pct: None,
+                        volume_ratio: None,
+                        pool_sources: vec!["momentum".into()],
                     },
                     Candidate {
                         code: format!("sz30001{i}"),
@@ -2263,6 +4412,9 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
                         pct: if *industry == "半导体" { 3.0 } else { 0.5 },
                         industry: industry.to_string(),
                         is_limit_up: false,
+                        turnover_pct: None,
+                        volume_ratio: None,
+                        pool_sources: vec!["momentum".into()],
                     },
                 ]
             })
@@ -2278,6 +4430,130 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
             avg.get("银行").copied().unwrap_or(0.0) < 0.0,
             "银行均值 ≤0 减分候选"
         );
+    }
+
+    #[test]
+    fn diversified_pool_includes_relative_strength_and_pullback() {
+        let make = |code: &str, pct: f64, industry: &str, source: &str| Candidate {
+            code: code.into(),
+            name: code.into(),
+            price: 10.0,
+            pct,
+            industry: industry.into(),
+            is_limit_up: false,
+            turnover_pct: Some(5.0),
+            volume_ratio: Some(1.2),
+            pool_sources: vec![source.into()],
+        };
+        let candidates = vec![
+            make("sh600001", 8.0, "热点", "momentum"),
+            make("sh600002", 2.0, "冷门", "active"),
+            make("sh600003", 1.0, "稳健", "active"),
+        ];
+        let industry_avg = HashMap::from([
+            ("热点".to_string(), 8.0),
+            ("冷门".to_string(), 0.0),
+            ("稳健".to_string(), 1.0),
+        ]);
+        let selected = select_diversified_candidates(&candidates, &industry_avg, Some(-1.0), 10);
+        assert_eq!(selected.len(), 3);
+        let relative = selected
+            .iter()
+            .find(|item| item.code == "sh600002")
+            .unwrap();
+        assert!(relative
+            .pool_sources
+            .iter()
+            .any(|item| item == "relative_strength"));
+        let pullback = selected
+            .iter()
+            .find(|item| item.code == "sh600003")
+            .unwrap();
+        assert!(pullback.pool_sources.iter().any(|item| item == "pullback"));
+    }
+
+    #[test]
+    fn industry_cap_rejects_third_pick_from_same_industry() {
+        let make = |code: &str, industry: &str| {
+            (
+                Candidate {
+                    code: code.into(),
+                    name: code.into(),
+                    price: 10.0,
+                    pct: 2.0,
+                    industry: industry.into(),
+                    is_limit_up: false,
+                    turnover_pct: Some(5.0),
+                    volume_ratio: Some(1.0),
+                    pool_sources: vec!["momentum".into()],
+                },
+                80.0,
+                vec!["放量".into()],
+            )
+        };
+        let mut picks = Vec::new();
+        assert!(push_with_industry_cap(&mut picks, &make("a", "半导体"), 2));
+        assert!(push_with_industry_cap(&mut picks, &make("b", "半导体"), 2));
+        assert!(!push_with_industry_cap(&mut picks, &make("c", "半导体"), 2));
+        assert!(push_with_industry_cap(&mut picks, &make("d", "银行"), 2));
+        assert_eq!(picks.len(), 3);
+    }
+
+    #[test]
+    fn limit_up_strength_separates_strong_and_weak_boards() {
+        let bars = vec![
+            DayBar {
+                code: "sh600001".into(),
+                date: "2026-09-22".into(),
+                open: 10.0,
+                high: 10.1,
+                low: 9.9,
+                close: 10.0,
+                volume: 100,
+                amount: 1_000.0,
+            },
+            DayBar {
+                code: "sh600001".into(),
+                date: "2026-09-23".into(),
+                open: 10.1,
+                high: 11.0,
+                low: 10.0,
+                close: 11.0,
+                volume: 200,
+                amount: 2_000.0,
+            },
+        ];
+        let strong_candidate = Candidate {
+            code: "sh600001".into(),
+            name: "强板".into(),
+            price: 12.1,
+            pct: 10.0,
+            industry: "半导体".into(),
+            is_limit_up: true,
+            turnover_pct: Some(8.0),
+            volume_ratio: Some(1.8),
+            pool_sources: vec!["momentum".into()],
+        };
+        let strong = classify_limit_up_strength(&strong_candidate, &bars, true);
+        assert_eq!(strong.tier, "strong");
+        assert_eq!(strong.score_delta, 0.0, "强板只免扣分，不再盲目加分");
+        assert_eq!(strong.prior_streak, 1);
+
+        let weak_candidate = Candidate {
+            code: "sh600002".into(),
+            name: "弱板".into(),
+            price: 11.0,
+            pct: 10.0,
+            industry: "冷门".into(),
+            is_limit_up: true,
+            turnover_pct: Some(0.5),
+            volume_ratio: Some(0.4),
+            pool_sources: vec!["momentum".into()],
+        };
+        let weak = classify_limit_up_strength(&weak_candidate, &bars[..1], false);
+        assert_eq!(weak.tier, "weak");
+        assert_eq!(weak.score_delta, -12.0);
+        assert_eq!(weak.prior_streak, 0);
     }
 
     #[test]
@@ -2357,33 +4633,81 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
 
     #[test]
     fn learned_weights_require_enough_samples_and_are_bounded() {
-        assert_eq!(learned_tag_delta(29, 1.0), 0.0, "30 样本前不调权");
-        assert!((learned_tag_delta(30, 0.7) - 4.0).abs() < 1e-9);
-        assert!((learned_tag_delta(60, 0.7) - 8.0).abs() < 1e-9);
-        assert_eq!(learned_tag_delta(100, 1.0), 10.0, "单标签上限 +10");
-        assert_eq!(learned_tag_delta(100, 0.0), -10.0, "单标签下限 -10");
+        let too_small = TagWindowBucket {
+            recent_samples: 8,
+            recent_wins: 8,
+            prior_samples: 11,
+            prior_wins: 11,
+        }
+        .performance("all");
+        assert_eq!(learned_tag_delta(&too_small), 0.0, "30 样本前不调权");
+
+        let stable_positive = TagWindowBucket {
+            recent_samples: 20,
+            recent_wins: 16,
+            prior_samples: 40,
+            prior_wins: 30,
+        }
+        .performance("range");
+        assert!(learned_tag_delta(&stable_positive) > 0.0);
+
+        let stable_negative = TagWindowBucket {
+            recent_samples: 20,
+            recent_wins: 4,
+            prior_samples: 40,
+            prior_wins: 10,
+        }
+        .performance("bear");
+        assert!(learned_tag_delta(&stable_negative) < 0.0);
+
+        let regime_flip = TagWindowBucket {
+            recent_samples: 10,
+            recent_wins: 2,
+            prior_samples: 30,
+            prior_wins: 24,
+        }
+        .performance("all");
+        assert_eq!(learned_tag_delta(&regime_flip), 0.0, "训练/验证翻转时禁用");
+
+        let all_wins = TagWindowBucket {
+            recent_samples: 40,
+            recent_wins: 40,
+            prior_samples: 80,
+            prior_wins: 80,
+        }
+        .performance("all");
+        assert_eq!(learned_tag_delta(&all_wins), 10.0, "单标签上限 +10");
 
         let performance = HashMap::from([
             (
                 "MACD金叉".to_string(),
-                TagPerformance {
-                    samples: 60,
-                    win_rate: 0.8,
-                },
+                TagWindowBucket {
+                    recent_samples: 30,
+                    recent_wins: 27,
+                    prior_samples: 70,
+                    prior_wins: 63,
+                }
+                .performance("range"),
             ),
             (
                 "放量".to_string(),
-                TagPerformance {
-                    samples: 80,
-                    win_rate: 0.9,
-                },
+                TagWindowBucket {
+                    recent_samples: 30,
+                    recent_wins: 28,
+                    prior_samples: 70,
+                    prior_wins: 65,
+                }
+                .performance("range"),
             ),
             (
                 "样本少".to_string(),
-                TagPerformance {
-                    samples: 12,
-                    win_rate: 1.0,
-                },
+                TagWindowBucket {
+                    recent_samples: 5,
+                    recent_wins: 5,
+                    prior_samples: 7,
+                    prior_wins: 7,
+                }
+                .performance("all"),
             ),
         ]);
         let tags = vec!["MACD金叉".into(), "放量".into(), "样本少".into()];
@@ -2395,6 +4719,74 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
             "样本不足不进证据"
         );
         assert_eq!(evidence["minimum_samples"], 30);
+        assert_eq!(evidence["method"], "walk_forward_wilson");
+        assert_eq!(evidence["outcome_basis"], "t1_real");
+    }
+
+    #[tokio::test]
+    async fn walk_forward_weights_exclude_future_and_prefer_current_regime() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE daily_pick(date TEXT, reasons TEXT, meta TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        async fn insert_samples(
+            db: &SqlitePool,
+            date: &str,
+            samples: usize,
+            won: bool,
+            avg_pct: f64,
+            real_outcome: bool,
+        ) {
+            for _ in 0..samples {
+                let outcome = if real_outcome {
+                    serde_json::json!({"t1_real": if won { 1.0 } else { -1.0 }})
+                } else {
+                    serde_json::json!({"t1_pct": if won { 1.0 } else { -1.0 }})
+                };
+                let meta = serde_json::json!({
+                    "cn": {"avg_pct": avg_pct},
+                    "outcome": outcome,
+                });
+                sqlx::query("INSERT INTO daily_pick(date, reasons, meta) VALUES(?, ?, ?)")
+                    .bind(date)
+                    .bind(r#"["MACD金叉"]"#)
+                    .bind(meta.to_string())
+                    .execute(db)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // 当前震荡环境：训练窗 22 + 验证窗 8，方向稳定且刚好达到介入门槛。
+        insert_samples(&db, "2026-07-10", 22, true, 0.0, true).await;
+        insert_samples(&db, "2026-09-10", 8, true, 0.0, true).await;
+        // 其他环境的失败样本不应污染当前震荡分层。
+        insert_samples(&db, "2026-07-10", 22, false, -1.0, true).await;
+        insert_samples(&db, "2026-09-10", 8, false, -1.0, true).await;
+        // as_of 之后即使已有值也必须排除；只有纸面 t1_pct、未回写 t1_real 也必须排除。
+        insert_samples(&db, "2026-10-01", 20, false, 0.0, true).await;
+        insert_samples(&db, "2026-09-10", 20, false, 0.0, false).await;
+
+        let stats = load_tag_performance(
+            &db,
+            NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+            Some("range"),
+        )
+        .await
+        .unwrap();
+        let stat = stats.get("MACD金叉").unwrap();
+        assert_eq!(stat.regime_scope, "range");
+        assert_eq!(stat.samples, 30);
+        assert_eq!(stat.recent_samples, 8);
+        assert_eq!(stat.prior_samples, 22);
+        assert_eq!(stat.win_rate, 1.0);
+        assert!(learned_tag_delta(stat) > 0.0);
     }
 
     #[test]
@@ -2418,13 +4810,13 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         assert_eq!(short["strategy"], "短线");
         assert_eq!(short["target"], "T+1");
         assert_eq!(short["entry_label"], "今日尾盘");
-        // §A.9 价格区间：close=10 套 ±2% → [9.80, 10.20]；无 sell_zone 数据 fallback 1.2%
+        // 买区 [9.80, 10.20]；卖价必须覆盖买区上界成交后的 5% 净目标。
         assert!((short["buy_price_low"].as_f64().unwrap() - 9.80).abs() < 1e-9);
         assert!((short["buy_price_high"].as_f64().unwrap() - 10.20).abs() < 1e-9);
         assert!((short["buy_basis_close"].as_f64().unwrap() - 10.00).abs() < 1e-9);
         let sell_low = short["sell_price_low"].as_f64().unwrap();
         let sell_high = short["sell_price_high"].as_f64().unwrap();
-        assert!(sell_low > 10.07 && sell_low < 10.18, "sell_low={sell_low}");
+        assert!((sell_low - 10.73).abs() < 0.02, "sell_low={sell_low}");
         assert!(sell_high > sell_low, "sell_high={sell_high}");
 
         let with_base = build_trade_plan(
@@ -2440,9 +4832,9 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         );
         assert_eq!(with_base["strategy"], "做T");
         assert_eq!(with_base["has_base_position"], true);
-        // sell_zone 显式提供时直接采纳
-        assert!((with_base["sell_price_low"].as_f64().unwrap() - 21.0).abs() < 1e-9);
-        assert!((with_base["sell_price_high"].as_f64().unwrap() - 21.5).abs() < 1e-9);
+        // 历史区间低于 5% 目标时自动抬升。
+        assert!((with_base["sell_price_low"].as_f64().unwrap() - 21.46).abs() < 0.02);
+        assert!((with_base["sell_price_high"].as_f64().unwrap() - 21.68).abs() < 0.02);
 
         let after_close = tz.with_ymd_and_hms(2026, 9, 22, 15, 10, 0).unwrap();
         let late = build_trade_plan(
@@ -2487,6 +4879,67 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
             42.84,
         );
         assert_eq!(locked_late["entry_label"], "次日开盘");
+    }
+
+    #[test]
+    fn entry_validity_rejects_breakdown_and_excessive_gap() {
+        assert_eq!(
+            classify_entry_validity(9.70, 9.80, 10.20).map(|(status, _)| status),
+            Some("invalid_below")
+        );
+        assert_eq!(
+            classify_entry_validity(10.50, 9.80, 10.20).map(|(status, _)| status),
+            Some("invalid_gap")
+        );
+        assert_eq!(
+            classify_entry_validity(10.25, 9.80, 10.20).map(|(status, _)| status),
+            Some("valid")
+        );
+    }
+
+    #[test]
+    fn dynamic_exit_separates_profit_target_from_risk_exit() {
+        let signal = NaiveDate::from_ymd_opt(2026, 9, 24).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 9, 25).unwrap();
+        let strong = dynamic_exit_plan(signal, today, 10.20, 10.0, Some(10.20), None, None)
+            .unwrap();
+        assert_eq!(strong.open_strength, "strong");
+        assert_eq!(strong.action, "hold_strength");
+        assert!((strong.sell_low - 10.73).abs() < 0.02);
+        assert!(strong.sell_high > strong.sell_low * 1.015);
+
+        let weak = dynamic_exit_plan(signal, today, 9.80, 10.0, Some(9.80), None, None).unwrap();
+        assert_eq!(weak.open_strength, "weak");
+        assert_eq!(weak.action, "risk_control");
+        assert!(weak.sell_high < weak.sell_low * 1.006);
+        assert!(weak.risk_stop < weak.sell_low);
+        assert!((weak.sell_low / 9.80 - 1.052).abs() < 0.002);
+
+        let breached = dynamic_exit_plan(
+            signal,
+            today,
+            10.0,
+            10.0,
+            Some(9.9),
+            Some(9.6),
+            None,
+        )
+        .unwrap();
+        assert_eq!(breached.action, "risk_exit");
+        assert_eq!(breached.target_reached, Some(false));
+
+        let timeout = dynamic_exit_plan(
+            signal,
+            today,
+            10.0,
+            10.0,
+            Some(10.0),
+            Some(10.2),
+            None,
+        )
+        .unwrap();
+        assert_eq!(timeout.action, "t1_timeout");
+        assert!(timeout.action_label.contains("T+1"));
     }
 
     #[test]
@@ -2604,6 +5057,34 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
     }
 
     #[test]
+    fn calendar_filter_blocks_realized_events_without_future_leakage() {
+        use chrono::TimeZone;
+        let cn = FixedOffset::east_opt(8 * 3600).unwrap();
+        let as_of = NaiveDate::from_ymd_opt(2026, 9, 25).unwrap();
+        let make = |title: &str, day: u32| crate::model::NewsItem {
+            code: "sz300623".into(),
+            title: title.into(),
+            summary: String::new(),
+            media: "交易所".into(),
+            url: "https://news.example.com/event".into(),
+            published_at: cn
+                .with_ymd_and_hms(2026, 9, day, 10, 0, 0)
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+
+        assert!(calendar_hard_block(&[make("股东减持计划公告", 25)], as_of).is_none());
+        let block = calendar_hard_block(&[make("股东累计减持达到1%", 24)], as_of).unwrap();
+        assert_eq!(block.reason, "减持实施");
+        assert!(calendar_hard_block(&[make("公司被证监会立案调查", 20)], as_of).is_some());
+        assert!(calendar_hard_block(&[make("限售股上市流通公告", 17)], as_of).is_none());
+        assert!(calendar_hard_block(&[make("公司股票复牌公告", 23)], as_of).is_none());
+        assert!(calendar_hard_block(&[make("公司股票复牌公告", 25)], as_of).is_some());
+        assert!(calendar_hard_block(&[make("业绩预告大幅下修并首亏", 24)], as_of).is_some());
+        assert!(calendar_hard_block(&[make("公司被证监会立案调查", 26)], as_of).is_none());
+    }
+
+    #[test]
     fn wilson_interval_brackets_and_zero_handling() {
         // 0/N 全部命中 → 区间下界 > 0
         let (low, high, margin) = wilson_interval(10, 10, 1.96);
@@ -2617,11 +5098,14 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         assert!(margin > 0.0);
 
         // 7/10 = 0.7 经典误读场景。Wilson 95% 实际给出约 (0.398, 0.892)——
-// 与「用 N 算 ±√(p(1-p)/N) ≈ 0.46」相比，区间偏窄但下界依旧低于 0.5。
+        // 与「用 N 算 ±√(p(1-p)/N) ≈ 0.46」相比，区间偏窄但下界依旧低于 0.5。
         let (low, high, _m) = wilson_interval(10, 7, 1.96);
         assert!(low < 0.45, "7/10 下界应 < 0.45：{low}");
         assert!(high > 0.85, "7/10 上界应 > 0.85：{high}");
-        assert!(low < 0.5, "下界应低于 0.5（说明 70% 胜率无统计意义）：{low}");
+        assert!(
+            low < 0.5,
+            "下界应低于 0.5（说明 70% 胜率无统计意义）：{low}"
+        );
 
         // 30 样本时区间收窄
         let (low30, high30, _) = wilson_interval(30, 21, 1.96);
@@ -2634,6 +5118,71 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         // 充分性阈值 = 30
         assert!(!samples_sufficient(29));
         assert!(samples_sufficient(30));
+    }
+
+    // §A.10 大盘情绪解析：四条指数 + risk_score 分档
+    #[test]
+    fn cn_index_parse_and_risk_score() {
+        // 真实接口字段顺序：[0]市场类型 [1]名称 [2]代码 [3..6]价格三件套
+        // pct 在字段索引 30。构造 31 字段，第 30 位为 pct。
+        fn build(code: &str, pct: f64) -> String {
+            let mut s = format!("v_x={}1~X~{}~100~100~100~vol", '"', code);
+            // 字段 7..29 (23 个零填充位)
+            for _ in 0..23 {
+                s.push_str("~0");
+            }
+            // 字段 30 = pct
+            s.push_str(&format!("~{pct}{}", '"'));
+            s
+        }
+        let body = format!(
+            "{}\n{}\n{}\n{}\n",
+            build("000001", -2.05),
+            build("399001", -2.10),
+            build("399006", -2.30),
+            build("000300", -2.15),
+        );
+        let cn = parse_cn_index(&body);
+        assert!(
+            cn.sh_pct.is_some(),
+            "sh_pct 应解析：{:?} / body={body}",
+            cn.sh_pct
+        );
+        assert!((cn.sh_pct.unwrap() - (-2.05)).abs() < 0.001);
+        let avg = cn.avg_pct().unwrap();
+        assert!(avg < -2.0, "avg 应 < -2.0：{avg}");
+        assert!(cn.should_pause(), "三指数均值 ≤ -2.0 应暂停");
+        let (delta, tag) = cn.risk_score();
+        assert_eq!(delta, -30.0, "≤-2% 应打 -30：{delta}");
+        assert_eq!(tag.as_deref(), Some("大盘大跌"));
+    }
+
+    #[test]
+    fn cn_index_risk_score_tiers() {
+        // -1% 区间 → -15 偏弱
+        let cn = CnSentiment {
+            sh_pct: Some(-1.0),
+            sz_pct: Some(-1.0),
+            gem_pct: Some(-1.0),
+            hs300_pct: Some(-1.0),
+        };
+        let (d, t) = cn.risk_score();
+        assert_eq!(d, -15.0);
+        assert_eq!(t.as_deref(), Some("大盘偏弱"));
+        // +1.2% → +10 偏多
+        let cn = CnSentiment {
+            sh_pct: Some(1.2),
+            sz_pct: Some(1.0),
+            gem_pct: Some(1.5),
+            hs300_pct: Some(1.0),
+        };
+        let (d, t) = cn.risk_score();
+        assert_eq!(d, 10.0);
+        assert_eq!(t.as_deref(), Some("大盘偏多"));
+        // 全空 → 0
+        let cn = CnSentiment::default();
+        assert_eq!(cn.risk_score(), (0.0, None));
+        assert_eq!(cn.avg_pct(), None);
     }
 
     #[test]

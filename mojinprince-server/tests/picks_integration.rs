@@ -46,6 +46,122 @@ async fn fresh_state() -> AppState {
     state
 }
 
+fn tencent_cn_line(code: &str, pct: f64) -> String {
+    let mut line = format!("v_x=\"1~X~{code}~100~100~100~vol");
+    for _ in 0..23 {
+        line.push_str("~0");
+    }
+    line.push_str(&format!("~{pct}\";"));
+    line
+}
+
+#[actix_web::test]
+async fn market_crash_pause_persists_for_followup_get() {
+    let upstream = MockServer::start();
+    upstream.mock(|when, then| {
+        when.method(GET).path("/api/qt/clist/get");
+        then.status(200).json_body(json!({
+            "data": {"diff": [
+                {"f12": "300623", "f14": "捷捷微电", "f2": 35.11, "f3": 2.8, "f100": "半导体"}
+            ]}
+        }));
+    });
+    let cn_body = [
+        tencent_cn_line("000001", -2.1),
+        tencent_cn_line("399001", -2.3),
+        tencent_cn_line("399006", -2.6),
+        tencent_cn_line("000300", -2.2),
+    ]
+    .join("\n");
+    upstream.mock(|when, then| {
+        when.method(GET)
+            .path("/q=sh000001,sz399001,sz399006,sh000300");
+        then.status(200).body(cn_body);
+    });
+
+    let mut state = fresh_state().await;
+    state.pick_ranking.base_url = upstream.base_url();
+    state.cn_index.base_url = upstream.base_url();
+    state.us_index.base_url = upstream.base_url();
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::pick::configure)),
+    )
+    .await;
+
+    let paused: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/picks/run")
+            .to_request(),
+    )
+    .await;
+    assert!(paused["picks"].as_array().unwrap().is_empty(), "{paused}");
+    assert!(paused["execute_hint"]
+        .as_str()
+        .unwrap()
+        .contains("暂停推荐"));
+    assert!(paused["market"]["cn"]["avg_pct"].as_f64().unwrap() <= -2.0);
+
+    let listed: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get().uri("/api/v1/picks").to_request(),
+    )
+    .await;
+    assert_eq!(listed["date"], paused["date"]);
+    assert!(listed["picks"].as_array().unwrap().is_empty(), "{listed}");
+    assert!(listed["execute_hint"]
+        .as_str()
+        .unwrap()
+        .contains("暂停推荐"));
+    assert_eq!(listed["market"]["cn"], paused["market"]["cn"]);
+}
+
+#[actix_web::test]
+async fn three_consecutive_losing_pick_days_pause_before_network() {
+    let state = fresh_state().await;
+    for (index, date) in ["2026-09-20", "2026-09-21", "2026-09-22"]
+        .iter()
+        .enumerate()
+    {
+        sqlx::query(
+            "INSERT INTO daily_pick(date, code, name, rank, score, reasons, ai_note, meta, created_at) \
+             VALUES(?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(*date)
+        .bind(format!("sz30060{index}"))
+        .bind("连亏样本")
+        .bind(1_i64)
+        .bind(80.0)
+        .bind("[]")
+        .bind("")
+        .bind(json!({"outcome": {"t1_real": -1.0 - index as f64}}).to_string())
+        .bind(0_i64)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::pick::configure)),
+    )
+    .await;
+    let doc: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/picks/run")
+            .to_request(),
+    )
+    .await;
+    assert!(doc["picks"].as_array().unwrap().is_empty(), "{doc}");
+    assert!(doc["execute_hint"]
+        .as_str()
+        .unwrap()
+        .contains("连续 3 个推荐日亏损"));
+}
+
 /// 40 根健康上行日 K（隔日 +0.21/−0.14 → RSI≈60、尾部放量）。
 fn zigzag_bars() -> Vec<Value> {
     let mut bars = Vec::new();
@@ -57,7 +173,7 @@ fn zigzag_bars() -> Vec<Value> {
             date,
             (close - 0.05) as f64,
             close,
-            close + 0.15,
+            close + 1.00,
             close - 0.15,
             volume
         ]));
@@ -307,6 +423,7 @@ async fn backfill_writes_outcome_and_stats() {
     let t5 = (t5_close - base_close) / base_close * 100.0;
     assert!((meta["outcome"]["t1_pct"].as_f64().unwrap() - t1).abs() < 1e-9);
     assert!((meta["outcome"]["t5_pct"].as_f64().unwrap() - t5).abs() < 1e-9);
+    assert_eq!(meta["outcome"]["target_hit_5pct"], true);
 
     // 统计：主口径 T+1，同时保留 T+5 中线参考。
     let doc = service::pick::list_picks(&state.db, Some(&pick_date))
@@ -317,7 +434,79 @@ async fn backfill_writes_outcome_and_stats() {
     assert!((doc.stats.avg_t1_pct - t1).abs() < 1e-9);
     assert_eq!(doc.stats.t5_samples, 1);
     assert!(doc.stats.t5_win_rate > 0.99);
+    assert_eq!(doc.stats.execution.target_5pct_samples, 1);
+    assert!(doc.stats.execution.target_5pct_hit_rate > 0.99);
     assert!((doc.stats.avg_t5_pct - t5).abs() < 1e-9);
+}
+
+#[actix_web::test]
+async fn shadow_pick_isolated_from_production_and_backfilled() {
+    let upstream = MockServer::start();
+    upstream.mock(|when, then| {
+        when.method(GET).path("/appstock/app/fqkline/get");
+        then.status(200).json_body(json!({
+            "data": {"sz300623": {"qfqday": zigzag_bars()}}
+        }));
+    });
+    let bars = zigzag_bars();
+    let pick_date = bars[31][0].as_str().unwrap().to_string();
+    let base_close = bars[31][2].as_f64().unwrap();
+    let mut state = fresh_state().await;
+    state.day_k.base_url = upstream.base_url();
+    sqlx::query(
+        "INSERT INTO daily_pick_shadow(\
+            date, experiment_id, code, name, rank, score, reasons, meta, created_at\
+         ) VALUES(?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(&pick_date)
+    .bind("target-stability-challenger-v1")
+    .bind("sz300623")
+    .bind("捷捷微电")
+    .bind(1)
+    .bind(75.0)
+    .bind(r#"["影子候选·5%稳定性待验证"]"#)
+    .bind(
+        json!({
+            "close": base_close,
+            "status": "shadow",
+            "plan": {"entry_timing": "today_close"}
+        })
+        .to_string(),
+    )
+    .bind(0)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let updated = service::pick::backfill_outcomes(&state).await.unwrap();
+    assert_eq!(updated, 1);
+    let production_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM daily_pick")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(production_count, 0, "影子候选不得进入正式推荐表");
+    let meta: String = sqlx::query_scalar(
+        "SELECT meta FROM daily_pick_shadow \
+         WHERE date=? AND experiment_id='target-stability-challenger-v1' AND code='sz300623'",
+    )
+    .bind(&pick_date)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    let meta: Value = serde_json::from_str(&meta).unwrap();
+    assert!(meta["outcome"]["t1_real"].as_f64().is_some());
+    assert!(meta["outcome"]["target_hit_5pct"].as_bool().is_some());
+
+    let doc = service::pick::list_picks(&state.db, Some(&pick_date))
+        .await
+        .unwrap();
+    assert!(doc.picks.is_empty());
+    assert_eq!(doc.stats.shadow_experiments.len(), 1);
+    let shadow = &doc.stats.shadow_experiments[0];
+    assert_eq!(shadow.status, "shadow");
+    assert_eq!(shadow.completed_days, 1);
+    assert_eq!(shadow.samples, 1);
+    assert!(!shadow.promotion_eligible);
 }
 
 #[actix_web::test]
@@ -540,10 +729,7 @@ async fn negative_signals_split_into_specific_tags_and_meta() {
         "「利空新闻」已被细分 tag 取代：{reasons:?}"
     );
     let neg = pick["meta"]["negative_signals"].as_array().unwrap();
-    let cats: Vec<&str> = neg
-        .iter()
-        .filter_map(|v| v["category"].as_str())
-        .collect();
+    let cats: Vec<&str> = neg.iter().filter_map(|v| v["category"].as_str()).collect();
     assert!(cats.contains(&"股东减持"));
     assert!(cats.contains(&"收到问询函"));
     // 每条都带原文标题
@@ -551,6 +737,102 @@ async fn negative_signals_split_into_specific_tags_and_meta() {
         assert!(sig["title"].is_string(), "title 必须存在：{sig}");
         assert!(!sig["title"].as_str().unwrap().is_empty());
     }
+}
+
+#[actix_web::test]
+async fn realized_calendar_event_is_hard_filtered_and_audited() {
+    let upstream = MockServer::start();
+    upstream.mock(|when, then| {
+        when.method(GET).path("/api/qt/clist/get");
+        then.status(200).json_body(json!({
+            "data": {"diff": [
+                {"f12": "300623", "f14": "捷捷微电", "f2": 35.11, "f3": 2.8, "f100": "半导体"}
+            ]}
+        }));
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/appstock/app/fqkline/get");
+        then.status(200).json_body(json!({
+            "data": {
+                "sz300623": {"qfqday": zigzag_bars()},
+                "sh000300": {"qfqday": zigzag_bars()}
+            }
+        }));
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/q=usDJI,usIXIC");
+        then.status(200).body(
+            "v_usDJI=\"200~DJI~.DJI~100~100~100~1\";\nv_usIXIC=\"200~IXIC~.IXIC~100~100~100~1\"",
+        );
+    });
+    let cn_body = [
+        tencent_cn_line("000001", 0.1),
+        tencent_cn_line("399001", 0.1),
+        tencent_cn_line("399006", 0.1),
+        tencent_cn_line("000300", 0.1),
+    ]
+    .join("\n");
+    upstream.mock(|when, then| {
+        when.method(GET)
+            .path("/q=sh000001,sz399001,sz399006,sh000300");
+        then.status(200).body(cn_body);
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/api/qt/stock/get");
+        then.status(500);
+    });
+    upstream.mock(|when, then| {
+        when.method(GET).path("/search/jsonp");
+        then.status(200).json_body(json!({
+            "code": 0,
+            "result": {"cmsArticleWebOld": [{
+                "date": "2026-09-25 10:30:00",
+                "title": "股东累计减持达到1%",
+                "content": "减持实施进展公告",
+                "mediaName": "交易所",
+                "url": "https://news.example.com/reduction"
+            }]}
+        }));
+    });
+
+    let mut state = fresh_state().await;
+    state.pick_ranking.base_url = upstream.base_url();
+    state.day_k.base_url = upstream.base_url();
+    state.us_index.base_url = upstream.base_url();
+    state.cn_index.base_url = upstream.base_url();
+    state.news.base_url = upstream.base_url();
+    state.main_net.base_url = upstream.base_url();
+    let db = state.db.clone();
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::pick::configure)),
+    )
+    .await;
+
+    let doc: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/picks/run")
+            .to_request(),
+    )
+    .await;
+    assert!(doc["picks"].as_array().unwrap().is_empty());
+    let shadow_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM daily_pick_shadow")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(shadow_count, 0, "硬过滤票也不得进入影子盘");
+    let audit: (String, String) = sqlx::query_as(
+        "SELECT reason, evidence FROM daily_pick_exclusion \
+         WHERE code='sz300623' AND stage='calendar'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(audit.0, "减持实施");
+    assert!(audit.1.contains("累计减持"));
+    assert_eq!(doc["stats"]["hard_filter_exclusions"][0]["count"], 1);
 }
 
 #[actix_web::test]
@@ -589,7 +871,8 @@ async fn anomaly_tag_appears_when_pct_above_board_threshold() {
         when.method(GET)
             .path("/api/qt/stock/get")
             .query_param("secid", "1.600519");
-        then.status(200).json_body(json!({"data": {"f2": 1620.0, "f3": 7.2}}));
+        then.status(200)
+            .json_body(json!({"data": {"f2": 1620.0, "f3": 7.2}}));
     });
 
     let mut state = fresh_state().await;
@@ -629,6 +912,7 @@ async fn list_picks_exposes_wilson_interval_and_low_sample_flag() {
     let next_open_better = |base_close: f64, t1_close: f64, t1_open: f64| {
         serde_json::json!({
             "close": base_close,
+            "cn": {"avg_pct": -1.1},
             "outcome": {
                 "t1_pct": (t1_close - base_close) / base_close * 100.0,
                 "t1_real": (t1_close - t1_open) / t1_open * 100.0,
@@ -690,13 +974,33 @@ async fn list_picks_exposes_wilson_interval_and_low_sample_flag() {
     let margin = stats["t1_win_rate_margin"].as_f64().unwrap();
     assert!(low < 0.45, "下界应 < 0.45（避免误读 70%）：{low}");
     assert!(high > 0.85, "上界应 > 0.85：{high}");
-    assert!(low < 0.5, "下界 < 0.5 明确告诉用户「70% 胜率无统计意义」：{low}");
-    assert!((margin - (high - low) / 2.0).abs() < 1e-9, "margin 应等于区间半宽");
+    assert!(
+        low < 0.5,
+        "下界 < 0.5 明确告诉用户「70% 胜率无统计意义」：{low}"
+    );
+    assert!(
+        (margin - (high - low) / 2.0).abs() < 1e-9,
+        "margin 应等于区间半宽"
+    );
     // 真实执行：同样有区间
     let exec = &stats["execution"];
     assert_eq!(exec["t1_real_samples_sufficient"], false);
     let r_low = exec["t1_real_win_rate_low"].as_f64().unwrap();
     assert!(r_low > 0.0, "真实执行区间下界应 > 0");
+    let curve = exec["curve"].as_array().expect("应返回纸面/开盘曲线");
+    assert_eq!(curve.len(), 1, "同一推荐日聚合为一个曲线点");
+    assert_eq!(curve[0]["date"], pick_date);
+    assert_eq!(curve[0]["samples"], 10);
+    assert!(curve[0]["paper_t1_pct"].is_number());
+    assert!(curve[0]["open_t1_pct"].is_number());
+    assert_eq!(exec["execution_warning"], false);
+    let regimes = stats["by_regime"].as_array().unwrap();
+    assert_eq!(regimes.len(), 1, "全部样本都属于偏空桶：{regimes:?}");
+    assert_eq!(regimes[0]["regime"], "bear");
+    assert_eq!(regimes[0]["label"], "偏空");
+    assert_eq!(regimes[0]["samples"], 10);
+    assert!((regimes[0]["win_rate"].as_f64().unwrap() - 0.7).abs() < 1e-9);
+    assert_eq!(regimes[0]["samples_sufficient"], false);
 }
 
 #[actix_web::test]
@@ -778,13 +1082,14 @@ async fn picks_run_attaches_buy_and_sell_price_zones() {
     assert!((buy_low - 34.41).abs() < 0.05, "buy_low={buy_low}");
     assert!((buy_high - 35.81).abs() < 0.05, "buy_high={buy_high}");
     assert!((plan["buy_basis_close"].as_f64().unwrap() - 35.11).abs() < 0.02);
-    // §A.9 卖点：基于 5 条历史 t1_pct=1.5% (samples=5) + win_rate=1.0
-    //   factor = (1.5/100)*1.0 = 0.015 → sell_mid = 35.11 * 1.015 = 35.6366
-    //   sell_low = 35.6366 * 0.985 = 35.10；sell_high = 35.6366 * 1.015 = 36.17
+    // 以买区上界 35.81 计算 5% 净目标，并预留约 0.2% 成本。
     let sell_low = plan["sell_price_low"].as_f64().unwrap();
     let sell_high = plan["sell_price_high"].as_f64().unwrap();
-    assert!(sell_low > 35.0 && sell_low < 35.20, "sell_low={sell_low}");
-    assert!(sell_high > 36.0 && sell_high < 36.30, "sell_high={sell_high}");
+    assert!(sell_low > 37.65 && sell_low < 37.75, "sell_low={sell_low}");
+    assert!(
+        sell_high > 38.0 && sell_high < 38.2,
+        "sell_high={sell_high}"
+    );
     assert!(sell_high > sell_low, "卖区间必须 high > low");
     // meta.sell_zone_basis 透出供前端回溯
     let basis = &pick["meta"]["sell_zone_basis"];
@@ -843,14 +1148,22 @@ async fn picks_run_falls_back_to_default_sell_zone_when_no_history() {
     .await;
     let pick = &doc["picks"][0];
     let plan = &pick["meta"]["plan"];
-    // 无历史 → 默认 1.2% 期望收益 → sell_mid = 35.11 * 1.012 = 35.5313
-    // sell_low ≈ 35.0、sell_high ≈ 36.06
+    // 无历史同样不能低于买区上界对应的 5% 净目标。
     let sell_low = plan["sell_price_low"].as_f64().unwrap();
     let sell_high = plan["sell_price_high"].as_f64().unwrap();
-    assert!(sell_low > 34.9 && sell_low < 35.2, "无历史 sell_low={sell_low}");
-    assert!(sell_high > 35.9 && sell_high < 36.2, "无历史 sell_high={sell_high}");
+    assert!(
+        sell_low > 37.65 && sell_low < 37.75,
+        "无历史 sell_low={sell_low}"
+    );
+    assert!(
+        sell_high > 38.0 && sell_high < 38.2,
+        "无历史 sell_high={sell_high}"
+    );
     // samples = 0
-    assert_eq!(pick["meta"]["sell_zone_basis"]["samples"].as_i64().unwrap(), 0);
+    assert_eq!(
+        pick["meta"]["sell_zone_basis"]["samples"].as_i64().unwrap(),
+        0
+    );
 }
 
 #[actix_web::test]
@@ -897,17 +1210,21 @@ async fn list_picks_returns_previous_picks_with_sell_zone() {
     )
     .await;
 
-    let prev = doc["previous_picks"].as_array().expect("必须有 previous_picks");
+    let prev = doc["previous_picks"]
+        .as_array()
+        .expect("必须有 previous_picks");
     assert_eq!(prev.len(), 2, "应返回 2 条昨日推荐");
-    // 上一交易日推荐：entry_timing=today_close → basis=t1_close=10.20
-    //   sell_low = 10.20 * 0.985 = 10.05, sell_high = 10.20 * 1.015 = 10.35
+    // 上一交易日推荐：以买入成本 10.00 计算 5% 目标，不使用 T+1 收盘价反推。
     let first = &prev[0];
     assert_eq!(first["code"], "sz300603");
     assert_eq!(first["entry_label"], "今日尾盘");
-    assert_eq!(first["sell_basis_kind"], "t1_close");
-    assert!((first["sell_basis_price"].as_f64().unwrap() - 10.20).abs() < 1e-9);
-    assert!((first["sell_price_low"].as_f64().unwrap() - 10.05).abs() < 0.02);
-    assert!((first["sell_price_high"].as_f64().unwrap() - 10.35).abs() < 0.02);
+    assert_eq!(first["sell_basis_kind"], "actual_execution_5pct_target");
+    assert!((first["sell_basis_price"].as_f64().unwrap() - 10.00).abs() < 1e-9);
+    assert!((first["sell_price_low"].as_f64().unwrap() - 10.52).abs() < 0.02);
+    assert!((first["sell_price_high"].as_f64().unwrap() - 10.63).abs() < 0.02);
+    assert_eq!(first["sell_action"], "t1_timeout");
+    assert!(first["sell_action_label"].as_str().unwrap().contains("T+1"));
+    assert!((first["risk_stop_price"].as_f64().unwrap() - 9.70).abs() < 0.02);
     // t1_pct / t1_real 也要透出
     assert!((first["t1_pct"].as_f64().unwrap() - 2.0).abs() < 1e-9);
     assert!((first["t1_real_pct"].as_f64().unwrap() - 1.7).abs() < 1e-9);
@@ -961,11 +1278,12 @@ async fn list_picks_previous_picks_uses_open_basis_for_next_session_open() {
     )
     .await;
     let prev = &doc["previous_picks"][0];
-    // basis = t1_open_basis * 1.005 = 21.50 * 1.005 = 21.6075
-    assert_eq!(prev["sell_basis_kind"], "actual_t1_open");
-    assert!((prev["sell_basis_price"].as_f64().unwrap() - 21.6075).abs() < 0.01);
+    assert_eq!(prev["sell_basis_kind"], "actual_execution_5pct_target");
+    assert!((prev["sell_basis_price"].as_f64().unwrap() - 21.50).abs() < 0.01);
     let s_low = prev["sell_price_low"].as_f64().unwrap();
     let s_high = prev["sell_price_high"].as_f64().unwrap();
-    assert!(s_low >= 21.27 && s_low <= 21.29, "sell_low={s_low}");
-    assert!(s_high > 21.92 && s_high < 21.94, "sell_high={s_high}");
+    assert!(s_low >= 22.61 && s_low <= 22.63, "sell_low={s_low}");
+    assert!(s_high > 23.05 && s_high < 23.10, "sell_high={s_high}");
+    assert_eq!(prev["open_strength"], "strong");
+    assert_eq!(prev["sell_action"], "t1_timeout");
 }

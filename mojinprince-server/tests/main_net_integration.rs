@@ -59,7 +59,7 @@ fn zigzag_bars() -> Vec<Value> {
             date,
             (close - 0.05) as f64,
             close,
-            close + 0.15,
+            close + 1.00,
             close - 0.15,
             volume
         ]));
@@ -228,14 +228,11 @@ async fn main_net_strong_outflow_drops_score() {
         "主力出逃标签：{reasons:?}"
     );
     assert!(
-        pick["meta"]["main_net"]["main_net_wan"]
-            .as_f64()
-            .unwrap()
-            < -10_000.0,
+        pick["meta"]["main_net"]["main_net_wan"].as_f64().unwrap() < -10_000.0,
         "main_net 透出流出绝对值 > 1.0 亿"
     );
     // 关键不在 score 绝对值（依赖 base 分 + 是否拉到新闻加分），而在 main_net delta：
-// 流出 -1.5 亿 / 占比 -15% → main_net_score 返回 -30，且 meta.main_net.score_delta == -30
+    // 流出 -1.5 亿 / 占比 -15% → main_net_score 返回 -30，且 meta.main_net.score_delta == -30
     let mn_delta = pick["meta"]["main_net"]["score_delta"]
         .as_f64()
         .expect("meta.main_net.score_delta 应存在");
