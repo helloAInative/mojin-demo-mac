@@ -303,6 +303,9 @@ struct PicksCardView: View {
     @ViewBuilder
     private func evidenceDetail(_ doc: GatewayPicksDocument) -> some View {
         VStack(alignment: .leading, spacing: UITokens.stackTight) {
+            if let quality = doc.calibrationQuality {
+                calibrationQualityPanel(quality)
+            }
             if doc.samples > 0, let exec = doc.execution {
                 executionDetail(exec)
             }
@@ -335,6 +338,57 @@ struct PicksCardView: View {
                     .foregroundStyle(UITokens.color(.audit))
             }
         }
+    }
+
+    private func calibrationQualityPanel(_ quality: GatewayPicksDocument.CalibrationQuality) -> some View {
+        let signal: UITokens.Signal = switch quality.status {
+        case "reliable": .buy
+        case "degraded": .danger
+        default: .observe
+        }
+        let label: String = switch quality.status {
+        case "reliable": "可靠"
+        case "degraded": "漂移"
+        default: "样本积累"
+        }
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: UITokens.stackNormal) {
+                Label("概率校准 · \(label)",
+                      systemImage: quality.status == "reliable" ? "checkmark.seal.fill" : "scope")
+                    .font(.system(size: UITokens.metaSize, weight: .bold))
+                    .foregroundStyle(UITokens.color(signal))
+                Text(String(format: "n=%d · Brier %.3f · ECE %.3f",
+                            quality.samples, quality.brierScore, quality.expectedCalibrationError))
+                    .font(.system(size: UITokens.microSize, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                if let auc = quality.auc {
+                    Text(String(format: "AUC %.2f", auc))
+                        .font(.system(size: UITokens.microSize, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                Text(quality.positiveBoostEnabled ? "概率加分已启用" : "概率加分已关闭")
+                    .font(.system(size: UITokens.microSize, weight: .semibold))
+                    .foregroundStyle(UITokens.color(signal))
+            }
+            Text(quality.reason)
+                .font(.system(size: UITokens.microSize))
+                .foregroundStyle(.secondary)
+            let populatedBins = quality.bins.filter { $0.samples > 0 }
+            if !populatedBins.isEmpty {
+                Text(populatedBins.map {
+                    String(format: "%.0f–%.0f%%: 预测%.0f%%/实际%.0f%%(n=%d)",
+                           $0.lower * 100, $0.upper * 100,
+                           $0.averageProbability * 100, $0.observedWinRate * 100, $0.samples)
+                }.joined(separator: " · "))
+                .font(.system(size: UITokens.microSize, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(UITokens.stackTight)
+        .background(UITokens.background(signal), in: RoundedRectangle(cornerRadius: 5))
+        .help("只评估推荐时已经固化、且相似历史样本不少于30的概率；Brier越低越好，ECE衡量预测概率与真实频率的偏差。")
     }
 
     private func tagPill(_ t: GatewayPicksDocument.TagStat) -> some View {
@@ -434,6 +488,31 @@ struct PicksCardView: View {
                 Text("集中度：\(audit.concentrationSummary) · 涨停 \(audit.limitUpCount) 只")
                     .font(.system(size: UITokens.microSize))
                     .foregroundStyle(.secondary)
+            }
+            if !doc.shadowExperiments.isEmpty {
+                Divider().opacity(0.35)
+                Text("影子实验（不进入生产清单）")
+                    .font(.system(size: UITokens.microSize, weight: .bold))
+                    .foregroundStyle(UITokens.color(.audit))
+                ForEach(doc.shadowExperiments) { experiment in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("\(experiment.experimentId) · \(experiment.completedDays)日/\(experiment.samples)样本")
+                            .font(.system(size: UITokens.microSize, design: .monospaced))
+                        Text(String(
+                            format: "真实胜率 %.0f%%（下界 %.0f%%）· 5%%达标 %.0f%%（下界 %.0f%%）",
+                            experiment.t1RealWinRate * 100,
+                            experiment.t1RealWilsonLow * 100,
+                            experiment.target5pctHitRate * 100,
+                            experiment.target5pctWilsonLow * 100
+                        ))
+                        .font(.system(size: UITokens.microSize))
+                        .foregroundStyle(experiment.promotionEligible
+                                         ? UITokens.color(.buy) : .secondary)
+                        Text(experiment.promotionReason)
+                            .font(.system(size: UITokens.microSize))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
             }
         }
         .padding(UITokens.stackTight)
@@ -557,6 +636,22 @@ struct PicksCardView: View {
                                             in: Capsule()
                                         )
                                         .help(pickHelp_AutoWeight(pick.meta.autoWeight))
+                                }
+                                if let calibration = pick.meta.calibration,
+                                   calibration.samples >= 30 {
+                                    let signal: UITokens.Signal = calibration.confidenceTier == "strong"
+                                        ? .buy : .observe
+                                    Text(String(
+                                        format: "校准 %.0f%% [%.0f–%.0f] · n=%d",
+                                        calibration.posteriorWinProbability * 100,
+                                        calibration.wilsonLow * 100,
+                                        calibration.wilsonHigh * 100,
+                                        calibration.samples
+                                    ))
+                                    .font(.system(size: UITokens.microSize, weight: .semibold))
+                                    .monospacedDigit()
+                                    .foregroundStyle(UITokens.color(signal))
+                                    .help("推荐日前 180 天相似标签的真实开盘执行 T+1；Beta(2,2) 后验均值 + Wilson 95% 区间")
                                 }
                                 Spacer(minLength: 0)
                                 Text(String(format: "%.0f分", pick.score))
@@ -879,7 +974,8 @@ struct PicksCardView: View {
         let entry = pickEntryStatus(pick).text
         let strategy = plan?.strategy ?? "短线"
         let exit = plan?.exitRule ?? "T+1 观察，不承诺次日上涨"
-        return "\(pick.name) \(pick.code) · \(entry) · \(strategy)\n目标：T+1 收盘正收益（概率筛选，非保证）\n计划：\(exit)\n\(pick.reasons.joined(separator: " / ")) · 综合分 \(Int(pick.score))\(pick.aiNote.isEmpty ? "" : "\nAI：\(pick.aiNote)")\n\(pickHelp_AutoWeight(pick.meta.autoWeight))\n点击加入自选并去盯盘（仅关注建议，不构成投资建议）"
+        let calibration = pickHelp_Calibration(pick.meta.calibration)
+        return "\(pick.name) \(pick.code) · \(entry) · \(strategy)\n目标：T+1 收盘正收益（概率筛选，非保证）\n计划：\(exit)\n\(pick.reasons.joined(separator: " / ")) · 综合分 \(Int(pick.score))\(pick.aiNote.isEmpty ? "" : "\nAI：\(pick.aiNote)")\n\(pickHelp_AutoWeight(pick.meta.autoWeight))\n\(calibration)\n点击加入自选并去盯盘（仅关注建议，不构成投资建议）"
     }
 
     private func pickHelp_AutoWeight(_ weight: GatewayPick.AutoWeight?) -> String {
@@ -896,6 +992,21 @@ struct PicksCardView: View {
         return String(format: "复盘学习调权 %@%.1f分\n%@",
                       adjustment >= 0 ? "+" : "", adjustment,
                       evidence.isEmpty ? "无可展示标签证据" : evidence)
+    }
+
+    private func pickHelp_Calibration(_ calibration: GatewayPick.Calibration?) -> String {
+        guard let calibration else { return "概率校准：暂无历史相似样本" }
+        if calibration.samples < 30 {
+            return "概率校准：\(calibration.samples) 样本不足，保持中性"
+        }
+        return String(
+            format: "概率校准：后验 %.0f%%，Wilson [%.0f–%.0f%%]，%@环境，%@",
+            calibration.posteriorWinProbability * 100,
+            calibration.wilsonLow * 100,
+            calibration.wilsonHigh * 100,
+            calibration.scope,
+            calibration.confidenceTier
+        )
     }
 
     private var todayCNDateKey: String {
