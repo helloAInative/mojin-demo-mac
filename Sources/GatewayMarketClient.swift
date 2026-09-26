@@ -16,13 +16,15 @@ struct GatewaySettingsSnapshot: Codable {
     var aiConfig: AIConfig?
     var boardShowHS300: Bool?
     var boardShowBJ50: Bool?
+    var smartPicksPaused: Bool?
 
     var isEmpty: Bool {
         currentCode == nil && levelsByCode == nil && strategies == nil &&
         comboStrategies == nil && diaries == nil && alertsEnabled == nil &&
         openCloseBrief == nil && theme == nil && menuBarFormat == nil &&
         fontSize == nil && indicator == nil && notifyConfig == nil &&
-        aiConfig == nil && boardShowHS300 == nil && boardShowBJ50 == nil
+        aiConfig == nil && boardShowHS300 == nil && boardShowBJ50 == nil &&
+        smartPicksPaused == nil
     }
 }
 
@@ -243,13 +245,40 @@ struct GatewayPick: Codable, Equatable, Identifiable {
         var sellZoneBasis: SellZoneBasis?
         /// §A 负面信号细分（减持/问询/立案/...）
         var negativeSignals: [NegativeSignal]?
+        var risk: RiskMetrics?
 
         enum CodingKeys: String, CodingKey {
-            case close, pct, industry, outcome, plan
+            case close, pct, industry, outcome, plan, risk
             case autoWeight = "auto_weight"
             case isLimitUp = "is_limit_up"
             case sellZoneBasis = "sell_zone_basis"
             case negativeSignals = "negative_signals"
+        }
+    }
+
+    struct RiskMetrics: Codable, Equatable {
+        var beta60d: Double?
+        var avgAmount20d: Double?
+        var maxDrawdown20d: Double?
+        var expectedShortfall10pct20d: Double?
+        var t1Reach5pctRate20d: Double?
+        var t1Reach5pctWilsonLow: Double?
+        var targetStable: Bool?
+        var return5d: Double?
+        var crowdingPenalty: Double?
+        var stressLossMarketDown2pct: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case beta60d = "beta_60d"
+            case avgAmount20d = "avg_amount_20d"
+            case maxDrawdown20d = "max_drawdown_20d"
+            case expectedShortfall10pct20d = "expected_shortfall_10pct_20d"
+            case t1Reach5pctRate20d = "t1_reach_5pct_rate_20d"
+            case t1Reach5pctWilsonLow = "t1_reach_5pct_wilson_low"
+            case targetStable = "target_stable"
+            case return5d = "return_5d"
+            case crowdingPenalty = "crowding_penalty"
+            case stressLossMarketDown2pct = "stress_loss_market_down_2pct"
         }
     }
 
@@ -290,6 +319,8 @@ struct GatewayPick: Codable, Equatable, Identifiable {
         var sellPriceLow: Double?
         /// §A.9 卖出价上界
         var sellPriceHigh: Double?
+        var profitTargetPrice: Double?
+        var targetReturnPct: Double?
         /// §A.9 买入价基准（现价 close，用于回溯）
         var buyBasisClose: Double?
 
@@ -305,6 +336,8 @@ struct GatewayPick: Codable, Equatable, Identifiable {
             case buyPriceHigh = "buy_price_high"
             case sellPriceLow = "sell_price_low"
             case sellPriceHigh = "sell_price_high"
+            case profitTargetPrice = "profit_target_price"
+            case targetReturnPct = "target_return_pct"
             case buyBasisClose = "buy_basis_close"
         }
     }
@@ -337,10 +370,14 @@ struct GatewayPick: Codable, Equatable, Identifiable {
     struct Outcome: Codable, Equatable {
         var t1Pct: Double?
         var t5Pct: Double?
+        var entryStatus: String?
+        var entryStatusLabel: String?
 
         enum CodingKeys: String, CodingKey {
             case t1Pct = "t1_pct"
             case t5Pct = "t5_pct"
+            case entryStatus = "entry_status"
+            case entryStatusLabel = "entry_status_label"
         }
     }
 
@@ -352,6 +389,25 @@ struct GatewayPick: Codable, Equatable, Identifiable {
 
 /// 推荐文档：当日尾盘清单 + 近 30 天 T+1 主回测（T+5 中线参考）。
 struct GatewayPicksDocument: Decodable, Equatable {
+    struct Audit: Decodable, Equatable {
+        var poolSources: [String]
+        var concentration: Concentration?
+        var limitUpBreakdown: String?
+        var experimentId: String?
+
+        struct Concentration: Decodable, Equatable {
+            var maxPerIndustry: Int
+            var summary: String
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case poolSources = "pool_sources"
+            case concentration
+            case limitUpBreakdown = "limit_up_breakdown"
+            case experimentId = "experiment_id"
+        }
+    }
+
     var date: String
     var picks: [GatewayPick]
     var samples: Int
@@ -389,6 +445,8 @@ struct GatewayPicksDocument: Decodable, Equatable {
         case t5SamplesSufficient = "t5_samples_sufficient"
         case avgT5Pct = "avg_t5_pct"
         case tags
+        case byRegime = "by_regime"
+        case audit
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -399,12 +457,16 @@ struct GatewayPicksDocument: Decodable, Equatable {
 
     /// 标签级 T+1 回测（哪个因子更适合隔日目标，按样本数降序 ≤6）
     var tags: [TagStat]
-    /// 隔夜美股（djia / ixic 涨跌 %）
+    /// §A.11 按推荐日市场环境分桶的 T+1 胜率。
+    var byRegime: [RegimeStat]
+    /// 生成时市场环境：隔夜美股 + A 股大盘情绪。
     var market: MarketInfo?
     /// 执行时机：「当天下午可买入」或「次日开盘买入…」
     var executeHint: String?
     /// 真实执行口径（次日开盘买入统计）
     var execution: ExecutionStats?
+    /// §A.14 规则版本与候选池审计信息；旧服务端缺失时为 nil。
+    var audit: Audit?
 
     /// §A.9 上一交易日推荐（已有 T+1 outcome 回写），用于展示「昨日推荐 → 今日卖点」
     var previousPicks: [GatewayPreviousPick]?
@@ -423,6 +485,16 @@ struct GatewayPicksDocument: Decodable, Equatable {
     /// 今日被识别为涨停、需要次日开盘买入的子集
     var nextOpenPicks: [GatewayPick] {
         picks.filter { ($0.meta.isLimitUp ?? false) == true }
+    }
+
+    var currentRegimeStat: RegimeStat? {
+        guard let avg = market?.cn?.avgPct else { return nil }
+        let key: String
+        if avg <= -2.0 { key = "crash" }
+        else if avg <= -0.8 { key = "bear" }
+        else if avg >= 0.8 { key = "bull" }
+        else { key = "range" }
+        return byRegime.first(where: { $0.regime == key })
     }
 
     struct TagStat: Decodable, Equatable, Identifiable {
@@ -445,15 +517,91 @@ struct GatewayPicksDocument: Decodable, Equatable {
         }
     }
 
-    struct MarketInfo: Decodable, Equatable {
-        var djia: Double?
-        var ixic: Double?
+    struct RegimeStat: Decodable, Equatable, Identifiable {
+        var regime: String
+        var label: String
+        var samples: Int
+        var winRate: Double
+        var winRateLow: Double
+        var winRateHigh: Double
+        var winRateMargin: Double
+        var samplesSufficient: Bool
+        var avgT1Pct: Double
+        var id: String { regime }
+
+        enum CodingKeys: String, CodingKey {
+            case regime, label, samples
+            case winRate = "win_rate"
+            case winRateLow = "win_rate_low"
+            case winRateHigh = "win_rate_high"
+            case winRateMargin = "win_rate_margin"
+            case samplesSufficient = "samples_sufficient"
+            case avgT1Pct = "avg_t1_pct"
+        }
     }
 
-    private enum CodingKeys: String, CodingKey {
-        case date, picks, stats, market, execution
-        case executeHint = "execute_hint"
-        case previousPicks = "previous_picks"
+    struct MarketInfo: Decodable, Equatable {
+        var us: US?
+        var cn: CN?
+        var confirmation: Confirmation?
+
+        /// 兼容 §A.10 之前服务端直接返回 `{djia, ixic}` 的历史文档。
+        var djia: Double? { us?.djia }
+        var ixic: Double? { us?.ixic }
+
+        struct US: Decodable, Equatable {
+            var djia: Double?
+            var ixic: Double?
+        }
+
+        struct CN: Decodable, Equatable {
+            var shPct: Double?
+            var szPct: Double?
+            var gemPct: Double?
+            var hs300Pct: Double?
+            var avgPct: Double?
+            var riskScore: Double?
+
+            enum CodingKeys: String, CodingKey {
+                case shPct = "sh_pct"
+                case szPct = "sz_pct"
+                case gemPct = "gem_pct"
+                case hs300Pct = "hs300_pct"
+                case avgPct = "avg_pct"
+                case riskScore = "risk_score"
+            }
+        }
+
+        struct Confirmation: Decodable, Equatable {
+            var status: String
+            var overlapRatio: Double
+            var regimeChanged: Bool
+            var reason: String
+
+            enum CodingKeys: String, CodingKey {
+                case status, reason
+                case overlapRatio = "overlap_ratio"
+                case regimeChanged = "regime_changed"
+            }
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case us, cn, confirmation, djia, ixic
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            us = try c.decodeIfPresent(US.self, forKey: .us)
+            cn = try c.decodeIfPresent(CN.self, forKey: .cn)
+            confirmation = try c.decodeIfPresent(Confirmation.self, forKey: .confirmation)
+            if us == nil {
+                let legacyDJIA = try c.decodeIfPresent(Double.self, forKey: .djia)
+                let legacyIXIC = try c.decodeIfPresent(Double.self, forKey: .ixic)
+                if legacyDJIA != nil || legacyIXIC != nil {
+                    us = US(djia: legacyDJIA, ixic: legacyIXIC)
+                }
+            }
+        }
     }
 
     init(date: String, picks: [GatewayPick], samples: Int, t5WinRate: Double, avgT5Pct: Double,
@@ -480,7 +628,12 @@ struct GatewayPicksDocument: Decodable, Equatable {
         self.t5SamplesSufficient = t5SamplesSufficient
         self.avgT5Pct = avgT5Pct
         self.tags = tags
+        self.byRegime = []
         self.market = market
+        self.executeHint = nil
+        self.execution = nil
+        self.audit = nil
+        self.previousPicks = nil
     }
 
     init(from decoder: Decoder) throws {
@@ -503,6 +656,8 @@ struct GatewayPicksDocument: Decodable, Equatable {
         t5SamplesSufficient = (try? stats.decodeIfPresent(Bool.self, forKey: .t5SamplesSufficient)) ?? false
         avgT5Pct = (try? stats.decodeIfPresent(Double.self, forKey: .avgT5Pct)) ?? 0
         tags = (try? stats.decodeIfPresent([TagStat].self, forKey: .tags)) ?? []
+        byRegime = (try? stats.decodeIfPresent([RegimeStat].self, forKey: .byRegime)) ?? []
+        audit = try? stats.decodeIfPresent(Audit.self, forKey: .audit)
         market = try? c.decodeIfPresent(MarketInfo.self, forKey: .market)
         executeHint = try? c.decodeIfPresent(String.self, forKey: .executeHint)
         execution = try? c.decodeIfPresent(ExecutionStats.self, forKey: .execution)
@@ -526,8 +681,15 @@ struct GatewayPreviousPick: Codable, Equatable, Identifiable {
     var sellPriceHigh: Double?
     var sellBasisPrice: Double?
     var sellBasisKind: String?
+    var openStrength: String?
+    var sellAction: String?
+    var sellActionLabel: String?
+    var riskStopPrice: Double?
+    var targetReached: Bool?
     var entryTiming: String?
     var entryLabel: String?
+    var entryStatus: String?
+    var entryStatusLabel: String?
     var reasons: [String]
 
     var id: String { "\(date)-\(code)" }
@@ -543,8 +705,15 @@ struct GatewayPreviousPick: Codable, Equatable, Identifiable {
         case sellPriceHigh = "sell_price_high"
         case sellBasisPrice = "sell_basis_price"
         case sellBasisKind = "sell_basis_kind"
+        case openStrength = "open_strength"
+        case sellAction = "sell_action"
+        case sellActionLabel = "sell_action_label"
+        case riskStopPrice = "risk_stop_price"
+        case targetReached = "target_reached"
         case entryTiming = "entry_timing"
         case entryLabel = "entry_label"
+        case entryStatus = "entry_status"
+        case entryStatusLabel = "entry_status_label"
     }
 }
 
@@ -562,8 +731,38 @@ struct ExecutionStats: Decodable, Equatable {
     /// 样本是否足以给出有意义的胜率（≥30）
     var t1RealSamplesSufficient: Bool
     var avgT1Real: Double
+    var avgWin: Double
+    var avgLoss: Double
     var avgMaxDd: Double
+    var maxDrawdown: Double
+    var expectedShortfall10: Double
+    var target5pctSamples: Int
+    var target5pctHitRate: Double
+    var target5pctWilsonLow: Double
+    var target5pctWilsonHigh: Double
     var winLossRatio: Double
+    var curve: [CurvePoint]
+    var executionDrag: Double
+    var executionWarning: Bool
+    var executionHint: String
+
+    struct CurvePoint: Decodable, Equatable, Identifiable {
+        var date: String
+        var samples: Int
+        var paperT1Pct: Double
+        var openT1Pct: Double
+        var paperCumulativePct: Double
+        var openCumulativePct: Double
+        var id: String { date }
+
+        enum CodingKeys: String, CodingKey {
+            case date, samples
+            case paperT1Pct = "paper_t1_pct"
+            case openT1Pct = "open_t1_pct"
+            case paperCumulativePct = "paper_cumulative_pct"
+            case openCumulativePct = "open_cumulative_pct"
+        }
+    }
 
     enum CodingKeys: String, CodingKey {
         case avgEntryGap = "avg_entry_gap"
@@ -573,8 +772,45 @@ struct ExecutionStats: Decodable, Equatable {
         case t1RealWinRateMargin = "t1_real_win_rate_margin"
         case t1RealSamplesSufficient = "t1_real_samples_sufficient"
         case avgT1Real = "avg_t1_real"
+        case avgWin = "avg_win"
+        case avgLoss = "avg_loss"
         case avgMaxDd = "avg_max_dd"
+        case maxDrawdown = "max_drawdown"
+        case expectedShortfall10 = "expected_shortfall_10"
+        case target5pctSamples = "target_5pct_samples"
+        case target5pctHitRate = "target_5pct_hit_rate"
+        case target5pctWilsonLow = "target_5pct_wilson_low"
+        case target5pctWilsonHigh = "target_5pct_wilson_high"
         case winLossRatio = "win_loss_ratio"
+        case curve
+        case executionDrag = "execution_drag"
+        case executionWarning = "execution_warning"
+        case executionHint = "execution_hint"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        avgEntryGap = try c.decodeIfPresent(Double.self, forKey: .avgEntryGap) ?? 0
+        t1RealWinRate = try c.decodeIfPresent(Double.self, forKey: .t1RealWinRate) ?? 0
+        t1RealWinRateLow = try c.decodeIfPresent(Double.self, forKey: .t1RealWinRateLow) ?? 0
+        t1RealWinRateHigh = try c.decodeIfPresent(Double.self, forKey: .t1RealWinRateHigh) ?? 0
+        t1RealWinRateMargin = try c.decodeIfPresent(Double.self, forKey: .t1RealWinRateMargin) ?? 0
+        t1RealSamplesSufficient = try c.decodeIfPresent(Bool.self, forKey: .t1RealSamplesSufficient) ?? false
+        avgT1Real = try c.decodeIfPresent(Double.self, forKey: .avgT1Real) ?? 0
+        avgWin = try c.decodeIfPresent(Double.self, forKey: .avgWin) ?? 0
+        avgLoss = try c.decodeIfPresent(Double.self, forKey: .avgLoss) ?? 0
+        avgMaxDd = try c.decodeIfPresent(Double.self, forKey: .avgMaxDd) ?? 0
+        maxDrawdown = try c.decodeIfPresent(Double.self, forKey: .maxDrawdown) ?? 0
+        expectedShortfall10 = try c.decodeIfPresent(Double.self, forKey: .expectedShortfall10) ?? 0
+        target5pctSamples = try c.decodeIfPresent(Int.self, forKey: .target5pctSamples) ?? 0
+        target5pctHitRate = try c.decodeIfPresent(Double.self, forKey: .target5pctHitRate) ?? 0
+        target5pctWilsonLow = try c.decodeIfPresent(Double.self, forKey: .target5pctWilsonLow) ?? 0
+        target5pctWilsonHigh = try c.decodeIfPresent(Double.self, forKey: .target5pctWilsonHigh) ?? 0
+        winLossRatio = try c.decodeIfPresent(Double.self, forKey: .winLossRatio) ?? 0
+        curve = try c.decodeIfPresent([CurvePoint].self, forKey: .curve) ?? []
+        executionDrag = try c.decodeIfPresent(Double.self, forKey: .executionDrag) ?? 0
+        executionWarning = try c.decodeIfPresent(Bool.self, forKey: .executionWarning) ?? false
+        executionHint = try c.decodeIfPresent(String.self, forKey: .executionHint) ?? ""
     }
 }
 
