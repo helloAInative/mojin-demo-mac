@@ -642,11 +642,12 @@ struct PicksCardView: View {
                                     let signal: UITokens.Signal = calibration.confidenceTier == "strong"
                                         ? .buy : .observe
                                     Text(String(
-                                        format: "校准 %.0f%% [%.0f–%.0f] · n=%d",
+                                        format: "校准 %.0f%% [%.0f–%.0f] · n=%d/%d日",
                                         calibration.posteriorWinProbability * 100,
                                         calibration.wilsonLow * 100,
                                         calibration.wilsonHigh * 100,
-                                        calibration.samples
+                                        calibration.samples,
+                                        calibration.completedDays ?? 0
                                     ))
                                     .font(.system(size: UITokens.microSize, weight: .semibold))
                                     .monospacedDigit()
@@ -1018,10 +1019,12 @@ struct PicksCardView: View {
             ""
         }
         return String(
-            format: "概率校准：后验 %.0f%%，Wilson [%.0f–%.0f%%]，%@环境，%@%@",
+            format: "概率校准：后验 %.0f%%，Wilson [%.0f–%.0f%%]，%d样本/%d独立交易日，%@环境，%@%@",
             calibration.posteriorWinProbability * 100,
             calibration.wilsonLow * 100,
             calibration.wilsonHigh * 100,
+            calibration.samples,
+            calibration.completedDays ?? 0,
             calibration.scope,
             calibration.confidenceTier,
             payoff
