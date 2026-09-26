@@ -83,6 +83,7 @@ async fn market_crash_pause_persists_for_followup_get() {
     state.pick_ranking.base_url = upstream.base_url();
     state.cn_index.base_url = upstream.base_url();
     state.us_index.base_url = upstream.base_url();
+    let db = state.db.clone();
     let app = test::init_service(
         App::new()
             .app_data(web::Data::new(state))
@@ -116,11 +117,80 @@ async fn market_crash_pause_persists_for_followup_get() {
         .unwrap()
         .contains("暂停推荐"));
     assert_eq!(listed["market"]["cn"], paused["market"]["cn"]);
+    let audit_source: String =
+        sqlx::query_scalar("SELECT source FROM pick_pause_audit WHERE date = ?")
+            .bind(paused["date"].as_str().unwrap())
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(audit_source, "market_crash");
+}
+
+#[actix_web::test]
+async fn manual_kill_switch_pauses_before_network_and_writes_audit() {
+    // 不配置任何 mock 上游：若 Kill Switch 没有在联网前短路，本请求会失败。
+    let state = fresh_state().await;
+    let db = state.db.clone();
+    sqlx::query("INSERT INTO settings(key, value, updated_at) VALUES(?,?,?)")
+        .bind("smartPicksPaused")
+        .bind("true")
+        .bind(0_i64)
+        .execute(&db)
+        .await
+        .unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .service(web::scope("/api/v1").configure(api::pick::configure)),
+    )
+    .await;
+
+    let paused: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/picks/run")
+            .to_request(),
+    )
+    .await;
+    assert!(paused["picks"].as_array().unwrap().is_empty(), "{paused}");
+    assert_eq!(paused["market"]["pause_source"], "manual");
+    assert!(paused["execute_hint"]
+        .as_str()
+        .unwrap()
+        .contains("手动暂停"));
+
+    let run: (i64, String) =
+        sqlx::query_as("SELECT paused, pause_source FROM daily_pick_run WHERE date = ?")
+            .bind(paused["date"].as_str().unwrap())
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(run, (1, "manual".into()));
+    let audit: (String, String, i64) =
+        sqlx::query_as("SELECT source, reason, active FROM pick_pause_audit WHERE date = ?")
+            .bind(paused["date"].as_str().unwrap())
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(audit.0, "manual");
+    assert!(audit.1.contains("手动暂停"));
+    assert_eq!(audit.2, 1);
+
+    let listed: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get().uri("/api/v1/picks").to_request(),
+    )
+    .await;
+    assert!(listed["picks"].as_array().unwrap().is_empty(), "{listed}");
+    assert_eq!(listed["market"]["pause_source"], "manual");
+    assert_eq!(listed["market"]["pause_audit"][0]["source"], "manual");
+    assert_eq!(listed["market"]["pause_audit"][0]["active"], true);
 }
 
 #[actix_web::test]
 async fn three_consecutive_losing_pick_days_pause_before_network() {
     let state = fresh_state().await;
+    let db = state.db.clone();
     for (index, date) in ["2026-09-20", "2026-09-21", "2026-09-22"]
         .iter()
         .enumerate()
@@ -160,6 +230,13 @@ async fn three_consecutive_losing_pick_days_pause_before_network() {
         .as_str()
         .unwrap()
         .contains("连续 3 个推荐日亏损"));
+    let audit_source: String =
+        sqlx::query_scalar("SELECT source FROM pick_pause_audit WHERE date = ?")
+            .bind(doc["date"].as_str().unwrap())
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(audit_source, "loss_streak");
 }
 
 /// 40 根健康上行日 K（隔日 +0.21/−0.14 → RSI≈60、尾部放量）。

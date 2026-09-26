@@ -3554,9 +3554,9 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     let run_snapshot: Option<(String, String, i64, String)> = sqlx::query_as(
         "SELECT market, execute_hint, paused, pause_source FROM daily_pick_run WHERE date = ?",
     )
-            .bind(&date_key)
-            .fetch_optional(db)
-            .await?;
+    .bind(&date_key)
+    .fetch_optional(db)
+    .await?;
     let paused = run_snapshot
         .as_ref()
         .map(|(_, _, paused, _)| *paused != 0)
@@ -3877,6 +3877,29 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
         if !source.is_empty() {
             market["pause_source"] = Value::String(source.clone());
         }
+    }
+    let pause_audit: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT source, reason, active, created_at FROM pick_pause_audit \
+         WHERE date = ? ORDER BY created_at ASC, id ASC",
+    )
+    .bind(&date_key)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    if !pause_audit.is_empty() {
+        market["pause_audit"] = Value::Array(
+            pause_audit
+                .into_iter()
+                .map(|(source, reason, active, created_at)| {
+                    serde_json::json!({
+                        "source": source,
+                        "reason": reason,
+                        "active": active != 0,
+                        "created_at": created_at,
+                    })
+                })
+                .collect(),
+        );
     }
     let execute_hint = run_snapshot
         .as_ref()
