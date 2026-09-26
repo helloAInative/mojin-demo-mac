@@ -50,6 +50,7 @@ struct MinuteChart: View {
     @State private var hoverIndex: Int? = nil
     @State private var hoverPoint: CGPoint = .zero
     @Environment(\.displayScale) private var displayScale
+    @Environment(\.colorScheme) private var colorScheme
 
     static let session: [String] = {
         var out: [String] = []
@@ -763,6 +764,7 @@ struct MinuteChart: View {
                 let solidWidth: CGFloat = isDeep
                     ? (1.4 + 0.6 * CGFloat(flashPhaseDeep))
                     : 1.0
+                let ringTint: Color = colorScheme == .dark ? .red : Color(red: 0.78, green: 0.12, blue: 0.10)
                 context.stroke(
                     solid,
                     with: .color(lv.color.opacity(solidAlpha * dimFactor)),
@@ -776,7 +778,7 @@ struct MinuteChart: View {
                     ring.addLine(to: CGPoint(x: xRight, y: y(lv.value)))
                     context.stroke(
                         ring,
-                        with: .color(.red.opacity((0.35 + 0.45 * flashPhaseDeep) * dimFactor)),
+                        with: .color(ringTint.opacity((0.35 + 0.45 * flashPhaseDeep) * dimFactor)),
                         style: StrokeStyle(lineWidth: 0.8)
                     )
                 }
