@@ -577,6 +577,10 @@ struct ContentView: View {
     @State private var reverseCountdown = 0
     @State private var minuteChartExpanded = false
     @State private var showMinuteDetail = false
+    /// §I.5 图例 hover 状态：透传到 MinuteChart.dimmedSeries
+    @StateObject private var watchLegendState = WatchLegendState()
+    /// §I.5 图例钉住高亮系列（空=无钉住）
+    @State private var watchLegendPinned: String = ""
     var embeddedInMenu: Bool = false
 
     enum ReviewKindFilter: Hashable {
@@ -626,6 +630,14 @@ struct ContentView: View {
         if pct > 0 { return trendUp }
         if pct < 0 { return trendDown }
         return .secondary
+    }
+
+    /// §I.5 把 legend hover / 钉住翻译成 dim 集合：空集合 = 不淡化。
+    private func legendDimmedSet() -> Set<String> {
+        let active = watchLegendState.hovered ?? (watchLegendPinned.isEmpty ? nil : watchLegendPinned)
+        guard let active else { return [] }
+        return Set(["price", "avg", "prev", "support", "resistance", "base"])
+            .subtracting([active])
     }
 
     var body: some View {
@@ -853,7 +865,7 @@ struct ContentView: View {
         let density = WatchDensity.resolve(settings.watchDensity)
         return ScrollView {
             VStack(alignment: .leading, spacing: UITokens.stackNormal) {
-                densityChip(density)
+                WatchDensityChipView(settings: settings, resolved: density)
                 if density != .focus {
                     boardIndexStrip
                 }
@@ -894,54 +906,7 @@ struct ContentView: View {
         .onAppear { store.ensureCodeInfo() }
     }
 
-    /// §I.4 密度切换胶囊：自动按盘内盘外判定，可手动锁定。
-    private func densityChip(_ current: WatchDensity) -> some View {
-        HStack(spacing: UITokens.stackTight) {
-            Image(systemName: current == .focus ? "scope" : (current == .standard ? "rectangle.split.3x1" : "square.grid.2x2"))
-                .font(.system(size: UITokens.metaSize))
-                .foregroundStyle(current == .focus ? UITokens.color(.buy) : (current == .full ? UITokens.color(.observe) : .secondary))
-            Text(densityLabel(current))
-                .font(.system(size: UITokens.metaSize, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Spacer()
-            ForEach(WatchDensity.allCases) { mode in
-                let isActive = settings.watchDensity == mode
-                Button {
-                    settings.setWatchDensity(mode)
-                } label: {
-                    Text(mode.rawValue)
-                        .font(.system(size: UITokens.microSize, weight: .semibold))
-                        .foregroundStyle(isActive ? .white : .secondary)
-                        .padding(.horizontal, UITokens.pillHPad)
-                        .padding(.vertical, 1)
-                        .background(isActive ? Color.accentColor : Color.secondary.opacity(0.12), in: Capsule())
-                }
-                .buttonStyle(.plain)
-                .help(densityHelp(mode))
-            }
-        }
-    }
-
-    private func densityLabel(_ resolved: WatchDensity) -> String {
-        switch (settings.watchDensity, resolved) {
-        case (.auto, .focus): return "盘中自动 · 专注"
-        case (.auto, .standard): return "盘前盘后 · 标准"
-        case (.auto, .full): return "盘外自动 · 全量"
-        case (.auto, .auto): return "自动"
-        case (.focus, _): return "专注：报价 + 分时 + 价位 + 持仓"
-        case (.standard, _): return "标准：增加指数条"
-        case (.full, _): return "全量：含资讯 · 研报 · 止损卡 · OHLC"
-        }
-    }
-
-    private func densityHelp(_ mode: WatchDensity) -> String {
-        switch mode {
-        case .auto: return "自动：盘中 09:30–15:00 切专注，其余时段全量"
-        case .focus: return "专注：仅报价头 / 分时 / 价位 / 持仓盈亏；盘中极速决策"
-        case .standard: return "标准：增加指数条"
-        case .full: return "全量：含资讯 · 研报 · 止损卡 · OHLC · 指标"
-        }
-    }
+    /// §I.4 密度切换胶囊：见 WatchPanelChrome.WatchDensityChipView（已外迁）。
 
     /// §F.3–F.4：当前标的的概念板块 / 机构研报 / 近期新闻（走网关，点击打开东财原文）。
     private var codeInfoPanel: some View {
@@ -1967,14 +1932,10 @@ struct ContentView: View {
                 .help("分时 / 逐笔的显隐与放大")
             }
             // §I.5 统一图例：均价 + 昨收 + 阻力 / 支撑 四件套，与价位线同色
-            HStack(spacing: UITokens.stackNormal) {
-                legendDot(color: UITokens.color(.observe), text: "均价")
-                legendDot(color: .secondary.opacity(0.6), text: "昨收", dashed: true)
-                legendDot(color: trendUp, text: "阻力")
-                legendDot(color: trendDown, text: "支撑")
-                Spacer(minLength: 0)
-            }
-            .font(.system(size: UITokens.microSize))
+            WatchLegendView(state: watchLegendState,
+                            avgColor: UITokens.color(.observe),
+                            trendUp: trendUp,
+                            trendDown: trendDown)
             if showTicks {
                 Text(store.tickHint)
                     .font(.system(size: 9))
@@ -2012,6 +1973,7 @@ struct ContentView: View {
                 cost: settings.position.cost,
                 costLightPct: settings.notifyConfig.costLightPct,
                 levelMarks: store.levelMarks,
+                dimmedSeries: legendDimmedSet(),
                 onOpenDetail: { showMinuteDetail = true }
             )
             .frame(height: minuteChartExpanded ? 240 : 132)
@@ -2075,22 +2037,7 @@ struct ContentView: View {
         }
     }
 
-    /// §I.5 图表图例小项：色点（实线 / 虚线）+ 短名，与价位线同色保持视觉一致。
-    private func legendDot(color: Color, text: String, dashed: Bool = false) -> some View {
-        HStack(spacing: 3) {
-            if dashed {
-                Path { p in
-                    p.move(to: CGPoint(x: 0, y: 4))
-                    p.addLine(to: CGPoint(x: 10, y: 4))
-                }
-                .stroke(color, style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
-                .frame(width: 10, height: 8)
-            } else {
-                Capsule().fill(color).frame(width: 10, height: 3)
-            }
-            Text(text).foregroundStyle(.secondary)
-        }
-    }
+    /// §I.5 图表图例小项：见 WatchPanelChrome.WatchLegendView（已外迁）。
 
     private func minuteStat(_ title: String, value: String, color: Color) -> some View {
         HStack(spacing: 3) {
@@ -2220,9 +2167,10 @@ struct ContentView: View {
 
     private var levels: some View {
         HStack(spacing: 6) {
-            pill("基准", store.base > 0 ? String(format: "%.2f", store.base) : "--")
-            pill("阻力", store.resistance > 0 ? String(format: "%.2f", store.resistance) : "--")
-            pill("支撑", store.support > 0 ? String(format: "%.2f", store.support) : "--")
+            WatchLevelRowView(base: store.base,
+                              support: store.support,
+                              resistance: store.resistance,
+                              lastPrice: store.quote.price)
             Button {
                 showSettings = true
             } label: {
