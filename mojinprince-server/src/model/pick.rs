@@ -41,7 +41,7 @@ pub struct PicksDocument {
     pub previous_picks: Vec<PreviousPick>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PickStats {
     pub samples: i64,
     /// 主目标：T+1 收盘价高于推荐日尾盘基准价的比例（0..1）。
@@ -77,9 +77,53 @@ pub struct PickStats {
     /// 标签级 T+1 回测：哪个因子更适合隔日目标。
     #[serde(default)]
     pub tags: Vec<PickTagStat>,
+    /// §A.11 按推荐日 A 股大盘环境分桶的 T+1 统计。
+    #[serde(default)]
+    pub by_regime: Vec<RegimeStat>,
     /// 真实执行口径（次日开盘买入，非收盘价）
     #[serde(default)]
     pub execution: ExecutionStats,
+    /// §A.14 影子实验只展示统计，不混入正式 picks。
+    #[serde(default)]
+    pub shadow_experiments: Vec<ShadowExperimentStat>,
+    /// 当日硬过滤汇总，便于解释“为什么今天少推/不推”。
+    #[serde(default)]
+    pub hard_filter_exclusions: Vec<HardFilterStat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct HardFilterStat {
+    pub stage: String,
+    pub reason: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ShadowExperimentStat {
+    pub experiment_id: String,
+    pub status: String,
+    pub completed_days: i64,
+    pub samples: i64,
+    pub t1_real_win_rate: f64,
+    pub t1_real_wilson_low: f64,
+    pub target_5pct_hit_rate: f64,
+    pub target_5pct_wilson_low: f64,
+    pub promotion_eligible: bool,
+    pub promotion_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RegimeStat {
+    /// bull / range / bear / crash
+    pub regime: String,
+    pub label: String,
+    pub samples: i64,
+    pub win_rate: f64,
+    pub win_rate_low: f64,
+    pub win_rate_high: f64,
+    pub win_rate_margin: f64,
+    pub samples_sufficient: bool,
+    pub avg_t1_pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -115,10 +159,51 @@ pub struct ExecutionStats {
     pub t1_real_samples_sufficient: bool,
     /// 真实 T+1 平均收益
     pub avg_t1_real: f64,
+    /// 盈利样本平均收益 / 亏损样本平均收益（后者为负）。
+    #[serde(default)]
+    pub avg_win: f64,
+    #[serde(default)]
+    pub avg_loss: f64,
     /// 平均最大回撤（持有期间最低价 vs 买入价）
     pub avg_max_dd: f64,
+    /// 样本中最差的持有期最大回撤。
+    #[serde(default)]
+    pub max_drawdown: f64,
+    /// T+1 真实收益最差 10% 样本的均值（CVaR / 期望短缺）。
+    #[serde(default)]
+    pub expected_shortfall_10: f64,
+    /// 实际执行成本下，T+1 盘中达到净盈利 5% 目标的统计。
+    #[serde(default)]
+    pub target_5pct_samples: i64,
+    #[serde(default)]
+    pub target_5pct_hit_rate: f64,
+    #[serde(default)]
+    pub target_5pct_wilson_low: f64,
+    #[serde(default)]
+    pub target_5pct_wilson_high: f64,
     /// 盈亏比（平均盈利 / |平均亏损|）
     pub win_loss_ratio: f64,
+    /// 按推荐日聚合的纸面基准 vs 次日开盘真实执行累计曲线（最近 20 个推荐日）。
+    #[serde(default)]
+    pub curve: Vec<ExecutionCurvePoint>,
+    /// 纸面平均 T+1 - 开盘执行平均 T+1（百分点）；正值表示纸面高估。
+    #[serde(default)]
+    pub execution_drag: f64,
+    /// 执行偏差过大时为 true，客户端应降低“可执行”文案强度。
+    #[serde(default)]
+    pub execution_warning: bool,
+    #[serde(default)]
+    pub execution_hint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ExecutionCurvePoint {
+    pub date: String,
+    pub samples: i64,
+    pub paper_t1_pct: f64,
+    pub open_t1_pct: f64,
+    pub paper_cumulative_pct: f64,
+    pub open_cumulative_pct: f64,
 }
 
 /// §A.9 上一交易日推荐：仅展示已有 T+1 outcome 回写的票，用于在
@@ -160,12 +245,30 @@ pub struct PreviousPick {
     /// §A.9 卖出价基准类型："t1_close"（T+1 收盘价）/ "t1_open"（真实执行买入价）
     #[serde(default)]
     pub sell_basis_kind: Option<String>,
+    /// strong / neutral / weak，按真实次日开盘相对推荐日收盘计算。
+    #[serde(default)]
+    pub open_strength: Option<String>,
+    /// hold_strength / take_profit / risk_control / risk_exit / t1_timeout / entry_invalid。
+    #[serde(default)]
+    pub sell_action: Option<String>,
+    #[serde(default)]
+    pub sell_action_label: Option<String>,
+    /// 与盈利目标分离的风险退出价；不得标记为“盈利5%卖点”。
+    #[serde(default)]
+    pub risk_stop_price: Option<f64>,
+    #[serde(default)]
+    pub target_reached: Option<bool>,
     /// 推荐时的 entry_timing（today_close / next_session_open / ...）
     #[serde(default)]
     pub entry_timing: Option<String>,
     /// 推荐时的 entry_label
     #[serde(default)]
     pub entry_label: Option<String>,
+    /// 次日开盘相对推荐买入区间的校验：valid / invalid_below / invalid_gap。
+    #[serde(default)]
+    pub entry_status: Option<String>,
+    #[serde(default)]
+    pub entry_status_label: Option<String>,
     /// 推荐时附带的 score / reasons 便于复用 UI
     #[serde(default)]
     pub reasons: Vec<String>,

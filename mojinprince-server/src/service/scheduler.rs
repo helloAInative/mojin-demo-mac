@@ -9,7 +9,7 @@ use crate::error::AppError;
 use crate::model::{Quote, ReviewContext, ScheduledReport, TicketSummary};
 use crate::service::ingest;
 use crate::state::AppState;
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, TimeZone, Timelike, Utc, Weekday};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Timelike, Utc, Weekday};
 use std::time::Duration;
 
 pub fn spawn_quote_scheduler(state: AppState) -> tokio::task::JoinHandle<()> {
@@ -104,6 +104,12 @@ mod tests {
         assert!(!tail_pick_window_open(before));
         assert!(tail_pick_window_open(ready));
         assert!(tail_pick_window_open(after), "错过尾盘窗口后仍应补生成");
+        assert!(!morning_pick_window_open(
+            tz.with_ymd_and_hms(2026, 9, 21, 9, 59, 0).unwrap()
+        ));
+        assert!(morning_pick_window_open(
+            tz.with_ymd_and_hms(2026, 9, 21, 10, 0, 0).unwrap()
+        ));
     }
 }
 
@@ -1134,36 +1140,39 @@ fn tail_pick_window_open(now: chrono::DateTime<FixedOffset>) -> bool {
         && now.hour() * 60 + now.minute() >= 14 * 60 + 45
 }
 
+fn morning_pick_window_open(now: chrono::DateTime<FixedOffset>) -> bool {
+    !matches!(now.weekday(), Weekday::Sat | Weekday::Sun)
+        && now.hour() * 60 + now.minute() >= 10 * 60
+}
+
 async fn maybe_generate_picks(state: &AppState) {
     let offset = FixedOffset::east_opt(CN_OFFSET_SECS).expect("valid UTC+8 offset");
     let now = Utc::now().with_timezone(&offset);
     let date = pick_target_date(now);
-    let today_tail = date == now.date_naive() && tail_pick_window_open(now);
     let catch_up = date != now.date_naive();
-    if today_tail || catch_up {
+    let session = if catch_up || (date == now.date_naive() && tail_pick_window_open(now)) {
+        Some("tail")
+    } else if date == now.date_naive() && morning_pick_window_open(now) {
+        Some("morning")
+    } else {
+        None
+    };
+    if let Some(session) = session {
         let date_key = date.format("%Y-%m-%d").to_string();
-        let latest_created: Option<i64> =
-            sqlx::query_scalar("SELECT MAX(created_at) FROM daily_pick WHERE date = ?")
-                .bind(&date_key)
-                .fetch_one(&state.db)
-                .await
-                .ok()
-                .flatten();
-        let tail_start_ms = now
-            .timezone()
-            .from_local_datetime(&date.and_hms_opt(14, 40, 0).unwrap())
-            .single()
-            .map(|dt| dt.timestamp_millis())
-            .unwrap_or_default();
-        let needs_generate = if date == now.date_naive() {
-            latest_created.map(|ts| ts < tail_start_ms).unwrap_or(true)
-        } else {
-            latest_created.is_none()
-        };
+        let already_generated: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM daily_pick_snapshot WHERE date=? AND session=?",
+        )
+        .bind(&date_key)
+        .bind(session)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+        let needs_generate = already_generated == 0;
         if needs_generate {
             match crate::service::pick::generate_picks(state, date, None).await {
                 Ok(doc) => tracing::info!(
                     date = %date_key,
+                    session,
                     count = doc.picks.len(),
                     "daily picks generated (quant)"
                 ),

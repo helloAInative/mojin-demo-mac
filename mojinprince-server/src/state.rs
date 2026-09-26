@@ -2,7 +2,9 @@
 use crate::config::Config;
 use crate::model::Quote;
 use crate::service::ingest::{EastMoneyMainNet, EastMoneyNews, EastMoneyReports, EastMoneySector};
-use crate::service::pick::{DayKSource, EastMoneyRanking, SinaRanking, TencentUsIndex};
+use crate::service::pick::{
+    DayKSource, EastMoneyRanking, SinaRanking, TencentCnIndex, TencentUsIndex,
+};
 use crate::service::quote::failover::QuoteFailover;
 use crate::service::quote::EastMoneyTicks;
 use sqlx::SqlitePool;
@@ -66,6 +68,8 @@ pub struct AppState {
     pub day_k: DayKSource,
     /// 智能推荐：隔夜美股情绪源
     pub us_index: TencentUsIndex,
+    /// §A.10 智能推荐：A 股大盘情绪源（上证/深成/创业板/沪深300）
+    pub cn_index: TencentCnIndex,
 }
 
 impl AppState {
@@ -127,6 +131,7 @@ impl AppState {
             ticks: EastMoneyTicks::default(),
             day_k: DayKSource::default(),
             us_index: TencentUsIndex::default(),
+            cn_index: TencentCnIndex::default(),
         })
     }
 }
