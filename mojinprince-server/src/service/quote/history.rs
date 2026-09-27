@@ -117,6 +117,20 @@ pub(crate) fn parse_days(json: &Value, code: &str) -> Result<Vec<DayBar>, QuoteE
         .as_array()
         .or_else(|| stock["day"].as_array())
         .ok_or(QuoteError::Empty)?;
+    parse_day_rows(rows, code)
+}
+
+/// 成交回填必须使用不复权价格。前复权序列会在后续分红送转后重写历史价格，
+/// 若与推荐当日固化的原始买价混用，会凭空制造收益或亏损；缺少 raw `day`
+/// 时宁可不产出标签，也不回退到 `qfqday`。
+pub(crate) fn parse_execution_days(json: &Value, code: &str) -> Result<Vec<DayBar>, QuoteError> {
+    let rows = json["data"][code]["day"]
+        .as_array()
+        .ok_or(QuoteError::Empty)?;
+    parse_day_rows(rows, code)
+}
+
+fn parse_day_rows(rows: &[Value], code: &str) -> Result<Vec<DayBar>, QuoteError> {
     let mut bars = Vec::with_capacity(rows.len());
     for row in rows {
         let Some(parts) = row.as_array() else {
@@ -174,5 +188,22 @@ mod tests {
         let bars = parse_days(&json, "sz300623").unwrap();
         assert_eq!(bars[0].close, 11.0);
         assert_eq!(bars[0].volume, 200);
+    }
+
+    #[test]
+    fn execution_daily_requires_and_prefers_unadjusted_series() {
+        let json = serde_json::json!({"data": {"sz300623": {
+            "qfqday": [["2026-09-17", "10", "11", "12", "9", "200"]],
+            "day": [["2026-09-17", "20", "21", "22", "19", "100"]]
+        }}});
+        let bars = parse_execution_days(&json, "sz300623").unwrap();
+        assert_eq!(bars[0].open, 20.0);
+        assert_eq!(bars[0].close, 21.0);
+        assert_eq!(bars[0].volume, 100);
+
+        let adjusted_only = serde_json::json!({"data": {"sz300623": {
+            "qfqday": [["2026-09-17", "10", "11"]]
+        }}});
+        assert!(parse_execution_days(&adjusted_only, "sz300623").is_err());
     }
 }
