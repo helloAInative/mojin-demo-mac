@@ -260,6 +260,12 @@ struct GatewayPick: Codable, Equatable, Identifiable {
     struct Calibration: Codable, Equatable {
         var samples: Int
         var completedDays: Int?
+        var signalSamples: Int?
+        var signalCompletedDays: Int?
+        var executionRate: Double?
+        var executionWilsonLow: Double?
+        var executionWilsonHigh: Double?
+        var entryUnexecutable: Bool?
         var wins: Int
         var posteriorWinProbability: Double
         var wilsonLow: Double
@@ -267,11 +273,43 @@ struct GatewayPick: Codable, Equatable, Identifiable {
         var meanT1Real: Double?
         var meanT1RealLow: Double?
         var meanT1RealHigh: Double?
+        var stressCostPct: Double?
+        var meanT1RealStress: Double?
+        var meanT1RealStressLow: Double?
+        var meanT1RealStressHigh: Double?
+        var costStressNegative: Bool?
         var averageWin: Double?
         var averageLoss: Double?
         var payoffRatio: Double?
+        var recentSamples: Int?
+        var recentWinRate: Double?
+        var recentMeanT1Real: Double?
+        var priorSamples: Int?
+        var priorWinRate: Double?
+        var priorMeanT1Real: Double?
+        var temporalStability: String?
+        var historySamples: Int?
+        var historyCompletedDays: Int?
+        var coverageStatus: String?
+        var outcomesDue: Int?
+        var outcomesCompleted: Int?
+        var outcomeCoverage: Double?
+        var localOutcomesDue: Int?
+        var localOutcomesCompleted: Int?
+        var localOutcomeCoverage: Double?
+        var dataQualityStatus: String?
+        var dataQualityScope: String?
+        var dataQualityDegraded: Bool?
+        var decisionConfidenceLevel: Double?
+        var multipleTestingCorrection: String?
         var target5pctSamples: Int
+        var target5pctCompletedDays: Int?
         var target5pctPosteriorProbability: Double
+        var target5pctWilsonLow: Double?
+        var target5pctWilsonHigh: Double?
+        var target5pctResolutionRate: Double?
+        var target5pctPathQualityStatus: String?
+        var target5pctUnreachable: Bool?
         var scope: String
         var confidenceTier: String
         var scoreDelta: Double
@@ -280,17 +318,55 @@ struct GatewayPick: Codable, Equatable, Identifiable {
         enum CodingKeys: String, CodingKey {
             case samples, wins, scope, abstain
             case completedDays = "completed_days"
+            case signalSamples = "signal_samples"
+            case signalCompletedDays = "signal_completed_days"
+            case executionRate = "execution_rate"
+            case executionWilsonLow = "execution_wilson_low"
+            case executionWilsonHigh = "execution_wilson_high"
+            case entryUnexecutable = "entry_unexecutable"
             case posteriorWinProbability = "posterior_win_probability"
             case wilsonLow = "wilson_low"
             case wilsonHigh = "wilson_high"
             case meanT1Real = "mean_t1_real"
             case meanT1RealLow = "mean_t1_real_low"
             case meanT1RealHigh = "mean_t1_real_high"
+            case stressCostPct = "stress_cost_pct"
+            case meanT1RealStress = "mean_t1_real_stress"
+            case meanT1RealStressLow = "mean_t1_real_stress_low"
+            case meanT1RealStressHigh = "mean_t1_real_stress_high"
+            case costStressNegative = "cost_stress_negative"
             case averageWin = "average_win"
             case averageLoss = "average_loss"
             case payoffRatio = "payoff_ratio"
+            case recentSamples = "recent_samples"
+            case recentWinRate = "recent_win_rate"
+            case recentMeanT1Real = "recent_mean_t1_real"
+            case priorSamples = "prior_samples"
+            case priorWinRate = "prior_win_rate"
+            case priorMeanT1Real = "prior_mean_t1_real"
+            case temporalStability = "temporal_stability"
+            case historySamples = "history_samples"
+            case historyCompletedDays = "history_completed_days"
+            case coverageStatus = "coverage_status"
+            case outcomesDue = "outcomes_due"
+            case outcomesCompleted = "outcomes_completed"
+            case outcomeCoverage = "outcome_coverage"
+            case localOutcomesDue = "local_outcomes_due"
+            case localOutcomesCompleted = "local_outcomes_completed"
+            case localOutcomeCoverage = "local_outcome_coverage"
+            case dataQualityStatus = "data_quality_status"
+            case dataQualityScope = "data_quality_scope"
+            case dataQualityDegraded = "data_quality_degraded"
+            case decisionConfidenceLevel = "decision_confidence_level"
+            case multipleTestingCorrection = "multiple_testing_correction"
             case target5pctSamples = "target_5pct_samples"
+            case target5pctCompletedDays = "target_5pct_completed_days"
             case target5pctPosteriorProbability = "target_5pct_posterior_probability"
+            case target5pctWilsonLow = "target_5pct_wilson_low"
+            case target5pctWilsonHigh = "target_5pct_wilson_high"
+            case target5pctResolutionRate = "target_5pct_resolution_rate"
+            case target5pctPathQualityStatus = "target_5pct_path_quality_status"
+            case target5pctUnreachable = "target_5pct_unreachable"
             case confidenceTier = "confidence_tier"
             case scoreDelta = "score_delta"
         }
