@@ -56,7 +56,9 @@ enum UITokens {
     /// 用法：`.foregroundStyle(.tertiary)` → `.foregroundStyle(.tertiary.adaptiveContrast())`
     /// 或更彻底的 `.modifier(UITokens.ContrastTertiaryModifier())`。
     static func adaptiveTertiary(for scheme: ColorScheme) -> Color {
-        scheme == .dark ? Color.secondary.opacity(0.85) : Color.tertiary
+        // SwiftUI 的 Color.tertiary 是 ShapeStyle 协议扩展成员，
+        // 不能直接当 Color 用；浅色下退化为 secondary 0.55。
+        scheme == .dark ? Color.secondary.opacity(0.85) : Color.secondary.opacity(0.55)
     }
 
     struct ContrastTertiaryModifier: ViewModifier {
