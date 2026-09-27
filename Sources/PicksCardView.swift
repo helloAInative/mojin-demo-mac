@@ -651,21 +651,45 @@ struct PicksCardView: View {
                                         .help(pickHelp_AutoWeight(pick.meta.autoWeight))
                                 }
                                 if let calibration = pick.meta.calibration,
-                                   calibration.samples >= 30 {
-                                    let signal: UITokens.Signal = calibration.confidenceTier == "strong"
-                                        ? .buy : .observe
+                                   (calibration.signalSamples ?? calibration.samples) >= 30 {
+                                    let dataQualityDegraded = calibration.dataQualityStatus == "degraded"
+                                    let signal: UITokens.Signal = dataQualityDegraded
+                                        ? .danger
+                                        : (calibration.confidenceTier == "strong" ? .buy : .observe)
                                     Text(String(
-                                        format: "校准 %.0f%% [%.0f–%.0f] · n=%d/%d日",
+                                        format: "校准 %.0f%% · %.0f%%区间[%.0f–%.0f] · n=%d/%d日%@",
                                         calibration.posteriorWinProbability * 100,
+                                        (calibration.decisionConfidenceLevel ?? 0.95) * 100,
                                         calibration.wilsonLow * 100,
                                         calibration.wilsonHigh * 100,
                                         calibration.samples,
-                                        calibration.completedDays ?? 0
+                                        calibration.completedDays ?? 0,
+                                        dataQualityDegraded ? " · 回写不足/停用" : ""
                                     ))
                                     .font(.system(size: UITokens.microSize, weight: .semibold))
                                     .monospacedDigit()
                                     .foregroundStyle(UITokens.color(signal))
-                                    .help("推荐日前 180 天相似标签的真实开盘执行 T+1；Beta(2,2) 后验均值 + Wilson 95% 区间")
+                                    .help(pickHelp_Calibration(calibration))
+                                    if let executionRate = calibration.executionRate,
+                                       let executionLow = calibration.executionWilsonLow,
+                                       let executionHigh = calibration.executionWilsonHigh {
+                                        Text(String(
+                                            format: "可成交 %.0f%% · 99%%区间[%.0f–%.0f] · %d/%d信号",
+                                            executionRate * 100,
+                                            executionLow * 100,
+                                            executionHigh * 100,
+                                            calibration.samples,
+                                            calibration.signalSamples ?? calibration.samples
+                                        ))
+                                        .font(.system(size: UITokens.microSize, weight: .semibold))
+                                        .monospacedDigit()
+                                        .foregroundStyle(UITokens.color(
+                                            calibration.entryUnexecutable == true
+                                                ? .danger
+                                                : (executionLow >= 0.5 ? .buy : .observe)
+                                        ))
+                                        .help("先判断历史信号是否真正满足买入条件；胜率只统计已成交样本，策略期望仍把未成交按0%计入")
+                                    }
                                     if let mean = calibration.meanT1Real,
                                        let low = calibration.meanT1RealLow,
                                        let high = calibration.meanT1RealHigh {
@@ -674,7 +698,65 @@ struct PicksCardView: View {
                                             .font(.system(size: UITokens.microSize, weight: .semibold))
                                             .monospacedDigit()
                                             .foregroundStyle(UITokens.color(low > 0 ? .buy : (high < 0 ? .danger : .observe)))
-                                            .help("相似样本真实T+1收益均值及95%区间；收益先截尾到±20%，避免极端值主导")
+                                            .help("相似样本使用不复权原始成交价，按目标/止损/T+1收盘真实退出并扣0.2%成本后的净收益均值及99%决策区间；收益截尾到±20%")
+                                    }
+                                    if let stress = calibration.meanT1RealStress,
+                                       let stressLow = calibration.meanT1RealStressLow,
+                                       let stressHigh = calibration.meanT1RealStressHigh {
+                                        Text(String(format: "成本压力 %.1f%%：%+.2f%% [%+.2f–%+.2f]",
+                                                    calibration.stressCostPct ?? 0.5,
+                                                    stress, stressLow, stressHigh))
+                                            .font(.system(size: UITokens.microSize, weight: .semibold))
+                                            .monospacedDigit()
+                                            .foregroundStyle(UITokens.color(
+                                                stressLow > 0 ? .buy : (stressHigh < 0 ? .danger : .observe)
+                                            ))
+                                            .help("将往返成本从基础0.2%提高到不利情景0.5%；区间上界仍低于0时主动弃权，下界未高于0时禁止正向加分")
+                                    }
+                                    if let targetLow = calibration.target5pctWilsonLow,
+                                       let targetHigh = calibration.target5pctWilsonHigh {
+                                        Text(String(
+                                            format: "5%%实达 %.0f%% · 99%%区间[%.0f–%.0f] · n=%d/%d日",
+                                            calibration.target5pctPosteriorProbability * 100,
+                                            targetLow * 100,
+                                            targetHigh * 100,
+                                            calibration.target5pctSamples,
+                                            calibration.target5pctCompletedDays ?? 0
+                                        ))
+                                        .font(.system(size: UITokens.microSize, weight: .semibold))
+                                        .monospacedDigit()
+                                        .foregroundStyle(UITokens.color(
+                                            calibration.target5pctPathQualityStatus == "degraded"
+                                                ? .observe
+                                                : (targetHigh < 0.05 ? .danger : (targetLow >= 0.05 ? .buy : .observe))
+                                        ))
+                                        .help(String(
+                                            format: "相似历史策略执行中盘中净5%%达标率；99%% Wilson决策区间；路径可判定率 %.0f%%%@",
+                                            (calibration.target5pctResolutionRate ?? 0) * 100,
+                                            calibration.target5pctPathQualityStatus == "degraded" ? "，低于90%，不作强结论" : ""
+                                        ))
+                                    }
+                                    if let recentWin = calibration.recentWinRate,
+                                       let priorWin = calibration.priorWinRate,
+                                       let recentReturn = calibration.recentMeanT1Real,
+                                       let priorReturn = calibration.priorMeanT1Real {
+                                        let drifted = calibration.temporalStability == "degraded"
+                                        Text(String(
+                                            format: "近60天 %.0f%%/%+.2f%% · 前窗 %.0f%%/%+.2f%%%@",
+                                            recentWin * 100, recentReturn,
+                                            priorWin * 100, priorReturn,
+                                            drifted ? " · 漂移" : ""
+                                        ))
+                                        .font(.system(size: UITokens.microSize, weight: .semibold))
+                                        .monospacedDigit()
+                                        .foregroundStyle(UITokens.color(drifted ? .danger : .neutral))
+                                        .help("最近60天与此前120天的真实执行胜率/日均收益对照；胜率下降≥15个百分点且近期收益转负时判定漂移")
+                                    }
+                                    if calibration.coverageStatus == "out_of_distribution" {
+                                        Text("分布外 · 仅影子观察")
+                                            .font(.system(size: UITokens.microSize, weight: .bold))
+                                            .foregroundStyle(UITokens.color(.danger))
+                                            .help("历史库已成熟，但当前标签组合缺少足够相似案例，不允许直接进入生产推荐")
                                     }
                                 }
                                 Spacer(minLength: 0)
@@ -1020,8 +1102,20 @@ struct PicksCardView: View {
 
     private func pickHelp_Calibration(_ calibration: GatewayPick.Calibration?) -> String {
         guard let calibration else { return "概率校准：暂无历史相似样本" }
-        if calibration.samples < 30 {
+        if calibration.samples < 30,
+           (calibration.signalSamples ?? calibration.samples) < 30 {
             return "概率校准：\(calibration.samples) 样本不足，保持中性"
+        }
+        let execution = if let rate = calibration.executionRate,
+                           let low = calibration.executionWilsonLow,
+                           let high = calibration.executionWilsonHigh {
+            String(format: "；可成交率 %.0f%%，99%%区间 [%.0f–%.0f%%]（%d/%d信号）%@",
+                   rate * 100, low * 100, high * 100,
+                   calibration.samples,
+                   calibration.signalSamples ?? calibration.samples,
+                   calibration.entryUnexecutable == true ? "，上界低于50%，已弃权" : "")
+        } else {
+            ""
         }
         let payoff = if let mean = calibration.meanT1Real,
                         let low = calibration.meanT1RealLow,
@@ -1031,16 +1125,83 @@ struct PicksCardView: View {
         } else {
             ""
         }
+        let friction = if let mean = calibration.meanT1RealStress,
+                          let low = calibration.meanT1RealStressLow,
+                          let high = calibration.meanT1RealStressHigh {
+            String(format: "；成本压力%.1f%%：%+.2f%%，99%%区间 [%+.2f–%+.2f%%]%@",
+                   calibration.stressCostPct ?? 0.5,
+                   mean, low, high,
+                   calibration.costStressNegative == true ? "，压力情景为负，已弃权" : "")
+        } else {
+            ""
+        }
+        let target = if let low = calibration.target5pctWilsonLow,
+                        let high = calibration.target5pctWilsonHigh {
+            String(format: "；5%%实达后验 %.0f%%，99%%区间 [%.0f–%.0f%%]，%d样本/%d独立交易日，路径可判定 %.0f%%%@",
+                   calibration.target5pctPosteriorProbability * 100,
+                   low * 100,
+                   high * 100,
+                   calibration.target5pctSamples,
+                   calibration.target5pctCompletedDays ?? 0,
+                   (calibration.target5pctResolutionRate ?? 0) * 100,
+                   calibration.target5pctUnreachable == true ? "，目标可达性被否定" : "")
+        } else {
+            ""
+        }
+        let temporal = if let recentWin = calibration.recentWinRate,
+                          let priorWin = calibration.priorWinRate,
+                          let recentReturn = calibration.recentMeanT1Real,
+                          let priorReturn = calibration.priorMeanT1Real {
+            String(format: "；近60天 %.0f%%/%+.2f%%，前120天 %.0f%%/%+.2f%%，时间稳定性 %@",
+                   recentWin * 100, recentReturn,
+                   priorWin * 100, priorReturn,
+                   calibration.temporalStability ?? "insufficient")
+        } else {
+            ""
+        }
+        let coverage = switch calibration.coverageStatus ?? "" {
+        case "out_of_distribution":
+            "；覆盖状态：分布外，仅影子观察"
+        case "in_distribution":
+            "；覆盖状态：历史分布内"
+        case "cold_start":
+            "；覆盖状态：历史库冷启动，不做强结论"
+        default:
+            ""
+        }
+        let dataQuality: String = {
+            guard let rate = calibration.outcomeCoverage,
+                  let due = calibration.outcomesDue,
+                  let completed = calibration.outcomesCompleted else { return "" }
+            let local = if let localRate = calibration.localOutcomeCoverage,
+                           let localDue = calibration.localOutcomesDue,
+                           let localCompleted = calibration.localOutcomesCompleted,
+                           localDue >= 30 {
+                String(format: "，相似形态 %.0f%%（%d/%d）", localRate * 100, localCompleted, localDue)
+            } else {
+                ""
+            }
+            return calibration.dataQualityStatus == "degraded"
+                ? String(format: "；结果回写覆盖：全局 %.0f%%（%d/%d）%@，低于90%%的层级已令校准加分与弃权停用", rate * 100, completed, due, local)
+                : String(format: "；结果回写覆盖：全局 %.0f%%（%d/%d）%@，状态 %@", rate * 100, completed, due, local, calibration.dataQualityStatus ?? "unknown")
+        }()
         return String(
-            format: "概率校准：后验 %.0f%%，Wilson [%.0f–%.0f%%]，%d样本/%d独立交易日，%@环境，%@%@",
+            format: "概率校准：后验 %.0f%%，Wilson %.0f%%区间 [%.0f–%.0f%%]，%d样本/%d独立交易日，%@环境，%@%@%@%@%@%@%@%@",
             calibration.posteriorWinProbability * 100,
+            (calibration.decisionConfidenceLevel ?? 0.95) * 100,
             calibration.wilsonLow * 100,
             calibration.wilsonHigh * 100,
             calibration.samples,
             calibration.completedDays ?? 0,
             calibration.scope,
             calibration.confidenceTier,
-            payoff
+            execution,
+            payoff,
+            friction,
+            target,
+            temporal,
+            coverage,
+            dataQuality
         )
     }
 
