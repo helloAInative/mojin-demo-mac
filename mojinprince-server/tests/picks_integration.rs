@@ -206,7 +206,11 @@ async fn manual_kill_switch_pauses_before_network_and_writes_audit() {
         .bind(80.0)
         .bind("[]")
         .bind("")
-        .bind(json!({"outcome": {"t1_real": -1.0}}).to_string())
+        .bind(json!({"outcome": {
+            "t1_real": -1.0,
+            "strategy_t1_real": -1.2,
+            "execution_price_basis": "raw_unadjusted"
+        }}).to_string())
         .bind(0_i64)
         .execute(&db)
         .await
@@ -252,7 +256,11 @@ async fn three_consecutive_losing_pick_days_pause_before_network() {
         .bind(80.0)
         .bind("[]")
         .bind("")
-        .bind(json!({"outcome": {"t1_real": -1.0 - index as f64}}).to_string())
+        .bind(json!({"outcome": {
+            "t1_real": -1.0 - index as f64,
+            "strategy_t1_real": -1.2 - index as f64,
+            "execution_price_basis": "raw_unadjusted"
+        }}).to_string())
         .bind(0_i64)
         .execute(&state.db)
         .await
@@ -505,7 +513,10 @@ async fn backfill_writes_outcome_and_stats() {
     upstream.mock(|when, then| {
         when.method(GET).path("/appstock/app/fqkline/get");
         then.status(200).json_body(json!({
-            "data": {"sz300623": {"qfqday": zigzag_bars()}}
+            "data": {"sz300623": {
+                "qfqday": zigzag_bars(),
+                "day": zigzag_bars()
+            }}
         }));
     });
     let bars = zigzag_bars();
@@ -547,6 +558,12 @@ async fn backfill_writes_outcome_and_stats() {
     assert!((meta["outcome"]["t1_pct"].as_f64().unwrap() - t1).abs() < 1e-9);
     assert!((meta["outcome"]["t5_pct"].as_f64().unwrap() - t5).abs() < 1e-9);
     assert_eq!(meta["outcome"]["target_hit_5pct"], true);
+    assert_eq!(meta["outcome"]["target_path_status"], "target_only");
+    assert!(meta["outcome"]["t1_low"].as_f64().is_some());
+    assert!(meta["outcome"]["risk_stop_price"].as_f64().is_some());
+    assert_eq!(meta["outcome"]["strategy_exit_basis"], "target_limit");
+    assert!((meta["outcome"]["strategy_t1_real"].as_f64().unwrap() - 5.0).abs() < 1e-9);
+    assert_eq!(meta["outcome"]["execution_price_basis"], "raw_unadjusted");
 
     // 统计：主口径 T+1，同时保留 T+5 中线参考。
     let doc = service::pick::list_picks(&state.db, Some(&pick_date))
@@ -568,7 +585,10 @@ async fn shadow_pick_isolated_from_production_and_backfilled() {
     upstream.mock(|when, then| {
         when.method(GET).path("/appstock/app/fqkline/get");
         then.status(200).json_body(json!({
-            "data": {"sz300623": {"qfqday": zigzag_bars()}}
+            "data": {"sz300623": {
+                "qfqday": zigzag_bars(),
+                "day": zigzag_bars()
+            }}
         }));
     });
     let bars = zigzag_bars();
@@ -619,6 +639,10 @@ async fn shadow_pick_isolated_from_production_and_backfilled() {
     let meta: Value = serde_json::from_str(&meta).unwrap();
     assert!(meta["outcome"]["t1_real"].as_f64().is_some());
     assert!(meta["outcome"]["target_hit_5pct"].as_bool().is_some());
+    assert!(meta["outcome"]["target_path_status"].as_str().is_some());
+    assert!(meta["outcome"]["strategy_exit_basis"].as_str().is_some());
+    assert!(meta["outcome"]["strategy_t1_real"].as_f64().is_some());
+    assert_eq!(meta["outcome"]["execution_price_basis"], "raw_unadjusted");
 
     let doc = service::pick::list_picks(&state.db, Some(&pick_date))
         .await
@@ -1039,6 +1063,9 @@ async fn list_picks_exposes_wilson_interval_and_low_sample_flag() {
             "outcome": {
                 "t1_pct": (t1_close - base_close) / base_close * 100.0,
                 "t1_real": (t1_close - t1_open) / t1_open * 100.0,
+                "strategy_t1_real": (t1_close - t1_open) / t1_open * 100.0 - 0.2,
+                "strategy_exit_basis": "t1_close",
+                "execution_price_basis": "raw_unadjusted",
                 "entry_gap": (t1_open - base_close) / base_close * 100.0,
             }
         })
@@ -1150,7 +1177,12 @@ async fn rolling_health_detects_drift_and_exposes_reproducible_rule_id() {
                 "industry": "半导体",
                 "pool_sources": ["momentum", "relative_strength"],
                 "cn": {"avg_pct": if index < 10 { 0.9 } else { -1.0 }},
-                "outcome": {"t1_pct": real, "t1_real": real}
+                "outcome": {
+                    "t1_pct": real,
+                    "t1_real": real,
+                    "strategy_t1_real": real - 0.2,
+                    "execution_price_basis": "raw_unadjusted"
+                }
             })
             .to_string(),
         )
@@ -1182,7 +1214,7 @@ async fn rolling_health_detects_drift_and_exposes_reproducible_rule_id() {
         .stats
         .audit
         .experiment_id
-        .starts_with("production-v2026.09.26-"));
+        .starts_with("production-v2026.09.27-"));
     assert_eq!(doc.stats.audit.rule_hash.len(), 16);
     assert_eq!(doc.stats.audit.manifest["industry_cap"], 2);
     assert_eq!(doc.stats.audit.pool_sources.len(), 2);
@@ -1235,7 +1267,10 @@ async fn picks_run_attaches_buy_and_sell_price_zones() {
         .bind(80.0)
         .bind("[]")
         .bind("")
-        .bind(json!({"outcome": {"t1_pct": 1.5}}).to_string())
+        .bind(json!({"outcome": {
+            "t1_pct": 1.5,
+            "execution_price_basis": "raw_unadjusted"
+        }}).to_string())
         .bind(0)
         .execute(&db)
         .await
@@ -1281,7 +1316,7 @@ async fn picks_run_attaches_buy_and_sell_price_zones() {
     assert_eq!(basis["samples"].as_i64().unwrap(), 5);
     assert!((basis["win_rate"].as_f64().unwrap() - 1.0).abs() < 1e-9);
     let experiment_id = pick["meta"]["experiment_id"].as_str().unwrap();
-    assert!(experiment_id.starts_with("production-v2026.09.26-"));
+    assert!(experiment_id.starts_with("production-v2026.09.27-"));
     assert_eq!(
         pick["meta"]["experiment"]["manifest"]["market_crash_pause_pct"],
         -2.0
@@ -1379,7 +1414,13 @@ async fn list_picks_returns_previous_picks_with_sell_zone() {
         .bind(json!({
             "close": 10.0,
             "plan": {"entry_timing": "today_close", "entry_label": "今日尾盘"},
-            "outcome": {"t1_pct": 2.0, "t1_close": 10.20, "t1_open_basis": 10.02, "t1_real": 1.7}
+            "outcome": {
+                "t1_pct": 2.0,
+                "t1_close": 10.20,
+                "t1_open_basis": 10.02,
+                "t1_real": 1.7,
+                "execution_price_basis": "raw_unadjusted"
+            }
         }).to_string())
         .bind(0)
         .execute(&db)
@@ -1447,7 +1488,8 @@ async fn list_picks_previous_picks_uses_open_basis_for_next_session_open() {
             "t1_pct": 5.0,
             "t1_close": 22.05,
             "t1_open_basis": 21.50, // T+1 开盘价（次日开盘买入的真实价）
-            "t1_real": 2.3
+            "t1_real": 2.3,
+            "execution_price_basis": "raw_unadjusted"
         }
     }).to_string())
     .bind(0)
