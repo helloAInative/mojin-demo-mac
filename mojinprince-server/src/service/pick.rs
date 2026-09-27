@@ -154,6 +154,32 @@ impl DayKSource {
         crate::service::quote::history::parse_days(&json, code)
             .map_err(|e| PickError::Parse(e.to_string()))
     }
+
+    /// 获取不复权日 K，仅用于真实成交回填。与技术指标的前复权序列严格隔离。
+    pub async fn fetch_execution(
+        &self,
+        http: &reqwest::Client,
+        code: &str,
+        limit: i64,
+    ) -> Result<Vec<DayBar>, PickError> {
+        let upstream_limit = limit.max(120);
+        let param = format!("{code},day,,,{upstream_limit}");
+        let response = http
+            .get(format!("{}/appstock/app/fqkline/get", self.base_url))
+            .query(&[("param", param.as_str())])
+            .send()
+            .await
+            .map_err(|e| PickError::Network(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(PickError::Network(format!("status {}", response.status())));
+        }
+        let json: Value = response
+            .json()
+            .await
+            .map_err(|e| PickError::Parse(e.to_string()))?;
+        crate::service::quote::history::parse_execution_days(&json, code)
+            .map_err(|e| PickError::Parse(e.to_string()))
+    }
 }
 
 /// 东财涨幅榜（沪深 A，剔除 ST / 退市 / 次新）。
@@ -1223,7 +1249,7 @@ fn learned_score_adjustment(
             "prior_minimum_samples": 12,
             "lookback_days": 120,
             "validation_days": 30,
-            "outcome_basis": "t1_real",
+            "outcome_basis": "executed_strategy_t1_real_net_raw_unadjusted",
             "method": "walk_forward_wilson",
         }),
     )
@@ -1243,7 +1269,10 @@ async fn load_tag_performance(
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT date, reasons, meta FROM daily_pick \
          WHERE date >= ? AND date < ? \
-         AND json_extract(meta,'$.outcome.t1_real') IS NOT NULL",
+         AND json_extract(meta,'$.outcome.strategy_t1_real') IS NOT NULL \
+         AND json_extract(meta,'$.outcome.strategy_exit_basis') IN \
+             ('target_at_open','target_limit','stop_at_open','risk_stop','t1_close') \
+         AND json_extract(meta,'$.outcome.execution_price_basis') = 'raw_unadjusted'",
     )
     .bind(&since)
     .bind(&before)
@@ -1256,7 +1285,7 @@ async fn load_tag_performance(
         let parsed = serde_json::from_str::<Value>(&meta).ok();
         let t1 = parsed
             .as_ref()
-            .and_then(|m| m["outcome"]["t1_real"].as_f64());
+            .and_then(|m| m["outcome"]["strategy_t1_real"].as_f64());
         let Some(t1) = t1 else { continue };
         let regime = parsed
             .as_ref()
@@ -1307,41 +1336,102 @@ fn record_tag_outcome(bucket: &mut TagWindowBucket, recent: bool, won: bool) {
 #[derive(Debug, Clone)]
 struct CalibrationSample {
     date: String,
+    recent: bool,
     tags: BTreeSet<String>,
     regime: Option<String>,
+    executed: bool,
     won: bool,
     real_return: f64,
     target_hit_5pct: Option<bool>,
 }
 
+#[derive(Debug, Clone)]
+struct CalibrationDueSample {
+    tags: BTreeSet<String>,
+    regime: Option<String>,
+    completed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CalibrationHistory {
+    samples: Vec<CalibrationSample>,
+    due_samples: Vec<CalibrationDueSample>,
+    outcomes_due: i64,
+    outcomes_completed: i64,
+    outcome_coverage: f64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct CalibrationEvidence {
+    signal_samples: i64,
+    signal_completed_days: i64,
     samples: i64,
     completed_days: i64,
     wins: i64,
     posterior_win_probability: f64,
     wilson_low: f64,
     wilson_high: f64,
+    execution_rate: f64,
+    execution_wilson_low: f64,
+    execution_wilson_high: f64,
     mean_t1_real: f64,
     mean_t1_real_low: f64,
     mean_t1_real_high: f64,
+    stress_cost_pct: f64,
+    mean_t1_real_stress: f64,
+    mean_t1_real_stress_low: f64,
+    mean_t1_real_stress_high: f64,
     average_win: f64,
     average_loss: f64,
     payoff_ratio: f64,
+    recent_samples: i64,
+    recent_win_rate: f64,
+    recent_mean_t1_real: f64,
+    prior_samples: i64,
+    prior_win_rate: f64,
+    prior_mean_t1_real: f64,
+    temporal_stability: String,
+    history_samples: i64,
+    history_completed_days: i64,
+    coverage_status: String,
+    outcomes_due: i64,
+    outcomes_completed: i64,
+    outcome_coverage: f64,
+    local_outcomes_due: i64,
+    local_outcomes_completed: i64,
+    local_outcome_coverage: f64,
+    data_quality_status: String,
+    data_quality_scope: String,
     target_samples: i64,
+    target_completed_days: i64,
     target_hits: i64,
     target_posterior_probability: f64,
+    target_wilson_low: f64,
+    target_wilson_high: f64,
+    target_resolution_rate: f64,
+    target_path_quality_status: String,
     scope: String,
     confidence_tier: String,
     score_delta: f64,
     abstain: bool,
     negative_expected_return: bool,
+    cost_stress_negative: bool,
+    entry_unexecutable: bool,
+    target_unreachable: bool,
+    temporal_drift: bool,
+    out_of_distribution: bool,
+    data_quality_degraded: bool,
     positive_boost_enabled: bool,
 }
 
+/// Top5 同时检验时按 Bonferroni 将家族错误率控制在约 5%：
+/// 单候选双侧 alpha=0.01，对应标准正态 z≈2.576。
+const CALIBRATION_DECISION_Z: f64 = 2.575_829;
+const CALIBRATION_DECISION_CONFIDENCE: f64 = 0.99;
+
 impl CalibrationEvidence {
     fn as_json(&self) -> Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "samples": self.samples,
             "completed_days": self.completed_days,
             "wins": self.wins,
@@ -1355,21 +1445,71 @@ impl CalibrationEvidence {
             "average_loss": self.average_loss,
             "payoff_ratio": self.payoff_ratio,
             "target_5pct_samples": self.target_samples,
+            "target_5pct_completed_days": self.target_completed_days,
             "target_5pct_hits": self.target_hits,
             "target_5pct_posterior_probability": self.target_posterior_probability,
+            "target_5pct_wilson_low": self.target_wilson_low,
+            "target_5pct_wilson_high": self.target_wilson_high,
+            "target_5pct_resolution_rate": self.target_resolution_rate,
+            "target_5pct_path_quality_status": self.target_path_quality_status,
             "scope": self.scope,
             "confidence_tier": self.confidence_tier,
             "score_delta": self.score_delta,
             "abstain": self.abstain,
             "negative_expected_return": self.negative_expected_return,
+            "target_5pct_unreachable": self.target_unreachable,
             "positive_boost_enabled": self.positive_boost_enabled,
-            "method": "day_clustered_beta_wilson_payoff_v3",
+            "decision_confidence_level": CALIBRATION_DECISION_CONFIDENCE,
+            "multiple_testing_correction": "bonferroni_top5_fwer_5pct",
+            "method": "two_stage_execution_day_clustered_policy_return_v9",
+            "outcome_basis": "executed_strategy_t1_real_net_raw_unadjusted",
             "minimum_samples": 30,
             "minimum_completed_days": 20,
+            "recent_window_days": 60,
+            "prior_window_days": 120,
             "similarity_floor": 0.35,
             "minimum_shared_tags": 2,
             "prior": "Beta(2,2)",
-        })
+        });
+        value["recent_samples"] = serde_json::json!(self.recent_samples);
+        value["signal_samples"] = serde_json::json!(self.signal_samples);
+        value["signal_completed_days"] = serde_json::json!(self.signal_completed_days);
+        value["execution_rate"] = serde_json::json!(self.execution_rate);
+        value["execution_wilson_low"] = serde_json::json!(self.execution_wilson_low);
+        value["execution_wilson_high"] = serde_json::json!(self.execution_wilson_high);
+        value["entry_unexecutable"] = serde_json::json!(self.entry_unexecutable);
+        value["stress_cost_pct"] = serde_json::json!(self.stress_cost_pct);
+        value["mean_t1_real_stress"] = serde_json::json!(self.mean_t1_real_stress);
+        value["mean_t1_real_stress_low"] = serde_json::json!(self.mean_t1_real_stress_low);
+        value["mean_t1_real_stress_high"] = serde_json::json!(self.mean_t1_real_stress_high);
+        value["cost_stress_negative"] = serde_json::json!(self.cost_stress_negative);
+        value["recent_win_rate"] = serde_json::json!(self.recent_win_rate);
+        value["recent_mean_t1_real"] = serde_json::json!(self.recent_mean_t1_real);
+        value["prior_samples"] = serde_json::json!(self.prior_samples);
+        value["prior_win_rate"] = serde_json::json!(self.prior_win_rate);
+        value["prior_mean_t1_real"] = serde_json::json!(self.prior_mean_t1_real);
+        value["temporal_stability"] = serde_json::json!(self.temporal_stability);
+        value["temporal_drift"] = serde_json::json!(self.temporal_drift);
+        value["history_samples"] = serde_json::json!(self.history_samples);
+        value["history_completed_days"] = serde_json::json!(self.history_completed_days);
+        value["coverage_status"] = serde_json::json!(self.coverage_status);
+        value["outcomes_due"] = serde_json::json!(self.outcomes_due);
+        value["outcomes_completed"] = serde_json::json!(self.outcomes_completed);
+        value["outcome_coverage"] = serde_json::json!(self.outcome_coverage);
+        value["local_outcomes_due"] = serde_json::json!(self.local_outcomes_due);
+        value["local_outcomes_completed"] = serde_json::json!(self.local_outcomes_completed);
+        value["local_outcome_coverage"] = serde_json::json!(self.local_outcome_coverage);
+        value["data_quality_status"] = serde_json::json!(self.data_quality_status);
+        value["data_quality_scope"] = serde_json::json!(self.data_quality_scope);
+        value["out_of_distribution"] = serde_json::json!(self.out_of_distribution);
+        value["data_quality_degraded"] = serde_json::json!(self.data_quality_degraded);
+        value["minimum_outcome_coverage"] = serde_json::json!(0.90);
+        value["minimum_outcomes_due_for_quality_gate"] = serde_json::json!(30);
+        value["mature_history_samples"] = serde_json::json!(100);
+        value["mature_history_completed_days"] = serde_json::json!(30);
+        value["minimum_in_distribution_samples"] = serde_json::json!(10);
+        value["minimum_in_distribution_completed_days"] = serde_json::json!(5);
+        value
     }
 }
 
@@ -1378,6 +1518,9 @@ fn calibration_tags(tags: &[String]) -> BTreeSet<String> {
         .filter(|tag| {
             !tag.starts_with("T+1达5%率")
                 && !tag.starts_with("影子候选")
+                && !tag.starts_with("校准强证据")
+                && !tag.starts_with("结果回写覆盖不足")
+                && !tag.starts_with("5%路径可判定不足")
                 && !matches!(
                     tag.as_str(),
                     "大盘偏多" | "大盘偏弱" | "大盘大跌" | "美股偏多" | "美股偏空"
@@ -1395,12 +1538,17 @@ fn similar_calibration_samples<'a>(
     samples
         .iter()
         .filter(|sample| regime.is_none_or(|key| sample.regime.as_deref() == Some(key)))
-        .filter(|sample| {
-            let shared = candidate_tags.intersection(&sample.tags).count();
-            let union = candidate_tags.union(&sample.tags).count();
-            shared >= 2 && union > 0 && shared as f64 / union as f64 >= 0.35
-        })
+        .filter(|sample| calibration_tags_match(candidate_tags, &sample.tags))
         .collect()
+}
+
+fn calibration_tags_match(
+    candidate_tags: &BTreeSet<String>,
+    sample_tags: &BTreeSet<String>,
+) -> bool {
+    let shared = candidate_tags.intersection(sample_tags).count();
+    let union = candidate_tags.union(sample_tags).count();
+    shared >= 2 && union > 0 && shared as f64 / union as f64 >= 0.35
 }
 
 fn distinct_calibration_days(samples: &[&CalibrationSample]) -> usize {
@@ -1411,24 +1559,112 @@ fn distinct_calibration_days(samples: &[&CalibrationSample]) -> usize {
         .len()
 }
 
+fn calibration_period_metrics(samples: &[&CalibrationSample]) -> (i64, i64, f64, f64) {
+    let executed = samples
+        .iter()
+        .copied()
+        .filter(|sample| sample.executed)
+        .collect::<Vec<_>>();
+    let count = executed.len() as i64;
+    let days = distinct_calibration_days(&executed) as i64;
+    let wins = executed.iter().filter(|sample| sample.won).count() as i64;
+    let mut by_day: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+    for sample in samples {
+        by_day
+            .entry(sample.date.as_str())
+            .or_default()
+            .push(sample.real_return.clamp(-20.0, 20.0));
+    }
+    let daily = by_day
+        .into_values()
+        .map(|values| values.iter().sum::<f64>() / values.len() as f64)
+        .collect::<Vec<_>>();
+    let mean = if daily.is_empty() {
+        0.0
+    } else {
+        daily.iter().sum::<f64>() / daily.len() as f64
+    };
+    (count, days, ratio(wins, count), mean)
+}
+
 fn calibrate_candidate(
     tags: &[String],
     history: &[CalibrationSample],
     current_regime: Option<&str>,
     positive_boost_enabled: bool,
+    outcomes_due: i64,
+    outcomes_completed: i64,
+    outcome_coverage: f64,
+    due_history: Option<&[CalibrationDueSample]>,
 ) -> CalibrationEvidence {
     let tags = calibration_tags(tags);
     let regime_matches = similar_calibration_samples(&tags, history, current_regime);
-    let (matches, scope) = if regime_matches.len() >= 30
-        && distinct_calibration_days(&regime_matches) >= 20
-    {
-        (regime_matches, current_regime.unwrap_or("all").to_string())
+    let (matches, scope) =
+        if regime_matches.len() >= 30 && distinct_calibration_days(&regime_matches) >= 20 {
+            (regime_matches, current_regime.unwrap_or("all").to_string())
+        } else {
+            (
+                similar_calibration_samples(&tags, history, None),
+                "all".into(),
+            )
+        };
+    let signal_samples = matches.len() as i64;
+    let signal_completed_days = distinct_calibration_days(&matches) as i64;
+    let execution_matches = matches
+        .iter()
+        .copied()
+        .filter(|sample| sample.executed)
+        .collect::<Vec<_>>();
+    let samples = execution_matches.len() as i64;
+    let completed_days = distinct_calibration_days(&execution_matches) as i64;
+    let history_samples = history.len() as i64;
+    let history_refs = history.iter().collect::<Vec<_>>();
+    let history_completed_days = distinct_calibration_days(&history_refs) as i64;
+    let history_mature = history_samples >= 100 && history_completed_days >= 30;
+    let out_of_distribution = history_mature && (signal_samples < 10 || signal_completed_days < 5);
+    let coverage_status = if !history_mature {
+        "cold_start"
+    } else if out_of_distribution {
+        "out_of_distribution"
     } else {
-        (similar_calibration_samples(&tags, history, None), "all".into())
+        "in_distribution"
     };
-    let samples = matches.len() as i64;
-    let completed_days = distinct_calibration_days(&matches) as i64;
-    let wins = matches.iter().filter(|sample| sample.won).count() as i64;
+    let due_regime = if scope == "all" { None } else { current_regime };
+    let local_due_matches = due_history
+        .map(|items| {
+            items
+                .iter()
+                .filter(|sample| due_regime.is_none_or(|key| sample.regime.as_deref() == Some(key)))
+                .filter(|sample| calibration_tags_match(&tags, &sample.tags))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let local_outcomes_due = local_due_matches.len() as i64;
+    let local_outcomes_completed = local_due_matches
+        .iter()
+        .filter(|sample| sample.completed)
+        .count() as i64;
+    let local_outcome_coverage = ratio(local_outcomes_completed, local_outcomes_due);
+    let data_quality_evaluable = outcomes_due >= 30;
+    let global_data_quality_degraded = data_quality_evaluable && outcome_coverage < 0.90;
+    let local_data_quality_evaluable = local_outcomes_due >= 30;
+    let local_data_quality_degraded = local_data_quality_evaluable && local_outcome_coverage < 0.90;
+    let data_quality_degraded = global_data_quality_degraded || local_data_quality_degraded;
+    let data_quality_status = if !data_quality_evaluable {
+        "insufficient"
+    } else if data_quality_degraded {
+        "degraded"
+    } else {
+        "healthy"
+    };
+    let data_quality_scope = match (global_data_quality_degraded, local_data_quality_degraded) {
+        (true, true) => "global_and_local",
+        (true, false) => "global",
+        (false, true) => "local",
+        (false, false) if local_data_quality_evaluable => "global_and_local",
+        _ => "global",
+    };
+    let wins = execution_matches.iter().filter(|sample| sample.won).count() as i64;
     let target_samples = matches
         .iter()
         .filter(|sample| sample.target_hit_5pct.is_some())
@@ -1437,11 +1673,30 @@ fn calibrate_candidate(
         .iter()
         .filter(|sample| sample.target_hit_5pct == Some(true))
         .count() as i64;
+    let target_matches = matches
+        .iter()
+        .copied()
+        .filter(|sample| sample.target_hit_5pct.is_some())
+        .collect::<Vec<_>>();
+    let target_completed_days = distinct_calibration_days(&target_matches) as i64;
+    let target_resolution_rate = ratio(target_samples, samples);
+    let target_path_quality_status = if samples < 30 {
+        "insufficient"
+    } else if target_resolution_rate < 0.90 {
+        "degraded"
+    } else {
+        "healthy"
+    };
     let posterior = (wins as f64 + 2.0) / (samples as f64 + 4.0);
+    let execution_rate = ratio(samples, signal_samples);
     let target_posterior = (target_hits as f64 + 2.0) / (target_samples as f64 + 4.0);
-    let (wilson_low, wilson_high, _) = wilson_interval(samples, wins, 1.96);
+    let (wilson_low, wilson_high, _) = wilson_interval(samples, wins, CALIBRATION_DECISION_Z);
+    let (execution_wilson_low, execution_wilson_high, _) =
+        wilson_interval(signal_samples, samples, CALIBRATION_DECISION_Z);
+    let (target_wilson_low, target_wilson_high, _) =
+        wilson_interval(target_samples, target_hits, CALIBRATION_DECISION_Z);
     // 极端行情先截尾到 ±20%，避免单个脏值或极端涨跌主导均值区间。
-    let returns = matches
+    let returns = execution_matches
         .iter()
         .map(|sample| sample.real_return.clamp(-20.0, 20.0))
         .collect::<Vec<_>>();
@@ -1472,16 +1727,34 @@ fn calibrate_candidate(
         0.0
     };
     let margin = if daily_returns.len() > 1 {
-        1.96 * (variance / daily_returns.len() as f64).sqrt()
+        CALIBRATION_DECISION_Z * (variance / daily_returns.len() as f64).sqrt()
     } else {
         0.0
     };
     let mean_t1_real_low = mean_t1_real - margin;
     let mean_t1_real_high = mean_t1_real + margin;
-    let profitable = returns.iter().copied().filter(|value| *value > 0.0).collect::<Vec<_>>();
-    let losing = returns.iter().copied().filter(|value| *value <= 0.0).collect::<Vec<_>>();
+    // 基础标签已扣 0.2%；再平移到 0.5% 不利成本情景。区间宽度不变，
+    // 用于识别只能在低摩擦假设下成立的脆弱优势。
+    let stress_shift = STRESS_EXECUTION_COST_PCT - EXECUTION_COST_PCT;
+    let mean_t1_real_stress = mean_t1_real - stress_shift;
+    let mean_t1_real_stress_low = mean_t1_real_low - stress_shift;
+    let mean_t1_real_stress_high = mean_t1_real_high - stress_shift;
+    let profitable = returns
+        .iter()
+        .copied()
+        .filter(|value| *value > 0.0)
+        .collect::<Vec<_>>();
+    let losing = returns
+        .iter()
+        .copied()
+        .filter(|value| *value <= 0.0)
+        .collect::<Vec<_>>();
     let average = |values: &[f64]| {
-        if values.is_empty() { 0.0 } else { values.iter().sum::<f64>() / values.len() as f64 }
+        if values.is_empty() {
+            0.0
+        } else {
+            values.iter().sum::<f64>() / values.len() as f64
+        }
     };
     let average_win = average(&profitable);
     let average_loss = average(&losing);
@@ -1492,11 +1765,64 @@ fn calibrate_candidate(
     } else {
         0.0
     };
+    let recent = matches
+        .iter()
+        .copied()
+        .filter(|sample| sample.recent)
+        .collect::<Vec<_>>();
+    let prior = matches
+        .iter()
+        .copied()
+        .filter(|sample| !sample.recent)
+        .collect::<Vec<_>>();
+    let (recent_samples, recent_days, recent_win_rate, recent_mean_t1_real) =
+        calibration_period_metrics(&recent);
+    let (prior_samples, prior_days, prior_win_rate, prior_mean_t1_real) =
+        calibration_period_metrics(&prior);
+    let temporal_samples_sufficient =
+        recent_samples >= 10 && recent_days >= 8 && prior_samples >= 20 && prior_days >= 12;
+    let temporal_drift = temporal_samples_sufficient
+        && recent_win_rate + 0.15 < prior_win_rate
+        && recent_mean_t1_real < 0.0;
+    let temporal_stability = if !temporal_samples_sufficient {
+        "insufficient"
+    } else if temporal_drift {
+        "degraded"
+    } else {
+        "stable"
+    };
     let sufficient = samples >= 30 && completed_days >= 20;
+    let execution_sufficient = signal_samples >= 30 && signal_completed_days >= 20;
+    let target_sufficient = target_samples >= 30
+        && target_completed_days >= 20
+        && target_path_quality_status == "healthy";
     let weak_probability = sufficient && wilson_high < 0.5;
     let negative_expected_return = sufficient && mean_t1_real_high < 0.0;
-    let abstain = weak_probability || negative_expected_return;
-    let positive = sufficient && wilson_low > 0.5 && mean_t1_real_low > 0.0;
+    let cost_stress_negative = sufficient && mean_t1_real_stress_high < 0.0;
+    let entry_unexecutable = execution_sufficient && execution_wilson_high < 0.5;
+    let target_unreachable = target_sufficient && target_wilson_high < 0.05;
+    let raw_abstain = weak_probability
+        || negative_expected_return
+        || cost_stress_negative
+        || entry_unexecutable
+        || target_unreachable
+        || temporal_drift
+        || out_of_distribution;
+    let abstain = !data_quality_degraded && raw_abstain;
+    let positive = sufficient
+        && !data_quality_degraded
+        && temporal_samples_sufficient
+        && !temporal_drift
+        && recent_win_rate >= 0.5
+        && recent_mean_t1_real > 0.0
+        && recent_mean_t1_real > stress_shift
+        && execution_sufficient
+        && execution_wilson_low >= 0.5
+        && wilson_low > 0.5
+        && mean_t1_real_low > 0.0
+        && mean_t1_real_stress_low > 0.0
+        && target_sufficient
+        && target_wilson_low >= 0.05;
     let confidence_tier = if abstain {
         "weak"
     } else if positive {
@@ -1512,62 +1838,157 @@ fn calibrate_candidate(
         0.0
     };
     CalibrationEvidence {
+        signal_samples,
+        signal_completed_days,
         samples,
         completed_days,
         wins,
         posterior_win_probability: posterior,
         wilson_low,
         wilson_high,
+        execution_rate,
+        execution_wilson_low,
+        execution_wilson_high,
         mean_t1_real,
         mean_t1_real_low,
         mean_t1_real_high,
+        stress_cost_pct: STRESS_EXECUTION_COST_PCT,
+        mean_t1_real_stress,
+        mean_t1_real_stress_low,
+        mean_t1_real_stress_high,
         average_win,
         average_loss,
         payoff_ratio,
+        recent_samples,
+        recent_win_rate,
+        recent_mean_t1_real,
+        prior_samples,
+        prior_win_rate,
+        prior_mean_t1_real,
+        temporal_stability: temporal_stability.into(),
+        history_samples,
+        history_completed_days,
+        coverage_status: coverage_status.into(),
+        outcomes_due,
+        outcomes_completed,
+        outcome_coverage,
+        local_outcomes_due,
+        local_outcomes_completed,
+        local_outcome_coverage,
+        data_quality_status: data_quality_status.into(),
+        data_quality_scope: data_quality_scope.into(),
         target_samples,
+        target_completed_days,
         target_hits,
         target_posterior_probability: target_posterior,
+        target_wilson_low,
+        target_wilson_high,
+        target_resolution_rate,
+        target_path_quality_status: target_path_quality_status.into(),
         scope,
         confidence_tier: confidence_tier.into(),
         score_delta,
         abstain,
         negative_expected_return,
-        positive_boost_enabled,
+        cost_stress_negative,
+        entry_unexecutable,
+        target_unreachable,
+        temporal_drift,
+        out_of_distribution,
+        data_quality_degraded,
+        positive_boost_enabled: positive_boost_enabled && !data_quality_degraded,
     }
 }
 
 async fn load_calibration_history(
     db: &SqlitePool,
     as_of: NaiveDate,
-) -> Result<Vec<CalibrationSample>, PickError> {
+) -> Result<CalibrationHistory, PickError> {
     let since = (as_of - Duration::days(180)).format("%Y-%m-%d").to_string();
+    let recent_since = (as_of - Duration::days(60)).format("%Y-%m-%d").to_string();
     let before = as_of.format("%Y-%m-%d").to_string();
+    // 留出 7 个自然日，避免把尚未到期的节假日前推荐误算为缺失结果。
+    let coverage_before = (as_of - Duration::days(7)).format("%Y-%m-%d").to_string();
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT date, reasons, meta FROM daily_pick WHERE date >= ? AND date < ? \
-         AND json_extract(meta,'$.outcome.t1_real') IS NOT NULL",
+         AND json_extract(meta,'$.outcome.strategy_t1_real') IS NOT NULL \
+         AND json_extract(meta,'$.outcome.execution_price_basis') = 'raw_unadjusted'",
     )
-    .bind(since)
-    .bind(before)
+    .bind(&since)
+    .bind(&before)
     .fetch_all(db)
     .await?;
-    Ok(rows
+    let samples = rows
         .into_iter()
         .filter_map(|(date, reasons, raw)| {
             let tags: Vec<String> = serde_json::from_str(&reasons).ok()?;
             let meta: Value = serde_json::from_str(&raw).ok()?;
-            let real = meta["outcome"]["t1_real"].as_f64()?;
+            let real = meta["outcome"]["strategy_t1_real"].as_f64()?;
+            let executed =
+                is_executed_strategy_basis(meta["outcome"]["strategy_exit_basis"].as_str());
             Some(CalibrationSample {
+                recent: date >= recent_since,
                 date,
                 tags: calibration_tags(&tags),
                 regime: meta["cn"]["avg_pct"]
                     .as_f64()
                     .map(|avg| market_regime(avg).0.to_string()),
+                executed,
                 won: real > 0.0,
                 real_return: real,
-                target_hit_5pct: meta["outcome"]["target_hit_5pct"].as_bool(),
+                // A.25 起只接纳具有路径状态的标签；旧版“只看最高价”的成功标签
+                // 可能忽略先止损后冲高，必须退出校准样本重新积累。
+                target_hit_5pct: match meta["outcome"]["target_path_status"].as_str() {
+                    Some("target_at_open" | "target_only") => Some(true),
+                    Some("stop_at_open" | "stop_only" | "neither") => Some(false),
+                    _ => None,
+                },
             })
         })
-        .collect())
+        .collect();
+    let due_rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT reasons, meta FROM daily_pick WHERE date >= ? AND date <= ?")
+            .bind(&since)
+            .bind(coverage_before)
+            .fetch_all(db)
+            .await?;
+    // 全局分母保留所有到期记录；即使 JSON/标签损坏也不能从覆盖率中“消失”。
+    let outcomes_due = due_rows.len() as i64;
+    let outcomes_completed = due_rows
+        .iter()
+        .filter(|(_, raw)| {
+            serde_json::from_str::<Value>(raw)
+                .ok()
+                .filter(|meta| {
+                    meta["outcome"]["execution_price_basis"].as_str() == Some("raw_unadjusted")
+                })
+                .and_then(|meta| meta["outcome"]["strategy_t1_real"].as_f64())
+                .is_some()
+        })
+        .count() as i64;
+    let due_samples = due_rows
+        .into_iter()
+        .filter_map(|(reasons, raw)| {
+            let tags: Vec<String> = serde_json::from_str(&reasons).ok()?;
+            let meta: Value = serde_json::from_str(&raw).ok()?;
+            Some(CalibrationDueSample {
+                tags: calibration_tags(&tags),
+                regime: meta["cn"]["avg_pct"]
+                    .as_f64()
+                    .map(|avg| market_regime(avg).0.to_string()),
+                completed: meta["outcome"]["execution_price_basis"].as_str()
+                    == Some("raw_unadjusted")
+                    && meta["outcome"]["strategy_t1_real"].as_f64().is_some(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(CalibrationHistory {
+        samples,
+        due_samples,
+        outcomes_due,
+        outcomes_completed,
+        outcome_coverage: ratio(outcomes_completed, outcomes_due),
+    })
 }
 
 fn calibration_quality(predictions: &[(f64, bool)]) -> CalibrationQuality {
@@ -1580,7 +2001,15 @@ fn calibration_quality(predictions: &[(f64, bool)]) -> CalibrationQuality {
         };
     }
     let mut bins = (0..5)
-        .map(|index| (index as f64 / 5.0, (index + 1) as f64 / 5.0, 0_i64, 0.0, 0_i64))
+        .map(|index| {
+            (
+                index as f64 / 5.0,
+                (index + 1) as f64 / 5.0,
+                0_i64,
+                0.0,
+                0_i64,
+            )
+        })
         .collect::<Vec<_>>();
     let mut brier_sum = 0.0;
     let mut log_loss_sum = 0.0;
@@ -1600,7 +2029,11 @@ fn calibration_quality(predictions: &[(f64, bool)]) -> CalibrationQuality {
     let bins = bins
         .into_iter()
         .map(|(lower, upper, count, probability_sum, wins)| {
-            let average_probability = if count > 0 { probability_sum / count as f64 } else { 0.0 };
+            let average_probability = if count > 0 {
+                probability_sum / count as f64
+            } else {
+                0.0
+            };
             let observed_win_rate = ratio(wins, count);
             expected_calibration_error +=
                 count as f64 / samples as f64 * (average_probability - observed_win_rate).abs();
@@ -1675,10 +2108,13 @@ pub(crate) async fn load_calibration_quality(
 ) -> CalibrationQuality {
     let parsed = NaiveDate::parse_from_str(through_date, "%Y-%m-%d")
         .unwrap_or_else(|_| Utc::now().date_naive());
-    let since = (parsed - Duration::days(180)).format("%Y-%m-%d").to_string();
+    let since = (parsed - Duration::days(180))
+        .format("%Y-%m-%d")
+        .to_string();
     let rows: Vec<String> = sqlx::query_scalar(
         "SELECT meta FROM daily_pick WHERE date >= ? AND date <= ? \
-         AND json_extract(meta,'$.outcome.t1_real') IS NOT NULL \
+         AND json_extract(meta,'$.outcome.strategy_t1_real') IS NOT NULL \
+         AND json_extract(meta,'$.outcome.execution_price_basis') = 'raw_unadjusted' \
          AND json_extract(meta,'$.calibration.posterior_win_probability') IS NOT NULL",
     )
     .bind(since)
@@ -1695,7 +2131,7 @@ pub(crate) async fn load_calibration_quality(
             }
             Some((
                 meta["calibration"]["posterior_win_probability"].as_f64()?,
-                meta["outcome"]["t1_real"].as_f64()? > 0.0,
+                meta["outcome"]["strategy_t1_real"].as_f64()? > 0.0,
             ))
         })
         .collect::<Vec<_>>();
@@ -1759,17 +2195,24 @@ struct StockRiskMetrics {
 
 const TARGET_NET_RETURN: f64 = 0.05;
 const TARGET_COST_BUFFER: f64 = 0.002;
+const EXECUTION_COST_PCT: f64 = 0.2;
+const STRESS_EXECUTION_COST_PCT: f64 = 0.5;
 const BUY_ZONE_UPPER_BUFFER: f64 = 0.02;
 const SHADOW_EXPERIMENT_ID: &str = "target-stability-challenger-v1";
 const CALIBRATION_EXPERIMENT_ID: &str = "calibrated-abstention-challenger-v1";
 const PAYOFF_EXPERIMENT_ID: &str = "payoff-aware-abstention-challenger-v1";
+const TEMPORAL_DRIFT_EXPERIMENT_ID: &str = "temporal-drift-abstention-challenger-v1";
+const OOD_EXPERIMENT_ID: &str = "out-of-distribution-challenger-v1";
+const TARGET_CALIBRATION_EXPERIMENT_ID: &str = "target-calibrated-abstention-challenger-v1";
+const COST_STRESS_EXPERIMENT_ID: &str = "cost-stress-abstention-challenger-v1";
+const ENTRY_FEASIBILITY_EXPERIMENT_ID: &str = "entry-feasibility-abstention-challenger-v1";
 const SHADOW_PROMOTION_DAYS: i64 = 20;
 const SHADOW_PROMOTION_SAMPLES: i64 = 30;
-const PRODUCTION_RULE_VERSION: &str = "production-v2026.09.26";
+const PRODUCTION_RULE_VERSION: &str = "production-v2026.09.27";
 
 /// 生产规则的可复现参数清单。修改影响入选或暂停的阈值时必须同步更新版本。
 fn production_rule_manifest() -> Value {
-    serde_json::json!({
+    let mut manifest = serde_json::json!({
         "candidate_score_floor": 60.0,
         "max_picks": 5,
         "industry_cap": 2,
@@ -1782,6 +2225,16 @@ fn production_rule_manifest() -> Value {
         "ai_quant_proximity_points": 5.0,
         "target_net_return_pct": 5.0,
         "execution_cost_pct": 0.2,
+        "execution_cost_stress_pct": STRESS_EXECUTION_COST_PCT,
+        "execution_price_basis": "raw_unadjusted_only",
+        "learning_outcome": {
+            "field": "strategy_t1_real",
+            "target_exit": "target_price_5pct",
+            "risk_exit": "entry_price_minus_3pct",
+            "fallback_exit": "t1_close",
+            "ambiguous_path": "censored",
+            "returns_are_net_of_cost_pct": EXECUTION_COST_PCT
+        },
         "walk_forward": {"lookback_days": 120, "train_days": 90, "validation_days": 30},
         "shadow_experiment_id": SHADOW_EXPERIMENT_ID,
         "calibration": {
@@ -1793,6 +2246,14 @@ fn production_rule_manifest() -> Value {
             "abstain_when_wilson_high_below": 0.5,
             "positive_when_wilson_low_above": 0.5,
             "prior": "Beta(2,2)",
+            "multiple_testing": {
+                "family": "daily_top5",
+                "family_wise_error_rate": 0.05,
+                "per_candidate_two_sided_alpha": 0.01,
+                "decision_confidence_level": CALIBRATION_DECISION_CONFIDENCE,
+                "z_score": CALIBRATION_DECISION_Z,
+                "method": "bonferroni"
+            },
             "quality_gate": {
                 "minimum_completed_predictions": 50,
                 "maximum_brier_score": 0.24,
@@ -1802,22 +2263,84 @@ fn production_rule_manifest() -> Value {
             "payoff_gate": {
                 "winsorized_return_pct": [-20.0, 20.0],
                 "confidence_unit": "equal_weight_recommendation_day",
-                "negative_abstain_when_mean_95pct_high_below": 0.0,
-                "positive_requires_mean_95pct_low_above": 0.0,
+                "negative_abstain_when_mean_decision_high_below": 0.0,
+                "positive_requires_mean_decision_low_above": 0.0,
                 "shadow_experiment_id": PAYOFF_EXPERIMENT_ID
+            },
+            "target_5pct_calibration_gate": {
+                "minimum_samples": 30,
+                "minimum_completed_days": 20,
+                "decision_confidence_level": CALIBRATION_DECISION_CONFIDENCE,
+                "minimum_acceptable_hit_probability": 0.05,
+                "positive_requires_wilson_low_at_least": 0.05,
+                "abstain_when_wilson_high_below": 0.05,
+                "minimum_path_resolution_rate": 0.90,
+                "ambiguous_target_and_stop_same_day": "censored",
+                "legacy_high_only_labels": "excluded",
+                "shadow_experiment_id": TARGET_CALIBRATION_EXPERIMENT_ID
+            },
+            "temporal_stability_gate": {
+                "recent_days": 60,
+                "prior_days": 120,
+                "minimum_recent_samples": 10,
+                "minimum_recent_completed_days": 8,
+                "minimum_prior_samples": 20,
+                "minimum_prior_completed_days": 12,
+                "win_rate_drop_points": 0.15,
+                "also_requires_recent_mean_return_below_pct": 0.0,
+                "shadow_experiment_id": TEMPORAL_DRIFT_EXPERIMENT_ID
+            },
+            "distribution_coverage_gate": {
+                "mature_history_samples": 100,
+                "mature_history_completed_days": 30,
+                "minimum_similar_samples": 10,
+                "minimum_similar_completed_days": 5,
+                "cold_start_abstention": false,
+                "shadow_experiment_id": OOD_EXPERIMENT_ID
+            },
+            "outcome_completeness_gate": {
+                "maturity_lag_calendar_days": 7,
+                "minimum_due_outcomes": 30,
+                "minimum_completion_rate": 0.90,
+                "local_similarity_gate": {
+                    "minimum_due_outcomes": 30,
+                    "minimum_completion_rate": 0.90,
+                    "scope": "same_similarity_and_selected_regime"
+                },
+                "on_degraded": "disable_calibration_boost_and_abstention"
             },
             "shadow_experiment_id": CALIBRATION_EXPERIMENT_ID,
         },
-    })
+    });
+    manifest["calibration"]["cost_stress_gate"] = serde_json::json!({
+        "base_round_trip_cost_pct": EXECUTION_COST_PCT,
+        "adverse_round_trip_cost_pct": STRESS_EXECUTION_COST_PCT,
+        "positive_requires_stress_mean_decision_low_above": 0.0,
+        "abstain_when_stress_mean_decision_high_below": 0.0,
+        "shadow_experiment_id": COST_STRESS_EXPERIMENT_ID
+    });
+    manifest["calibration"]["entry_feasibility_gate"] = serde_json::json!({
+        "win_probability_scope": "executed_trades_only",
+        "policy_return_scope": "all_signals_no_trade_equals_zero",
+        "minimum_execution_probability": 0.5,
+        "positive_requires_execution_wilson_low_at_least": 0.5,
+        "abstain_when_execution_wilson_high_below": 0.5,
+        "decision_confidence_level": CALIBRATION_DECISION_CONFIDENCE,
+        "shadow_experiment_id": ENTRY_FEASIBILITY_EXPERIMENT_ID
+    });
+    manifest
 }
 
 fn production_experiment() -> (String, String, Value) {
     let manifest = production_rule_manifest();
     let canonical = serde_json::to_string(&manifest).unwrap_or_default();
     // FNV-1a：跨进程稳定，不依赖 Rust 随机哈希种子。
-    let hash = canonical.as_bytes().iter().fold(0xcbf29ce484222325_u64, |acc, byte| {
-        (acc ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    });
+    let hash = canonical
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |acc, byte| {
+            (acc ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
     let rule_hash = format!("{hash:016x}");
     (
         format!("{PRODUCTION_RULE_VERSION}-{rule_hash}"),
@@ -2337,6 +2860,104 @@ fn classify_entry_validity(
 }
 
 #[derive(Debug, Clone, PartialEq)]
+struct TargetPathOutcome {
+    status: &'static str,
+    hit: Option<bool>,
+    target: f64,
+    risk_stop: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct StrategyT1Outcome {
+    exit_basis: &'static str,
+    exit_price: Option<f64>,
+    net_return_pct: Option<f64>,
+}
+
+/// 日线无法识别盘中先后顺序：若目标与止损同日都被触及，则将结果删失，
+/// 不允许仅凭最高价把它计作“净5%成功”。开盘跳空可确定为最先成交，单独处理。
+fn classify_target_path(open: f64, high: f64, low: f64, entry: f64) -> TargetPathOutcome {
+    let target = entry * (1.0 + TARGET_NET_RETURN + TARGET_COST_BUFFER);
+    let risk_stop = entry * 0.97;
+    if open <= 0.0 || high <= 0.0 || low <= 0.0 || entry <= 0.0 {
+        return TargetPathOutcome {
+            status: "invalid_data",
+            hit: None,
+            target,
+            risk_stop,
+        };
+    }
+    if open >= target {
+        return TargetPathOutcome {
+            status: "target_at_open",
+            hit: Some(true),
+            target,
+            risk_stop,
+        };
+    }
+    if open <= risk_stop {
+        return TargetPathOutcome {
+            status: "stop_at_open",
+            hit: Some(false),
+            target,
+            risk_stop,
+        };
+    }
+    let target_touched = high >= target;
+    let stop_touched = low <= risk_stop;
+    let (status, hit) = match (target_touched, stop_touched) {
+        (true, true) => ("ambiguous_both_touched", None),
+        (true, false) => ("target_only", Some(true)),
+        (false, true) => ("stop_only", Some(false)),
+        (false, false) => ("neither", Some(false)),
+    };
+    TargetPathOutcome {
+        status,
+        hit,
+        target,
+        risk_stop,
+    }
+}
+
+/// 将模型标签与真实执行策略对齐：目标/止损触发时按对应成交价退出，均未触发则
+/// 按 T+1 收盘退出，并统一扣除 0.2% 手续费/滑点。路径歧义保持未知。
+fn strategy_t1_outcome(
+    path: &TargetPathOutcome,
+    open: f64,
+    close: f64,
+    entry: f64,
+) -> StrategyT1Outcome {
+    let resolved = |basis: &'static str, exit_price: f64| StrategyT1Outcome {
+        exit_basis: basis,
+        exit_price: Some(exit_price),
+        net_return_pct: (entry > 0.0 && exit_price > 0.0)
+            .then_some((exit_price - entry) / entry * 100.0 - EXECUTION_COST_PCT),
+    };
+    match path.status {
+        "target_at_open" => resolved("target_at_open", open),
+        "target_only" => resolved("target_limit", path.target),
+        "stop_at_open" => resolved("stop_at_open", open),
+        "stop_only" => resolved("risk_stop", path.risk_stop),
+        "neither" => resolved("t1_close", close),
+        "entry_invalid" => StrategyT1Outcome {
+            exit_basis: "no_trade_entry_invalid",
+            exit_price: None,
+            net_return_pct: Some(0.0),
+        },
+        "ambiguous_both_touched" => StrategyT1Outcome {
+            exit_basis: "ambiguous_both_touched",
+            exit_price: None,
+            net_return_pct: None,
+        },
+        _ => StrategyT1Outcome {
+            exit_basis: "invalid_data",
+            exit_price: None,
+            net_return_pct: None,
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct DynamicExitPlan {
     sell_low: f64,
     sell_high: f64,
@@ -2381,10 +3002,17 @@ fn dynamic_exit_plan(
     let sell_high = round_price(sell_low * upper_factor);
     let risk_stop = round_price(entry * 0.97);
     let reached = t1_close.map(|close| close >= sell_low);
-    let (action, action_label) = if entry_status.is_some_and(|status| status.starts_with("invalid")) {
-        ("entry_invalid", "买入条件已失效，不应按计划追入".to_string())
+    let (action, action_label) = if entry_status.is_some_and(|status| status.starts_with("invalid"))
+    {
+        (
+            "entry_invalid",
+            "买入条件已失效，不应按计划追入".to_string(),
+        )
     } else if t1_close.is_some_and(|close| close < risk_stop) {
-        ("risk_exit", format!("跌破风险线 {:.2}，优先控制损失", risk_stop))
+        (
+            "risk_exit",
+            format!("跌破风险线 {:.2}，优先控制损失", risk_stop),
+        )
     } else if reached == Some(true) {
         ("take_profit", "已达到净5%目标，可分批止盈".to_string())
     } else if today > signal_date && t1_close.is_some() {
@@ -2445,7 +3073,9 @@ pub async fn fetch_sell_zone_basis(db: &SqlitePool, code: &str) -> Option<Value>
         .to_string();
     let rows: Vec<f64> = sqlx::query_scalar(
         "SELECT CAST(json_extract(meta,'$.outcome.t1_pct') AS REAL) FROM daily_pick \
-         WHERE code = ? AND date >= ? AND json_extract(meta,'$.outcome.t1_pct') IS NOT NULL",
+         WHERE code = ? AND date >= ? \
+         AND json_extract(meta,'$.outcome.t1_pct') IS NOT NULL \
+         AND json_extract(meta,'$.outcome.execution_price_basis') = 'raw_unadjusted'",
     )
     .bind(code)
     .bind(&since)
@@ -2481,14 +3111,14 @@ pub async fn fetch_previous_picks(
     today: NaiveDate,
 ) -> Result<Vec<crate::model::PreviousPick>, sqlx::Error> {
     // 拉最近 30 天内已回写 T+1 outcome 的「距 today 最近一天」的 daily_pick
-    let since = (today - Duration::days(30)).format("%Y-%m-%d").to_string();
+    let since = (today - Duration::days(180)).format("%Y-%m-%d").to_string();
     // 取最近的 1 个有 outcome 的 date
     let latest: Option<(String,)> = sqlx::query_as(
         "SELECT date FROM daily_pick \
          WHERE date >= ? AND (\
             json_extract(meta,'$.outcome.t1_pct') IS NOT NULL OR \
             json_extract(meta,'$.outcome.entry_open') IS NOT NULL\
-         ) \
+         ) AND json_extract(meta,'$.outcome.execution_price_basis') = 'raw_unadjusted' \
          ORDER BY date DESC LIMIT 1",
     )
     .bind(&since)
@@ -2502,7 +3132,7 @@ pub async fn fetch_previous_picks(
          WHERE date = ? AND (\
             json_extract(meta,'$.outcome.t1_pct') IS NOT NULL OR \
             json_extract(meta,'$.outcome.entry_open') IS NOT NULL\
-         ) \
+         ) AND json_extract(meta,'$.outcome.execution_price_basis') = 'raw_unadjusted' \
          ORDER BY rank ASC",
     )
     .bind(&latest_date)
@@ -2517,7 +3147,9 @@ pub async fn fetch_previous_picks(
         let close = meta["close"].as_f64();
         let outcome = &meta["outcome"];
         let t1_pct = outcome["t1_pct"].as_f64();
-        let t1_real_pct = outcome["t1_real"].as_f64();
+        let t1_real_pct = outcome["strategy_t1_real"]
+            .as_f64()
+            .or_else(|| outcome["t1_real"].as_f64());
         let t1_open = outcome["t1_open_basis"]
             .as_f64()
             .or_else(|| outcome["entry_open"].as_f64());
@@ -2595,9 +3227,7 @@ pub async fn fetch_previous_picks(
                 .as_ref()
                 .map(|plan| plan.open_strength.to_string()),
             sell_action: exit_plan.as_ref().map(|plan| plan.action.to_string()),
-            sell_action_label: exit_plan
-                .as_ref()
-                .map(|plan| plan.action_label.clone()),
+            sell_action_label: exit_plan.as_ref().map(|plan| plan.action_label.clone()),
             risk_stop_price: exit_plan.as_ref().map(|plan| plan.risk_stop),
             target_reached: exit_plan.as_ref().and_then(|plan| plan.target_reached),
             entry_timing,
@@ -2856,9 +3486,10 @@ async fn consecutive_loss_days(
     required: usize,
 ) -> Result<Vec<(String, f64)>, PickError> {
     let rows: Vec<(String, f64)> = sqlx::query_as(
-        "SELECT date, AVG(CAST(json_extract(meta,'$.outcome.t1_real') AS REAL)) AS portfolio_t1 \
+        "SELECT date, AVG(CAST(json_extract(meta,'$.outcome.strategy_t1_real') AS REAL)) AS portfolio_t1 \
          FROM daily_pick WHERE date < ? \
-         AND json_extract(meta,'$.outcome.t1_real') IS NOT NULL \
+         AND json_extract(meta,'$.outcome.strategy_t1_real') IS NOT NULL \
+         AND json_extract(meta,'$.outcome.execution_price_basis') = 'raw_unadjusted' \
          GROUP BY date ORDER BY date DESC LIMIT ?",
     )
     .bind(before.format("%Y-%m-%d").to_string())
@@ -3395,11 +4026,31 @@ pub async fn generate_picks(
         // 小样本保持中性；只有充分样本的 Wilson 上界仍低于 50% 才主动弃权。
         let calibration = calibrate_candidate(
             &tags,
-            &calibration_history,
+            &calibration_history.samples,
             current_regime,
             calibration_quality.positive_boost_enabled,
+            calibration_history.outcomes_due,
+            calibration_history.outcomes_completed,
+            calibration_history.outcome_coverage,
+            Some(&calibration_history.due_samples),
         );
         score += calibration.score_delta;
+        if calibration.data_quality_degraded {
+            tags.push(format!(
+                "结果回写覆盖不足·{}·校准停用",
+                match calibration.data_quality_scope.as_str() {
+                    "local" => "相似形态",
+                    "global_and_local" => "全局及相似形态",
+                    _ => "全局",
+                }
+            ));
+        }
+        if calibration.target_path_quality_status == "degraded" {
+            tags.push(format!(
+                "5%路径可判定不足·{:.0}%·校准不加分",
+                calibration.target_resolution_rate * 100.0
+            ));
+        }
         if calibration.score_delta > 0.0 {
             tags.push(format!(
                 "校准强证据·下界{:.0}%",
@@ -3408,12 +4059,49 @@ pub async fn generate_picks(
         }
         if calibration.abstain {
             shadow_only = true;
-            if calibration.negative_expected_return {
+            if calibration.out_of_distribution {
+                tags.push("影子候选·分布外形态".into());
+                shadow_experiment_map.insert(candidate.code.clone(), OOD_EXPERIMENT_ID);
+                shadow_reason_map.insert(
+                    candidate.code.clone(),
+                    "历史库已成熟，但该标签组合缺少至少10个样本/5个独立交易日的相似案例",
+                );
+            } else if calibration.temporal_drift {
+                tags.push("影子候选·近期表现漂移".into());
+                shadow_experiment_map.insert(candidate.code.clone(), TEMPORAL_DRIFT_EXPERIMENT_ID);
+                shadow_reason_map.insert(
+                    candidate.code.clone(),
+                    "最近60天胜率较此前120天下降至少15个百分点且日均真实收益转负",
+                );
+            } else if calibration.entry_unexecutable {
+                tags.push("影子候选·历史可成交率不足".into());
+                shadow_experiment_map
+                    .insert(candidate.code.clone(), ENTRY_FEASIBILITY_EXPERIMENT_ID);
+                shadow_reason_map.insert(
+                    candidate.code.clone(),
+                    "相似信号的真实可成交率99%区间上界仍低于50%",
+                );
+            } else if calibration.negative_expected_return {
                 tags.push("影子候选·收益期望为负".into());
                 shadow_experiment_map.insert(candidate.code.clone(), PAYOFF_EXPERIMENT_ID);
                 shadow_reason_map.insert(
                     candidate.code.clone(),
-                    "相似历史真实T+1收益均值的95%区间上界仍低于0%",
+                    "相似历史真实T+1收益均值的99%决策区间上界仍低于0%",
+                );
+            } else if calibration.cost_stress_negative {
+                tags.push("影子候选·成本压力不通过".into());
+                shadow_experiment_map.insert(candidate.code.clone(), COST_STRESS_EXPERIMENT_ID);
+                shadow_reason_map.insert(
+                    candidate.code.clone(),
+                    "按0.5%不利往返成本重估后，真实T+1收益99%区间上界低于0%",
+                );
+            } else if calibration.target_unreachable {
+                tags.push("影子候选·5%实达概率不足".into());
+                shadow_experiment_map
+                    .insert(candidate.code.clone(), TARGET_CALIBRATION_EXPERIMENT_ID);
+                shadow_reason_map.insert(
+                    candidate.code.clone(),
+                    "相似历史真实执行的5%达标率99%区间上界仍低于5%",
                 );
             } else {
                 tags.push("影子候选·校准主动弃权".into());
@@ -3848,6 +4536,15 @@ async fn fetch_days_cached(
     Ok(bars)
 }
 
+/// 执行标签专用原始价，不写入技术指标使用的前复权 `day_bar` 缓存。
+async fn fetch_execution_days(
+    state: &AppState,
+    code: &str,
+    limit: i64,
+) -> Result<Vec<DayBar>, PickError> {
+    state.day_k.fetch_execution(&state.http, code, limit).await
+}
+
 /// AI 精排：返回按 AI 意见排序的 code 列表（≤5，超出丢弃）。
 async fn ai_rank(
     config: &AiRankConfig,
@@ -3964,36 +4661,67 @@ pub fn confidence_bounds(samples: i64, hits: i64) -> (f64, f64, f64, bool) {
     (low, high, margin, samples_sufficient(samples))
 }
 
+/// 只有真正发生买入并产生策略退出价的样本，才进入条件胜率和盈亏比。
+/// `no_trade_entry_invalid` 仍进入全信号策略收益（收益记 0），用于约束不可成交推荐。
+fn is_executed_strategy_basis(basis: Option<&str>) -> bool {
+    matches!(
+        basis,
+        Some("target_at_open" | "target_limit" | "stop_at_open" | "risk_stop" | "t1_close")
+    )
+}
+
 async fn load_shadow_experiment_stats(
     db: &SqlitePool,
 ) -> Result<Vec<ShadowExperimentStat>, PickError> {
-    let rows: Vec<(String, i64, i64, i64, i64, i64)> = sqlx::query_as(
+    let rows: Vec<(String, i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT experiment_id, \
-            COUNT(DISTINCT CASE WHEN json_extract(meta,'$.outcome.t1_real') IS NOT NULL THEN date END), \
-            COUNT(json_extract(meta,'$.outcome.t1_real')), \
-            COALESCE(SUM(CASE WHEN CAST(json_extract(meta,'$.outcome.t1_real') AS REAL) > 0 THEN 1 ELSE 0 END), 0), \
+            COUNT(DISTINCT CASE WHEN json_extract(meta,'$.outcome.strategy_t1_real') IS NOT NULL THEN date END), \
+            COUNT(json_extract(meta,'$.outcome.strategy_t1_real')), \
+            COUNT(DISTINCT CASE WHEN json_extract(meta,'$.outcome.strategy_exit_basis') IN \
+                ('target_at_open','target_limit','stop_at_open','risk_stop','t1_close') THEN date END), \
+            COALESCE(SUM(CASE WHEN json_extract(meta,'$.outcome.strategy_exit_basis') IN \
+                ('target_at_open','target_limit','stop_at_open','risk_stop','t1_close') THEN 1 ELSE 0 END), 0), \
+            COALESCE(SUM(CASE WHEN json_extract(meta,'$.outcome.strategy_exit_basis') IN \
+                ('target_at_open','target_limit','stop_at_open','risk_stop','t1_close') \
+                AND CAST(json_extract(meta,'$.outcome.strategy_t1_real') AS REAL) > 0 THEN 1 ELSE 0 END), 0), \
             COUNT(json_extract(meta,'$.outcome.target_hit_5pct')), \
             COALESCE(SUM(CASE WHEN json_extract(meta,'$.outcome.target_hit_5pct') = 1 THEN 1 ELSE 0 END), 0) \
-         FROM daily_pick_shadow GROUP BY experiment_id ORDER BY experiment_id",
+         FROM daily_pick_shadow \
+         WHERE json_extract(meta,'$.outcome.execution_price_basis') = 'raw_unadjusted' \
+         GROUP BY experiment_id ORDER BY experiment_id",
     )
     .fetch_all(db)
     .await?;
     Ok(rows
         .into_iter()
         .map(
-            |(experiment_id, completed_days, samples, wins, target_samples, target_hits)| {
+            |(
+                experiment_id,
+                signal_days,
+                signal_samples,
+                completed_days,
+                samples,
+                wins,
+                target_samples,
+                target_hits,
+            )| {
                 let (win_low, _, _) = wilson_interval(samples, wins, 1.96);
                 let (target_low, _, _) = wilson_interval(target_samples, target_hits, 1.96);
+                let (execution_low, _, _) =
+                    wilson_interval(signal_samples, samples, CALIBRATION_DECISION_Z);
                 let eligible = completed_days >= SHADOW_PROMOTION_DAYS
                     && samples >= SHADOW_PROMOTION_SAMPLES
+                    && execution_low >= 0.5
                     && win_low >= 0.5
                     && target_low >= 0.05;
                 let reason = if eligible {
                     "样本外门槛已达标，等待人工审查后方可晋升".to_string()
                 } else {
                     format!(
-                        "继续影子观察：{completed_days}/{SHADOW_PROMOTION_DAYS}日，\
-                         {samples}/{SHADOW_PROMOTION_SAMPLES}样本，胜率下界{:.0}%，5%达标下界{:.0}%",
+                        "继续影子观察：成交{completed_days}/{signal_days}日，\
+                         {samples}/{signal_samples}信号（可成交率99%下界{:.0}%），\
+                         胜率下界{:.0}%，5%达标下界{:.0}%",
+                        execution_low * 100.0,
                         win_low * 100.0,
                         target_low * 100.0
                     )
@@ -4047,7 +4775,10 @@ fn build_pick_audit(picks: &[DailyPick]) -> PickAudit {
                 pool_sources.insert(source.to_string());
             }
         }
-        if let Some(industry) = pick.meta["industry"].as_str().filter(|item| !item.is_empty()) {
+        if let Some(industry) = pick.meta["industry"]
+            .as_str()
+            .filter(|item| !item.is_empty())
+        {
             *industries.entry(industry.to_string()).or_insert(0) += 1;
         }
         if pick.meta["is_limit_up"].as_bool().unwrap_or(false) {
@@ -4064,7 +4795,10 @@ fn build_pick_audit(picks: &[DailyPick]) -> PickAudit {
         concentration_summary: if picks.is_empty() {
             "当日无生产候选".into()
         } else {
-            format!("{} 个行业，单行业最多 {max_industry} 只（上限 2）", industries.len())
+            format!(
+                "{} 个行业，单行业最多 {max_industry} 只（上限 2）",
+                industries.len()
+            )
         },
         limit_up_count,
     }
@@ -4073,7 +4807,8 @@ fn build_pick_audit(picks: &[DailyPick]) -> PickAudit {
 pub(crate) async fn load_strategy_health(db: &SqlitePool, through_date: &str) -> StrategyHealth {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT date, meta FROM daily_pick \
-         WHERE date <= ? AND json_extract(meta,'$.outcome.t1_real') IS NOT NULL \
+         WHERE date <= ? AND json_extract(meta,'$.outcome.strategy_t1_real') IS NOT NULL \
+         AND json_extract(meta,'$.outcome.execution_price_basis') = 'raw_unadjusted' \
          ORDER BY date ASC",
     )
     .bind(through_date)
@@ -4081,28 +4816,31 @@ pub(crate) async fn load_strategy_health(db: &SqlitePool, through_date: &str) ->
     .await
     .unwrap_or_default();
 
-    // 每个推荐日按组合等权聚合，避免一天推荐较多时不成比例放大权重。
-    let mut days: BTreeMap<String, (i64, i64, f64, String)> = BTreeMap::new();
+    // 每个推荐日按组合等权聚合。胜率只统计成交样本；收益曲线保留全部信号，
+    // 不可成交信号按策略已回写的 0 收益计入，避免选择性忽略。
+    let mut days: BTreeMap<String, (i64, i64, i64, f64, String)> = BTreeMap::new();
     for (date, raw) in rows {
         let Ok(meta) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
-        let Some(real) = meta["outcome"]["t1_real"].as_f64() else {
+        let Some(real) = meta["outcome"]["strategy_t1_real"].as_f64() else {
             continue;
         };
         let regime = meta["cn"]["avg_pct"]
             .as_f64()
             .map(|pct| market_regime(pct).0.to_string())
             .unwrap_or_else(|| "unknown".into());
-        let entry = days.entry(date).or_insert((0, 0, 0.0, regime));
+        let executed = is_executed_strategy_basis(meta["outcome"]["strategy_exit_basis"].as_str());
+        let entry = days.entry(date).or_insert((0, 0, 0, 0.0, regime));
         entry.0 += 1;
-        entry.1 += i64::from(real > 0.0);
-        entry.2 += real;
+        entry.1 += i64::from(executed);
+        entry.2 += i64::from(executed && real > 0.0);
+        entry.3 += real;
     }
     let mut daily: Vec<(String, i64, i64, f64, String)> = days
         .into_iter()
-        .map(|(date, (samples, wins, sum, regime))| {
-            (date, samples, wins, sum / samples as f64, regime)
+        .map(|(date, (signals, samples, wins, sum, regime))| {
+            (date, samples, wins, sum / signals as f64, regime)
         })
         .collect();
     if daily.len() > 20 {
@@ -4140,11 +4878,7 @@ pub(crate) async fn load_strategy_health(db: &SqlitePool, through_date: &str) ->
         }
     };
     let windows = vec![window(10), window(20)];
-    let current_loss_streak = daily
-        .iter()
-        .rev()
-        .take_while(|item| item.3 < 0.0)
-        .count() as i64;
+    let current_loss_streak = daily.iter().rev().take_while(|item| item.3 < 0.0).count() as i64;
     let mut factor = 1.0_f64;
     let curve = daily
         .iter()
@@ -4183,7 +4917,9 @@ pub(crate) async fn load_strategy_health(db: &SqlitePool, through_date: &str) ->
     let mut alerts = Vec::new();
     if current_loss_streak >= 3 {
         score -= 40;
-        alerts.push(format!("已连续亏损 {current_loss_streak} 个推荐日，策略应保持暂停"));
+        alerts.push(format!(
+            "已连续亏损 {current_loss_streak} 个推荐日，策略应保持暂停"
+        ));
     }
     if ten.completed_days >= 5 && ten.win_rate < 0.45 {
         score -= 20;
@@ -4326,7 +5062,8 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     let outcomes: Vec<String> = sqlx::query_scalar(
         "SELECT meta FROM daily_pick WHERE date >= ? AND (\
          json_extract(meta,'$.outcome.t1_pct') IS NOT NULL OR \
-         json_extract(meta,'$.outcome.t5_pct') IS NOT NULL)",
+         json_extract(meta,'$.outcome.t5_pct') IS NOT NULL) \
+         AND json_extract(meta,'$.outcome.execution_price_basis') = 'raw_unadjusted'",
     )
     .bind(&since)
     .fetch_all(db)
@@ -4386,7 +5123,8 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     // 标签级回测：按 reasons 聚合 T+1 胜率，直接服务隔日目标。
     let tag_rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT reasons, meta FROM daily_pick \
-         WHERE date >= ? AND json_extract(meta,'$.outcome.t1_pct') IS NOT NULL",
+         WHERE date >= ? AND json_extract(meta,'$.outcome.t1_pct') IS NOT NULL \
+         AND json_extract(meta,'$.outcome.execution_price_basis') = 'raw_unadjusted'",
     )
     .bind(&since)
     .fetch_all(db)
@@ -4451,14 +5189,16 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     // 真实执行口径统计（从 meta.outcome 提取）
     let exec_rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT date, meta FROM daily_pick \
-         WHERE date >= ? AND json_extract(meta,'$.outcome.t1_real') IS NOT NULL",
+         WHERE date >= ? AND json_extract(meta,'$.outcome.strategy_t1_real') IS NOT NULL \
+         AND json_extract(meta,'$.outcome.execution_price_basis') = 'raw_unadjusted'",
     )
     .bind(&since)
     .fetch_all(db)
     .await
     .unwrap_or_default();
     let mut gaps: Vec<f64> = Vec::new();
-    let mut t1_reals: Vec<f64> = Vec::new();
+    let mut policy_reals: Vec<f64> = Vec::new();
+    let mut executed_reals: Vec<f64> = Vec::new();
     let mut dds: Vec<f64> = Vec::new();
     let mut wins: Vec<f64> = Vec::new();
     let mut losses: Vec<f64> = Vec::new();
@@ -4471,12 +5211,15 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
             if let Some(g) = o["entry_gap"].as_f64() {
                 gaps.push(g);
             }
-            if let Some(r) = o["t1_real"].as_f64() {
-                t1_reals.push(r);
-                if r > 0.0 {
-                    wins.push(r);
-                } else {
-                    losses.push(r);
+            if let Some(r) = o["strategy_t1_real"].as_f64() {
+                policy_reals.push(r);
+                if is_executed_strategy_basis(o["strategy_exit_basis"].as_str()) {
+                    executed_reals.push(r);
+                    if r > 0.0 {
+                        wins.push(r);
+                    } else {
+                        losses.push(r);
+                    }
                 }
                 if let Some(paper) = o["t1_pct"].as_f64() {
                     let entry = daily_execution.entry(date.clone()).or_insert((0, 0.0, 0.0));
@@ -4496,7 +5239,7 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
             }
         }
     }
-    let n = t1_reals.len() as i64;
+    let n = executed_reals.len() as i64;
     let avg = |v: &[f64]| {
         if v.is_empty() {
             0.0
@@ -4504,7 +5247,7 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
             v.iter().sum::<f64>() / v.len() as f64
         }
     };
-    let real_hits = t1_reals.iter().filter(|r| **r > 0.0).count() as i64;
+    let real_hits = executed_reals.iter().filter(|r| **r > 0.0).count() as i64;
     let (real_low, real_high, real_margin, real_sufficient) = confidence_bounds(n, real_hits);
     let (target_low, target_high, _) = wilson_interval(target_5pct_samples, target_5pct_hits, 1.96);
     let mut paper_factor = 1.0_f64;
@@ -4528,7 +5271,7 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
         curve.drain(..curve.len() - 20);
     }
     let execution_drag = if t1_samples > 0 && n > 0 {
-        t1_sum / t1_samples as f64 - avg(&t1_reals)
+        t1_sum / t1_samples as f64 - avg(&policy_reals)
     } else {
         0.0
     };
@@ -4540,7 +5283,7 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
     } else {
         String::new()
     };
-    let mut sorted_reals = t1_reals.clone();
+    let mut sorted_reals = policy_reals.clone();
     sorted_reals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let expected_shortfall_10 = if sorted_reals.is_empty() {
         0.0
@@ -4559,7 +5302,8 @@ pub async fn list_picks(db: &SqlitePool, date: Option<&str>) -> Result<PicksDocu
         t1_real_win_rate_high: real_high,
         t1_real_win_rate_margin: real_margin,
         t1_real_samples_sufficient: real_sufficient,
-        avg_t1_real: avg(&t1_reals),
+        // 策略期望收益使用全信号口径（未成交为 0），条件胜率/盈亏比仅使用成交样本。
+        avg_t1_real: avg(&policy_reals),
         avg_win: avg(&wins),
         avg_loss: avg(&losses),
         avg_max_dd: avg(&dds),
@@ -4709,14 +5453,16 @@ pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
         .date_naive();
     let today_key = today.format("%Y-%m-%d").to_string();
     let t5_cutoff = (today - Duration::days(7)).format("%Y-%m-%d").to_string();
-    let since = (today - Duration::days(30)).format("%Y-%m-%d").to_string();
+    let since = (today - Duration::days(180)).format("%Y-%m-%d").to_string();
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT date, code FROM daily_pick \
          WHERE date >= ? AND date < ? AND (\
            json_extract(meta,'$.outcome.t1_pct') IS NULL OR \
            json_extract(meta,'$.outcome.entry_open') IS NULL OR \
+           json_extract(meta,'$.outcome.strategy_exit_basis') IS NULL OR \
+           json_extract(meta,'$.outcome.execution_price_basis') IS NULL OR \
            (json_extract(meta,'$.plan.target_return_pct') IS NOT NULL AND \
-            json_extract(meta,'$.outcome.target_hit_5pct') IS NULL) OR \
+            json_extract(meta,'$.outcome.target_path_status') IS NULL) OR \
            (json_extract(meta,'$.plan.buy_price_low') IS NOT NULL AND \
             json_extract(meta,'$.outcome.entry_status') IS NULL) OR \
            (date <= ? AND json_extract(meta,'$.outcome.t5_pct') IS NULL)\
@@ -4730,7 +5476,7 @@ pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
     .await?;
     let mut updated = 0usize;
     for (date, code) in &rows {
-        let Ok(bars) = fetch_days_cached(state, code, 120).await else {
+        let Ok(bars) = fetch_execution_days(state, code, 220).await else {
             continue;
         };
         let Some(index) = bars.iter().position(|b| b.date == *date) else {
@@ -4767,24 +5513,30 @@ pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
         let outcome_map = outcome
             .as_object_mut()
             .expect("outcome normalized to object");
+        let needs_raw_refresh = outcome_map
+            .get("execution_price_basis")
+            .and_then(Value::as_str)
+            != Some("raw_unadjusted");
         let mut changed = false;
         // 真实执行价：次日开盘（用户实际能买到的价格，涨停股尤其重要）
         if outcome_map
             .get("entry_open")
             .and_then(Value::as_f64)
             .is_none()
-            && index + 1 < bars.len()
+            || needs_raw_refresh
         {
-            let entry_open = bars[index + 1].open;
-            if entry_open > 0.0 {
-                let gap = if plan_entry_timing == "today_close" {
-                    0.0
-                } else {
-                    (entry_open - base) / base * 100.0
-                };
-                outcome_map.insert("entry_open".into(), serde_json::json!(entry_open));
-                outcome_map.insert("entry_gap".into(), serde_json::json!(gap));
-                changed = true;
+            if index + 1 < bars.len() {
+                let entry_open = bars[index + 1].open;
+                if entry_open > 0.0 {
+                    let gap = if plan_entry_timing == "today_close" {
+                        0.0
+                    } else {
+                        (entry_open - base) / base * 100.0
+                    };
+                    outcome_map.insert("entry_open".into(), serde_json::json!(entry_open));
+                    outcome_map.insert("entry_gap".into(), serde_json::json!(gap));
+                    changed = true;
+                }
             }
         }
         let entry_open = outcome_map.get("entry_open").and_then(Value::as_f64);
@@ -4792,6 +5544,7 @@ pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
             .get("entry_status")
             .and_then(Value::as_str)
             .is_none()
+            || needs_raw_refresh
         {
             if let Some(open) = entry_open {
                 if let Some((status, label)) = classify_entry_validity(open, buy_low, buy_high) {
@@ -4806,14 +5559,33 @@ pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
         } else {
             entry_open.unwrap_or(base)
         };
-        if outcome_map
-            .get("target_hit_5pct")
-            .and_then(Value::as_bool)
+        if (outcome_map
+            .get("target_path_status")
+            .and_then(Value::as_str)
             .is_none()
+            || outcome_map
+                .get("strategy_exit_basis")
+                .and_then(Value::as_str)
+                .is_none()
+            || needs_raw_refresh)
             && index + 1 < bars.len()
         {
-            let high = bars[index + 1].high;
-            let target = entry * (1.0 + TARGET_NET_RETURN + TARGET_COST_BUFFER);
+            let bar = &bars[index + 1];
+            let entry_invalid = outcome_map
+                .get("entry_status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status.starts_with("invalid"));
+            let path = if entry_invalid {
+                TargetPathOutcome {
+                    status: "entry_invalid",
+                    hit: None,
+                    target: entry * (1.0 + TARGET_NET_RETURN + TARGET_COST_BUFFER),
+                    risk_stop: entry * 0.97,
+                }
+            } else {
+                classify_target_path(bar.open, bar.high, bar.low, entry)
+            };
+            let strategy = strategy_t1_outcome(&path, bar.open, bar.close, entry);
             outcome_map.insert("execution_entry".into(), serde_json::json!(entry));
             outcome_map.insert(
                 "execution_basis".into(),
@@ -4823,19 +5595,42 @@ pub async fn backfill_outcomes(state: &AppState) -> Result<usize, PickError> {
                     "next_open"
                 }),
             );
-            outcome_map.insert("t1_high".into(), serde_json::json!(high));
-            outcome_map.insert("target_price_5pct".into(), serde_json::json!(target));
-            outcome_map.insert("target_hit_5pct".into(), serde_json::json!(high >= target));
+            outcome_map.insert("t1_high".into(), serde_json::json!(bar.high));
+            outcome_map.insert("t1_low".into(), serde_json::json!(bar.low));
+            outcome_map.insert("target_price_5pct".into(), serde_json::json!(path.target));
+            outcome_map.insert("risk_stop_price".into(), serde_json::json!(path.risk_stop));
+            outcome_map.insert("target_path_status".into(), serde_json::json!(path.status));
+            outcome_map.insert("target_hit_5pct".into(), serde_json::json!(path.hit));
+            outcome_map.insert(
+                "strategy_exit_basis".into(),
+                serde_json::json!(strategy.exit_basis),
+            );
+            outcome_map.insert(
+                "strategy_exit_price".into(),
+                serde_json::json!(strategy.exit_price),
+            );
+            outcome_map.insert(
+                "strategy_t1_real".into(),
+                serde_json::json!(strategy.net_return_pct),
+            );
+            outcome_map.insert(
+                "execution_price_basis".into(),
+                serde_json::json!("raw_unadjusted"),
+            );
             changed = true;
         }
-        if outcome_map.get("t1_pct").and_then(Value::as_f64).is_none() && index + 1 < bars.len() {
+        if (outcome_map.get("t1_pct").and_then(Value::as_f64).is_none() || needs_raw_refresh)
+            && index + 1 < bars.len()
+        {
             let t1 = (bars[index + 1].close - base) / base * 100.0;
             let t1r = (bars[index + 1].close - entry) / entry * 100.0;
             outcome_map.insert("t1_pct".into(), serde_json::json!(t1));
             outcome_map.insert("t1_real".into(), serde_json::json!(t1r));
             changed = true;
         }
-        if outcome_map.get("t5_pct").and_then(Value::as_f64).is_none() && index + 5 < bars.len() {
+        if (outcome_map.get("t5_pct").and_then(Value::as_f64).is_none() || needs_raw_refresh)
+            && index + 5 < bars.len()
+        {
             let t5 = (bars[index + 5].close - base) / base * 100.0;
             let t5r = (bars[index + 5].close - entry) / entry * 100.0;
             outcome_map.insert("t5_pct".into(), serde_json::json!(t5));
@@ -4875,7 +5670,9 @@ async fn backfill_shadow_outcomes(state: &AppState, today: NaiveDate) -> Result<
         "SELECT date, experiment_id, code FROM daily_pick_shadow \
          WHERE date >= ? AND date < ? AND (\
             json_extract(meta,'$.outcome.t1_real') IS NULL OR \
-            json_extract(meta,'$.outcome.target_hit_5pct') IS NULL\
+            json_extract(meta,'$.outcome.target_path_status') IS NULL OR \
+            json_extract(meta,'$.outcome.strategy_exit_basis') IS NULL OR \
+            json_extract(meta,'$.outcome.execution_price_basis') IS NULL\
          ) ORDER BY date DESC",
     )
     .bind(&since)
@@ -4884,7 +5681,7 @@ async fn backfill_shadow_outcomes(state: &AppState, today: NaiveDate) -> Result<
     .await?;
     let mut updated = 0usize;
     for (date, experiment_id, code) in rows {
-        let Ok(bars) = fetch_days_cached(state, &code, 220).await else {
+        let Ok(bars) = fetch_execution_days(state, &code, 220).await else {
             continue;
         };
         let Some(index) = bars.iter().position(|bar| bar.date == date) else {
@@ -4917,8 +5714,11 @@ async fn backfill_shadow_outcomes(state: &AppState, today: NaiveDate) -> Result<
             entry_open
         };
         let t1_close = bars[index + 1].close;
+        let t1_open = bars[index + 1].open;
         let t1_high = bars[index + 1].high;
-        let target = entry * (1.0 + TARGET_NET_RETURN + TARGET_COST_BUFFER);
+        let t1_low = bars[index + 1].low;
+        let path = classify_target_path(t1_open, t1_high, t1_low, entry);
+        let strategy = strategy_t1_outcome(&path, t1_open, t1_close, entry);
         let outcome = serde_json::json!({
             "entry_open": entry_open,
             "execution_entry": entry,
@@ -4926,8 +5726,15 @@ async fn backfill_shadow_outcomes(state: &AppState, today: NaiveDate) -> Result<
             "t1_close": t1_close,
             "t1_real": (t1_close - entry) / entry * 100.0,
             "t1_high": t1_high,
-            "target_price_5pct": target,
-            "target_hit_5pct": t1_high >= target,
+            "t1_low": t1_low,
+            "target_price_5pct": path.target,
+            "risk_stop_price": path.risk_stop,
+            "target_path_status": path.status,
+            "target_hit_5pct": path.hit,
+            "strategy_exit_basis": strategy.exit_basis,
+            "strategy_exit_price": strategy.exit_price,
+            "strategy_t1_real": strategy.net_return_pct,
+            "execution_price_basis": "raw_unadjusted",
         });
         if !meta.is_object() {
             meta = serde_json::json!({});
@@ -5484,36 +6291,92 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         );
         assert_eq!(evidence["minimum_samples"], 30);
         assert_eq!(evidence["method"], "walk_forward_wilson");
-        assert_eq!(evidence["outcome_basis"], "t1_real");
+        assert_eq!(
+            evidence["outcome_basis"],
+            "executed_strategy_t1_real_net_raw_unadjusted"
+        );
     }
 
     #[test]
     fn calibrated_probability_abstains_only_with_sufficient_weak_evidence() {
         let sample = |index: usize, won: bool| CalibrationSample {
             date: format!("day-{index:03}"),
+            recent: index >= 20,
             tags: BTreeSet::from(["MACD金叉".into(), "放量".into(), "相对强势".into()]),
             regime: Some("range".into()),
+            executed: true,
             won,
             real_return: if won { 2.0 } else { -1.0 },
             target_hit_5pct: Some(won),
         };
         let tags = vec!["MACD金叉".into(), "放量".into(), "相对强势".into()];
+        let audited_tags = calibration_tags(&[
+            "MACD金叉".into(),
+            "校准强证据·下界60%".into(),
+            "结果回写覆盖不足·70%·校准停用".into(),
+        ]);
+        assert_eq!(audited_tags, BTreeSet::from(["MACD金叉".into()]));
 
-        let small = (0..10).map(|index| sample(index, index < 2)).collect::<Vec<_>>();
-        let small_result = calibrate_candidate(&tags, &small, Some("range"), true);
+        let small = (0..10)
+            .map(|index| sample(index, index < 2))
+            .collect::<Vec<_>>();
+        let small_result =
+            calibrate_candidate(&tags, &small, Some("range"), true, 100, 100, 1.0, None);
         assert_eq!(small_result.confidence_tier, "insufficient");
         assert!(!small_result.abstain, "小样本不得主动弃权");
 
-        let weak = (0..40).map(|index| sample(index, index < 8)).collect::<Vec<_>>();
-        let weak_result = calibrate_candidate(&tags, &weak, Some("range"), true);
+        let mostly_unfilled = (0..40)
+            .map(|index| {
+                let executed = index < 10;
+                CalibrationSample {
+                    date: format!("entry-day-{index:03}"),
+                    recent: index >= 20,
+                    tags: BTreeSet::from(["MACD金叉".into(), "放量".into(), "相对强势".into()]),
+                    regime: Some("range".into()),
+                    executed,
+                    won: executed,
+                    real_return: if executed { 1.0 } else { 0.0 },
+                    target_hit_5pct: executed.then_some(true),
+                }
+            })
+            .collect::<Vec<_>>();
+        let entry_fragile = calibrate_candidate(
+            &tags,
+            &mostly_unfilled,
+            Some("range"),
+            true,
+            100,
+            100,
+            1.0,
+            None,
+        );
+        assert_eq!(entry_fragile.signal_samples, 40);
+        assert_eq!(entry_fragile.samples, 10, "胜率分母只能使用真实成交样本");
+        assert_eq!(entry_fragile.execution_rate, 0.25);
+        assert!(entry_fragile.posterior_win_probability > 0.8);
+        assert!(entry_fragile.entry_unexecutable);
+        assert!(entry_fragile.abstain, "高条件胜率不得掩盖低可成交率");
+        assert_eq!(
+            entry_fragile.average_loss, 0.0,
+            "未成交0收益不得混入亏损均值"
+        );
+
+        let weak = (0..40)
+            .map(|index| sample(index, index < 8))
+            .collect::<Vec<_>>();
+        let weak_result =
+            calibrate_candidate(&tags, &weak, Some("range"), true, 100, 100, 1.0, None);
         assert_eq!(weak_result.samples, 40);
         assert_eq!(weak_result.confidence_tier, "weak");
         assert!(weak_result.wilson_high < 0.5);
         assert!(weak_result.abstain);
         assert_eq!(weak_result.score_delta, 0.0);
 
-        let strong = (0..40).map(|index| sample(index, index < 34)).collect::<Vec<_>>();
-        let strong_result = calibrate_candidate(&tags, &strong, Some("range"), true);
+        let strong = (0..40)
+            .map(|index| sample(index, index < 34))
+            .collect::<Vec<_>>();
+        let strong_result =
+            calibrate_candidate(&tags, &strong, Some("range"), true, 100, 100, 1.0, None);
         assert_eq!(strong_result.confidence_tier, "strong");
         assert!(strong_result.wilson_low > 0.5);
         assert!(!strong_result.abstain);
@@ -5521,8 +6384,43 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         assert!(strong_result.posterior_win_probability < 0.85);
         assert!(strong_result.mean_t1_real_low > 0.0);
         assert!(strong_result.payoff_ratio > 1.0);
+        let strong_json = strong_result.as_json();
+        assert_eq!(strong_json["decision_confidence_level"], 0.99);
+        assert!(strong_json["target_5pct_wilson_low"].as_f64().unwrap() >= 0.05);
+        assert_eq!(
+            strong_json["multiple_testing_correction"],
+            "bonferroni_top5_fwer_5pct"
+        );
 
-        let gated = calibrate_candidate(&tags, &strong, Some("range"), false);
+        let friction_fragile = (0..40)
+            .map(|index| CalibrationSample {
+                date: format!("cost-day-{index:03}"),
+                recent: index >= 20,
+                tags: BTreeSet::from(["MACD金叉".into(), "放量".into(), "相对强势".into()]),
+                regime: Some("range".into()),
+                executed: true,
+                won: true,
+                real_return: 0.2,
+                target_hit_5pct: Some(true),
+            })
+            .collect::<Vec<_>>();
+        let fragile = calibrate_candidate(
+            &tags,
+            &friction_fragile,
+            Some("range"),
+            true,
+            100,
+            100,
+            1.0,
+            None,
+        );
+        assert!(fragile.mean_t1_real_low > 0.0, "基础成本下仍为正收益");
+        assert!(fragile.mean_t1_real_stress_high < 0.0);
+        assert!(fragile.cost_stress_negative);
+        assert!(fragile.abstain, "只在低摩擦假设下盈利必须进入影子盘");
+        assert_eq!(fragile.score_delta, 0.0);
+
+        let gated = calibrate_candidate(&tags, &strong, Some("range"), false, 100, 100, 1.0, None);
         assert_eq!(gated.confidence_tier, "strong");
         assert_eq!(gated.score_delta, 0.0, "质量门未通过时不得正向加分");
         assert!(!gated.positive_boost_enabled);
@@ -5530,14 +6428,25 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         let high_win_negative_payoff = (0..40)
             .map(|index| CalibrationSample {
                 date: format!("day-{index:03}"),
+                recent: index >= 20,
                 tags: BTreeSet::from(["MACD金叉".into(), "放量".into(), "相对强势".into()]),
                 regime: Some("range".into()),
-                won: index < 34,
-                real_return: if index < 34 { 0.1 } else { -20.0 },
+                executed: true,
+                won: index < 33,
+                real_return: if index < 33 { 0.1 } else { -20.0 },
                 target_hit_5pct: Some(false),
             })
             .collect::<Vec<_>>();
-        let negative = calibrate_candidate(&tags, &high_win_negative_payoff, Some("range"), true);
+        let negative = calibrate_candidate(
+            &tags,
+            &high_win_negative_payoff,
+            Some("range"),
+            true,
+            100,
+            100,
+            1.0,
+            None,
+        );
         assert!(negative.wilson_low > 0.5, "点胜率看似很高");
         assert!(negative.mean_t1_real_high < 0.0, "但收益区间整体为负");
         assert!(negative.abstain);
@@ -5550,11 +6459,168 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
                 ..sample(index, index < 34)
             })
             .collect::<Vec<_>>();
-        let clustered = calibrate_candidate(&tags, &same_day, Some("range"), true);
+        let clustered =
+            calibrate_candidate(&tags, &same_day, Some("range"), true, 100, 100, 1.0, None);
         assert_eq!(clustered.samples, 40);
         assert_eq!(clustered.completed_days, 1);
         assert_eq!(clustered.confidence_tier, "insufficient");
         assert_eq!(clustered.score_delta, 0.0, "同日相关样本不得膨胀置信度");
+
+        let drifting = (0..40)
+            .map(|index| {
+                let recent = index >= 25;
+                let won = if recent { index < 30 } else { index < 24 };
+                CalibrationSample {
+                    date: format!("drift-day-{index:03}"),
+                    recent,
+                    tags: BTreeSet::from(["MACD金叉".into(), "放量".into(), "相对强势".into()]),
+                    regime: Some("range".into()),
+                    executed: true,
+                    won,
+                    real_return: if won { 1.0 } else { -2.0 },
+                    target_hit_5pct: Some(false),
+                }
+            })
+            .collect::<Vec<_>>();
+        let drifted =
+            calibrate_candidate(&tags, &drifting, Some("range"), true, 100, 100, 1.0, None);
+        assert!(drifted.wilson_low > 0.5, "全窗胜率仍看似可用");
+        assert_eq!(drifted.temporal_stability, "degraded");
+        assert!(drifted.temporal_drift);
+        assert!(drifted.abstain);
+        assert_eq!(drifted.score_delta, 0.0);
+
+        let unseen_tags = vec!["全新形态A".into(), "全新形态B".into(), "全新形态C".into()];
+        let mature_history = (0..100)
+            .map(|index| sample(index, index < 60))
+            .collect::<Vec<_>>();
+        let ood = calibrate_candidate(
+            &unseen_tags,
+            &mature_history,
+            Some("range"),
+            true,
+            100,
+            100,
+            1.0,
+            None,
+        );
+        assert_eq!(ood.history_samples, 100);
+        assert_eq!(ood.samples, 0);
+        assert_eq!(ood.coverage_status, "out_of_distribution");
+        assert!(ood.out_of_distribution);
+        assert!(ood.abstain, "成熟历史库中的未见形态必须进入影子盘");
+
+        let cold_start = calibrate_candidate(
+            &unseen_tags,
+            &mature_history[..20],
+            Some("range"),
+            true,
+            100,
+            100,
+            1.0,
+            None,
+        );
+        assert_eq!(cold_start.coverage_status, "cold_start");
+        assert!(!cold_start.out_of_distribution);
+        assert!(!cold_start.abstain, "冷启动阶段不得把未知误判为负证据");
+
+        let incomplete =
+            calibrate_candidate(&tags, &weak, Some("range"), true, 100, 70, 0.70, None);
+        assert_eq!(incomplete.data_quality_status, "degraded");
+        assert!(incomplete.data_quality_degraded);
+        assert!(!incomplete.abstain, "回写不完整时不得用偏样本做负向决策");
+        assert_eq!(incomplete.score_delta, 0.0);
+        assert!(!incomplete.positive_boost_enabled);
+
+        let not_evaluable =
+            calibrate_candidate(&tags, &strong, Some("range"), true, 20, 10, 0.50, None);
+        assert_eq!(not_evaluable.data_quality_status, "insufficient");
+        assert!(!not_evaluable.data_quality_degraded);
+
+        let selective_due = (0..140)
+            .map(|index| {
+                let matching = index < 40;
+                CalibrationDueSample {
+                    tags: if matching {
+                        BTreeSet::from(["MACD金叉".into(), "放量".into(), "相对强势".into()])
+                    } else {
+                        BTreeSet::from(["低波防守".into(), "缩量".into(), "弱相关".into()])
+                    },
+                    regime: Some("range".into()),
+                    completed: !matching || index < 30,
+                }
+            })
+            .collect::<Vec<_>>();
+        let selective_missing = calibrate_candidate(
+            &tags,
+            &weak,
+            Some("range"),
+            true,
+            140,
+            130,
+            130.0 / 140.0,
+            Some(&selective_due),
+        );
+        assert!(
+            selective_missing.outcome_coverage >= 0.90,
+            "全局覆盖看似健康"
+        );
+        assert_eq!(selective_missing.local_outcomes_due, 40);
+        assert_eq!(selective_missing.local_outcomes_completed, 30);
+        assert_eq!(selective_missing.local_outcome_coverage, 0.75);
+        assert_eq!(selective_missing.data_quality_scope, "local");
+        assert!(selective_missing.data_quality_degraded);
+        assert!(!selective_missing.abstain, "局部缺失时不得据偏样本弃权");
+
+        let unreachable_target = (0..200)
+            .map(|index| CalibrationSample {
+                date: format!("target-day-{index:03}"),
+                recent: index >= 140,
+                tags: BTreeSet::from(["MACD金叉".into(), "放量".into(), "相对强势".into()]),
+                regime: Some("range".into()),
+                executed: true,
+                won: true,
+                real_return: 0.1,
+                target_hit_5pct: Some(false),
+            })
+            .collect::<Vec<_>>();
+        let unreachable = calibrate_candidate(
+            &tags,
+            &unreachable_target,
+            Some("range"),
+            true,
+            200,
+            200,
+            1.0,
+            None,
+        );
+        assert!(unreachable.wilson_low > 0.5, "正收益胜率看似很高");
+        assert!(unreachable.mean_t1_real_low > 0.0, "平均收益也为正");
+        assert!(unreachable.target_wilson_high < 0.05);
+        assert!(unreachable.target_unreachable);
+        assert!(unreachable.abstain, "5%实达概率被强证据否定时必须影子化");
+        assert_eq!(unreachable.score_delta, 0.0);
+
+        let path_censored = (0..40)
+            .map(|index| CalibrationSample {
+                target_hit_5pct: (index < 20).then_some(true),
+                ..sample(index, true)
+            })
+            .collect::<Vec<_>>();
+        let censored = calibrate_candidate(
+            &tags,
+            &path_censored,
+            Some("range"),
+            true,
+            40,
+            40,
+            1.0,
+            None,
+        );
+        assert_eq!(censored.target_resolution_rate, 0.5);
+        assert_eq!(censored.target_path_quality_status, "degraded");
+        assert_eq!(censored.score_delta, 0.0, "路径大量歧义时不得正向加分");
+        assert!(!censored.target_unreachable, "删失样本不得被当成目标失败");
     }
 
     #[test]
@@ -5565,7 +6631,13 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
 
         let reliable = calibration_quality(
             &(0..50)
-                .map(|index| if index < 35 { (0.91, true) } else { (0.09, false) })
+                .map(|index| {
+                    if index < 35 {
+                        (0.91, true)
+                    } else {
+                        (0.09, false)
+                    }
+                })
                 .collect::<Vec<_>>(),
         );
         assert_eq!(reliable.status, "reliable");
@@ -5601,7 +6673,12 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         ) {
             for _ in 0..samples {
                 let outcome = if real_outcome {
-                    serde_json::json!({"t1_real": if won { 1.0 } else { -1.0 }})
+                    serde_json::json!({
+                        "t1_real": if won { 1.0 } else { -1.0 },
+                        "strategy_t1_real": if won { 0.8 } else { -1.2 },
+                        "strategy_exit_basis": "t1_close",
+                        "execution_price_basis": "raw_unadjusted"
+                    })
                 } else {
                     serde_json::json!({"t1_pct": if won { 1.0 } else { -1.0 }})
                 };
@@ -5625,9 +6702,23 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         // 其他环境的失败样本不应污染当前震荡分层。
         insert_samples(&db, "2026-07-10", 22, false, -1.0, true).await;
         insert_samples(&db, "2026-09-10", 8, false, -1.0, true).await;
-        // as_of 之后即使已有值也必须排除；只有纸面 t1_pct、未回写 t1_real 也必须排除。
+        // as_of 之后即使已有值也必须排除；只有收盘收益、未回写策略净收益也必须排除。
         insert_samples(&db, "2026-10-01", 20, false, 0.0, true).await;
         insert_samples(&db, "2026-09-10", 20, false, 0.0, false).await;
+        // 有策略收益但缺少不复权价格证据的旧标签也必须排除，防止公司行为污染调权。
+        for _ in 0..20 {
+            let meta = serde_json::json!({
+                "cn": {"avg_pct": 0.0},
+                "outcome": {"strategy_t1_real": -9.0}
+            });
+            sqlx::query("INSERT INTO daily_pick(date, reasons, meta) VALUES(?, ?, ?)")
+                .bind("2026-09-10")
+                .bind(r#"["MACD金叉"]"#)
+                .bind(meta.to_string())
+                .execute(&db)
+                .await
+                .unwrap();
+        }
 
         let stats = load_tag_performance(
             &db,
@@ -5754,11 +6845,55 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
     }
 
     #[test]
+    fn target_path_censors_same_day_target_and_stop_ambiguity() {
+        let target_only = classify_target_path(10.0, 10.60, 9.80, 10.0);
+        assert_eq!(target_only.status, "target_only");
+        assert_eq!(target_only.hit, Some(true));
+        let target_strategy = strategy_t1_outcome(&target_only, 10.0, 10.1, 10.0);
+        assert_eq!(target_strategy.exit_basis, "target_limit");
+        assert!((target_strategy.net_return_pct.unwrap() - 5.0).abs() < 1e-9);
+
+        let stop_only = classify_target_path(10.0, 10.20, 9.60, 10.0);
+        assert_eq!(stop_only.status, "stop_only");
+        assert_eq!(stop_only.hit, Some(false));
+        let stop_strategy = strategy_t1_outcome(&stop_only, 10.0, 10.1, 10.0);
+        assert_eq!(stop_strategy.exit_basis, "risk_stop");
+        assert!((stop_strategy.net_return_pct.unwrap() + 3.2).abs() < 1e-9);
+
+        let ambiguous = classify_target_path(10.0, 10.60, 9.60, 10.0);
+        assert_eq!(ambiguous.status, "ambiguous_both_touched");
+        assert_eq!(ambiguous.hit, None, "日线无法判断先后，不得算作成功");
+        assert!(
+            strategy_t1_outcome(&ambiguous, 10.0, 10.1, 10.0)
+                .net_return_pct
+                .is_none(),
+            "路径未知时策略收益也必须删失"
+        );
+
+        let target_at_open = classify_target_path(10.60, 10.80, 9.50, 10.0);
+        assert_eq!(target_at_open.status, "target_at_open");
+        assert_eq!(target_at_open.hit, Some(true), "开盘越过目标可确定先成交");
+
+        let stop_at_open = classify_target_path(9.60, 10.80, 9.50, 10.0);
+        assert_eq!(stop_at_open.status, "stop_at_open");
+        assert_eq!(
+            stop_at_open.hit,
+            Some(false),
+            "开盘跌破止损后反抽不得算成功"
+        );
+
+        let neither = classify_target_path(10.0, 10.30, 9.80, 10.0);
+        let close_strategy = strategy_t1_outcome(&neither, 10.0, 10.10, 10.0);
+        assert_eq!(close_strategy.exit_basis, "t1_close");
+        assert!((close_strategy.net_return_pct.unwrap() - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
     fn dynamic_exit_separates_profit_target_from_risk_exit() {
         let signal = NaiveDate::from_ymd_opt(2026, 9, 24).unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 9, 25).unwrap();
-        let strong = dynamic_exit_plan(signal, today, 10.20, 10.0, Some(10.20), None, None)
-            .unwrap();
+        let strong =
+            dynamic_exit_plan(signal, today, 10.20, 10.0, Some(10.20), None, None).unwrap();
         assert_eq!(strong.open_strength, "strong");
         assert_eq!(strong.action, "hold_strength");
         assert!((strong.sell_low - 10.73).abs() < 0.02);
@@ -5771,29 +6906,13 @@ v_usIXIC="200~IXIC~.IXIC~26522.55~26418.30~26522.09~12789451846";"#;
         assert!(weak.risk_stop < weak.sell_low);
         assert!((weak.sell_low / 9.80 - 1.052).abs() < 0.002);
 
-        let breached = dynamic_exit_plan(
-            signal,
-            today,
-            10.0,
-            10.0,
-            Some(9.9),
-            Some(9.6),
-            None,
-        )
-        .unwrap();
+        let breached =
+            dynamic_exit_plan(signal, today, 10.0, 10.0, Some(9.9), Some(9.6), None).unwrap();
         assert_eq!(breached.action, "risk_exit");
         assert_eq!(breached.target_reached, Some(false));
 
-        let timeout = dynamic_exit_plan(
-            signal,
-            today,
-            10.0,
-            10.0,
-            Some(10.0),
-            Some(10.2),
-            None,
-        )
-        .unwrap();
+        let timeout =
+            dynamic_exit_plan(signal, today, 10.0, 10.0, Some(10.0), Some(10.2), None).unwrap();
         assert_eq!(timeout.action, "t1_timeout");
         assert!(timeout.action_label.contains("T+1"));
     }
